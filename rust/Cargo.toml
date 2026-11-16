@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["core", "android"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# tiny-skia is far too slow unoptimised to be usable in tests.
+[profile.dev.package."*"]
+opt-level = 3
+[profile.dev]
+opt-level = 1

@@ -1,0 +1,10 @@
+target/
+build/
+.gradle/
+.kotlin/
+local.properties
+*.apk
+*.jks
+*.keystore
+jniLibs/
+out/
