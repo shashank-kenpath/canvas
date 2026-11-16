@@ -101,6 +101,29 @@ impl Platform for AndroidUi {
     fn set_full_resolution(&mut self, on: bool) {
         self.call("setFullResolution", "(Z)V", &[JValue::Bool(on as u8)]);
     }
+    fn copy_text(&mut self, text: &str) {
+        self.text_call("copyText", "(Ljava/lang/String;)V", text, false, false);
+    }
+    fn save_png(&mut self, name: &str, png: &[u8]) {
+        if let Ok(mut env) = self.vm.attach_current_thread_as_daemon() {
+            let _ = env
+                .with_local_frame(8, |env| -> jni::errors::Result<()> {
+                    let title = env.new_string(name)?;
+                    let bytes = env.byte_array_from_slice(png)?;
+                    env.call_method(
+                        &self.host,
+                        "savePng",
+                        "(Ljava/lang/String;[B)V",
+                        &[JValue::Object(title.as_ref()), JValue::Object(bytes.as_ref())],
+                    )?;
+                    Ok(())
+                })
+                .map_err(|_| {
+                    let _ = env.exception_clear();
+                    log(6, "savePng failed");
+                });
+        }
+    }
     fn exit(&mut self) {
         self.call("finishApp", "()V", &[]);
     }

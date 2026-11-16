@@ -4,13 +4,16 @@
 //! supplies a window, touches and a few system services ([`Platform`]).
 
 use super::font::{self, Face};
+use super::net;
 use super::paint::{self, Painter, Rf};
-use crate::editor::{Contact, Editor, PenMode, TextRequest, EV_DOC, EV_HAPTIC, EV_INK, EV_TEXT};
+use crate::editor::{Contact, Editor, PenMode, EV_DOC, EV_HAPTIC, EV_INK, EV_TEXT};
 use crate::geom::{IRect, Pt};
 use crate::render::{self, Layer};
 use crate::shape::{Shape, Tool};
 use crate::store::{self, BoardFile, BoardMeta};
-use serde_json::{Map, Value};
+use crate::text;
+use serde_json::{json, Map, Value};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -47,7 +50,8 @@ const PALETTE: [u32; 12] = [
     0xff099268, 0xff4cb05e, 0xfff87777, 0xffe03131,
 ];
 const SIZES: [(&str, f64); 4] = [("S", 2.0), ("M", 3.5), ("L", 5.0), ("XL", 10.0)];
-const FONTS: [&str; 5] = ["Sans", "Serif", "Mono", "Handwriting", "Script"];
+/// Where the panel is reached from other networks (see server/relay.mjs).
+const RELAY: &str = "https://inkboard.taila6db10.ts.net";
 const LANGS: [(&str, &str); 2] = [("en", "English"), ("hi", "हिन्दी")];
 
 // -------------------------------------------------------- Material icons
@@ -56,7 +60,14 @@ mod icon {
     pub const SELECT: u32 = 0xf206;
     pub const HAND: u32 = 0xf250;
     pub const PEN: u32 = 0xf00d;
-    pub const ERASER: u32 = 0xeeac;
+    /// Drawn by hand: Material has no eraser glyph in this font.
+    pub const ERASER: u32 = u32::MAX;
+    pub const WRITE: u32 = 0xe5e1;
+    pub const SMART: u32 = 0xeea9;
+    pub const SHARE: u32 = 0xf378;
+    pub const JOIN: u32 = 0xf0d8;
+    pub const CLAUDE: u32 = 0xf3a8;
+    pub const FONT: u32 = 0xf096;
     pub const ARROW: u32 = 0xe443;
     pub const RECTANGLE: u32 = 0xe1ae;
     pub const ELLIPSE: u32 = 0xef53;
@@ -77,7 +88,6 @@ mod icon {
     pub const SMALLER: u32 = 0xf058a;
     pub const SPEED: u32 = 0xf3c3;
     pub const CHECK: u32 = 0xe156;
-    pub const EDIT_TEXT: u32 = 0xf04f6;
     pub const TO_TEXT: u32 = 0xe649;
 }
 
@@ -101,6 +111,10 @@ pub trait Platform: Send {
     fn install_update(&mut self, _url: &str) {}
     /// Draw at the panel's full resolution instead of a capped one.
     fn set_full_resolution(&mut self, _on: bool) {}
+    /// Puts `text` on the clipboard.
+    fn copy_text(&mut self, _text: &str) {}
+    /// Saves a PNG picture to the device's Pictures.
+    fn save_png(&mut self, _name: &str, _png: &[u8]) {}
     fn exit(&mut self) {}
 }
 
@@ -159,6 +173,7 @@ enum Job {
         id: String,
         title: String,
         updated: String,
+        extra: Map<String, Value>,
     },
     Delete(String),
     Rename {
@@ -227,8 +242,8 @@ fn disk_worker(
                 }
                 Done::Saved { seq, ok }
             }
-            Job::Create { id, title, updated } => {
-                let contents = store::encode(&id, &title, &updated, &[], &Map::new());
+            Job::Create { id, title, updated, extra } => {
+                let contents = store::encode(&id, &title, &updated, &[], &extra);
                 let ok = store::save_atomic(&dir, &id, &contents).is_ok();
                 Done::Created(id, ok)
             }
@@ -260,6 +275,45 @@ struct Settings {
     font: u8,
     full_res: bool,
     lang: String,
+    /// Secret part of the Claude (MCP) address.
+    mcp_key: String,
+    /// This panel's name and password at the relay.
+    relay_id: String,
+    relay_secret: String,
+    relay_url: String,
+}
+
+/// A random lowercase token, for keys that only need to be unguessable.
+fn random_token(len: usize) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let digits = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = String::with_capacity(len);
+    let mut round = 0u64;
+    while out.len() < len {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(round);
+        h.write_i64(wall_millis());
+        h.write_usize(&out as *const String as usize);
+        let mut v = h.finish();
+        for _ in 0..10 {
+            if out.len() < len {
+                out.push(digits[(v % 36) as usize] as char);
+                v /= 36;
+            }
+        }
+        round += 1;
+    }
+    out
+}
+
+/// The 6-digit code in what someone typed to join a board.
+fn share_code(input: &str) -> String {
+    input
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|p| p.len() == 6 && p.chars().all(|c| c.is_ascii_digit()))
+        .last()
+        .map(str::to_string)
+        .unwrap_or_else(|| input.chars().filter(|c| c.is_ascii_digit()).collect())
 }
 
 impl Settings {
@@ -269,6 +323,17 @@ impl Settings {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(Value::Null);
         let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(true);
+        let token = |k: &str, min: usize, len: usize| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .filter(|t| {
+                    t.len() >= min
+                        && t.len() <= 32
+                        && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                })
+                .map(str::to_string)
+                .unwrap_or_else(|| random_token(len))
+        };
         Settings {
             tidy: flag("tidy"),
             typed: flag("typed"),
@@ -279,13 +344,21 @@ impl Settings {
                 .get("font")
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
-                .min(FONTS.len() as u64 - 1) as u8,
+                .min(text::FONT_NAMES.len() as u64 - 1) as u8,
             full_res: v.get("fullRes").and_then(Value::as_bool).unwrap_or(false),
             lang: v
                 .get("lang")
                 .and_then(Value::as_str)
                 .filter(|l| LANGS.iter().any(|(c, _)| c == l))
                 .unwrap_or("en")
+                .to_string(),
+            mcp_key: token("mcpKey", 24, 24),
+            relay_id: token("relayId", 8, 16),
+            relay_secret: token("relaySecret", 16, 32),
+            relay_url: v
+                .get("relayUrl")
+                .and_then(Value::as_str)
+                .unwrap_or(RELAY)
                 .to_string(),
         }
     }
@@ -294,6 +367,8 @@ impl Settings {
         let v = serde_json::json!({
             "tidy": self.tidy, "typed": self.typed, "palm": self.palm, "grid": self.grid,
             "snap": self.snap, "font": self.font, "fullRes": self.full_res, "lang": self.lang,
+            "mcpKey": self.mcp_key, "relayId": self.relay_id, "relaySecret": self.relay_secret,
+            "relayUrl": self.relay_url,
         });
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, v.to_string()).is_ok() {
@@ -327,7 +402,6 @@ enum Act {
     Redo,
     Delete,
     Convert,
-    EditText,
     Bigger,
     Smaller,
     Style,
@@ -338,11 +412,11 @@ enum Act {
     ZoomIn,
     Zoom100,
     Fit,
-    Tool(usize),
+    Tool(usize, PenMode),
     Retry,
     Toggle(Opt),
     Lang(usize),
-    FontMenu,
+    FontPanel,
     Font(u8),
     FullRes,
     Rename(String),
@@ -350,6 +424,14 @@ enum Act {
     Field,
     Cancel,
     Done,
+    Share,
+    StopShare,
+    Join,
+    Claude,
+    Export,
+    Copy(String),
+    /// A surface that takes touches so they do not fall through.
+    Nothing,
     /// The empty area around a menu or dialog.
     Outside,
 }
@@ -431,6 +513,13 @@ enum Look {
     },
     Toast(String),
     Scrim(u32),
+    /// An address or command, wrapped anywhere, on a tinted box.
+    Code(String),
+    /// A font's name written in that font.
+    FontTile {
+        font: u8,
+        chosen: bool,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -471,6 +560,7 @@ impl Node {
             Look::DlgBtn { .. } => 20.0,
             Look::Item { .. } => 0.0,
             Look::Thumb { .. } => 8.0,
+            Look::FontTile { .. } => 10.0,
             _ => 8.0,
         }
     }
@@ -535,7 +625,6 @@ impl<'a> Ui<'a> {
 #[derive(Clone, PartialEq, Debug)]
 enum MenuKind {
     Main,
-    Fonts,
     Display,
     Card(String),
 }
@@ -549,7 +638,14 @@ enum Entry {
 enum AskFor {
     NewBoard,
     Rename(String),
-    Text(TextRequest),
+    Join,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanelKind {
+    Share,
+    Claude,
+    Fonts,
 }
 
 #[derive(Clone, Debug)]
@@ -577,6 +673,11 @@ enum Overlay {
         cancel: String,
         ok: String,
         purpose: ConfirmFor,
+    },
+    /// A larger sheet with scrolling content.
+    Panel {
+        kind: PanelKind,
+        scroll: f32,
     },
 }
 
@@ -670,6 +771,25 @@ pub struct App {
     pressed: Option<Act>,
     focus: Option<Act>,
     ink: HashMap<u32, Vec<String>>,
+
+    wake: Arc<dyn Fn() + Send + Sync>,
+    /// Kept so the request channel and the listener live as long as the app.
+    #[allow(dead_code)]
+    net_tx: Sender<net::Req>,
+    net_rx: Receiver<net::Req>,
+    #[allow(dead_code)]
+    server: Option<net::Server>,
+    relay: Option<net::Relay>,
+    /// Counts changes to the open board; joiners poll by it.
+    doc_gen: u64,
+    /// A board joined from another device.
+    link: Option<net::Link>,
+    known: HashMap<String, Value>,
+    ops_sent: u64,
+    link_online: Option<bool>,
+    joining: Option<Receiver<(String, net::Found)>>,
+    lan_ip: Option<std::net::Ipv4Addr>,
+    font_tiles: RefCell<HashMap<(u8, u32), Option<text::TextBitmap>>>,
 }
 
 /// Floats per stroke point in an ink request.
@@ -751,10 +871,27 @@ impl App {
         let (jobs, job_rx) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
         let worker_dir = dir.clone();
+        let disk_wake = wake.clone();
         let _ = std::thread::Builder::new()
             .name("boards".into())
-            .spawn(move || disk_worker(worker_dir, job_rx, done_tx, wake));
+            .spawn(move || disk_worker(worker_dir, job_rx, done_tx, disk_wake));
         let settings = Settings::load(&settings_path);
+        settings.save(&settings_path);
+        let (net_tx, net_rx) = mpsc::channel();
+        let (server, relay) = if cfg!(test) {
+            (None, None)
+        } else {
+            let relay = (!settings.relay_url.is_empty()).then(|| {
+                net::relay(
+                    settings.relay_url.clone(),
+                    settings.relay_id.clone(),
+                    settings.relay_secret.clone(),
+                    net_tx.clone(),
+                    wake.clone(),
+                )
+            });
+            (net::serve(net_tx.clone(), wake.clone()).ok(), relay)
+        };
         let mut app = App {
             ed: Editor::new(),
             platform,
@@ -794,6 +931,19 @@ impl App {
             pressed: None,
             focus: None,
             ink: HashMap::new(),
+            wake,
+            net_tx,
+            net_rx,
+            server,
+            relay,
+            doc_gen: 1,
+            link: None,
+            known: HashMap::new(),
+            ops_sent: 0,
+            link_online: None,
+            joining: None,
+            lan_ip: None,
+            font_tiles: RefCell::new(HashMap::new()),
         };
         app.apply_settings();
         app.ed.set_tool(Tool::Pen, PenMode::Ink);
@@ -889,6 +1039,9 @@ impl App {
     pub fn frame(&mut self, now: u64) -> Option<IRect> {
         self.now = self.now.max(now);
         self.take_disk();
+        self.take_net();
+        self.take_link();
+        self.take_join();
         self.ed.tick(self.now);
         self.take_editor_events();
         if self.toast.as_ref().is_some_and(|t| self.now >= t.1) {
@@ -1040,6 +1193,9 @@ impl App {
                             self.style_open = false;
                             self.focus = None;
                             self.full = true;
+                            self.doc_gen += 1;
+                            self.start_link();
+                            self.sync_relay_codes();
                         }
                         Err(_) => self.show_toast("This board could not be opened"),
                     }
@@ -1139,6 +1295,10 @@ impl App {
 
     fn return_to_library(&mut self) {
         self.board = None;
+        self.link = None;
+        self.known.clear();
+        self.link_online = None;
+        self.sync_relay_codes();
         self.screen = Screen::Library;
         self.overlay = None;
         self.focus = None;
@@ -1182,22 +1342,22 @@ impl App {
         if events & EV_DOC != 0 && self.board.is_some() {
             self.unsaved = true;
             self.save_due = Some(self.now + 1200);
+            self.doc_gen += 1;
+            if self.link.is_some() {
+                let now = self.shape_map();
+                let ops = net::diff(&self.known, &now);
+                if !ops.is_empty() {
+                    if let Some(link) = &self.link {
+                        let _ = link.ops.send(ops);
+                    }
+                    self.ops_sent += 1;
+                    self.known = now;
+                }
+            }
         }
         if events & EV_TEXT != 0 {
-            if let Some(request) = self.ed.take_text_request() {
-                let title = if request.id.is_empty() {
-                    "Add text"
-                } else {
-                    "Edit text"
-                };
-                self.ask(
-                    title,
-                    &request.text.clone(),
-                    "Type a note…",
-                    true,
-                    AskFor::Text(request),
-                );
-            }
+            // Text comes from handwriting; there is no typing on the board.
+            let _ = self.ed.take_text_request();
         }
         if events & EV_INK != 0 {
             while let Some(request) = self.ed.take_ink_request() {
@@ -1326,7 +1486,8 @@ impl App {
 
     fn moved(&mut self, s: &Sample) {
         let d = self.d;
-        let library = self.screen == Screen::Library && self.overlay.is_none();
+        let panel = matches!(self.overlay, Some(Overlay::Panel { .. }));
+        let library = (self.screen == Screen::Library && self.overlay.is_none()) || panel;
         let mut scroll_by = 0.0;
         let mut release = false;
         match self.captures.get_mut(&s.id) {
@@ -1365,8 +1526,15 @@ impl App {
             self.pressed = None;
         }
         if scroll_by != 0.0 {
-            self.scroll += scroll_by;
-            self.clamp_scroll();
+            if panel {
+                let max = self.panel_max_scroll();
+                if let Some(Overlay::Panel { scroll, .. }) = &mut self.overlay {
+                    *scroll = (*scroll + scroll_by).clamp(0.0, max);
+                }
+            } else {
+                self.scroll += scroll_by;
+                self.clamp_scroll();
+            }
         }
     }
 
@@ -1433,7 +1601,7 @@ impl App {
         let candidates: Vec<&Node> = self
             .nodes
             .iter()
-            .filter(|n| n.act.is_some() && n.act != Some(Act::Outside))
+            .filter(|n| n.act.is_some() && n.act != Some(Act::Outside) && n.act != Some(Act::Nothing))
             .collect();
         if candidates.is_empty() {
             return false;
@@ -1586,32 +1754,6 @@ impl App {
             Act::Redo => self.ed.redo(),
             Act::Delete => self.ed.delete_selection(),
             Act::Convert => self.ed.convert_selection(),
-            Act::EditText => {
-                // Opening a lone selected text for editing goes through the
-                // editor so it can place the request.
-                if let Some(s) = self
-                    .ed
-                    .doc
-                    .selected_shapes()
-                    .into_iter()
-                    .find(|s| s.tool == Tool::Text)
-                {
-                    let p = s.points.first().copied().unwrap_or(Pt::ZERO);
-                    let request = TextRequest {
-                        id: s.id.clone(),
-                        x: p.x,
-                        y: p.y,
-                        text: s.text.clone(),
-                    };
-                    self.ask(
-                        "Edit text",
-                        &request.text.clone(),
-                        "Type a note…",
-                        true,
-                        AskFor::Text(request),
-                    );
-                }
-            }
             Act::Bigger => self.ed.scale_text(1.25),
             Act::Smaller => self.ed.scale_text(0.8),
             Act::Style => self.style_open = !self.style_open,
@@ -1633,9 +1775,13 @@ impl App {
                     self.dismiss();
                 }
             }
-            Act::Tool(i) => {
+            Act::Tool(i, mode) => {
                 if let Some(tool) = Tool::from_index(i as i32) {
-                    self.ed.set_tool(tool, PenMode::Ink);
+                    self.ed.set_tool(tool, mode);
+                    if tool == Tool::Pen && mode == PenMode::Write {
+                        let lang = self.settings.lang.clone();
+                        self.platform.prepare_handwriting(&lang);
+                    }
                 }
             }
             Act::Retry => self.queue_save(None),
@@ -1653,11 +1799,7 @@ impl App {
                 self.set(|s| s.lang = LANGS[i].0.to_string());
                 self.dismiss();
             }
-            Act::FontMenu => {
-                if let Some(Overlay::Menu { kind, .. }) = &mut self.overlay {
-                    *kind = MenuKind::Fonts;
-                }
-            }
+            Act::FontPanel => self.panel(PanelKind::Fonts),
             Act::Font(f) => {
                 self.set(|s| s.font = f);
                 self.dismiss();
@@ -1708,7 +1850,73 @@ impl App {
             }
             Act::Cancel | Act::Outside => self.dismiss(),
             Act::Done => self.done(),
+            Act::Share => self.share(),
+            Act::StopShare => {
+                if let Some(b) = &mut self.board {
+                    b.extra.remove("lanHost");
+                    self.unsaved = true;
+                    self.save_due = Some(self.now + 300);
+                }
+                self.sync_relay_codes();
+                self.dismiss();
+                self.show_toast("Sharing stopped");
+            }
+            Act::Join => self.ask(
+                "Join a shared board",
+                "",
+                "Board code, like 123456",
+                false,
+                AskFor::Join,
+            ),
+            Act::Claude => {
+                self.lan_ip = net::local_ip();
+                self.panel(PanelKind::Claude);
+            }
+            Act::Export => {
+                if in_menu {
+                    self.dismiss();
+                }
+                let title = self.board.as_ref().map(|b| b.title.clone()).unwrap_or_default();
+                match board_png(self.ed.doc.shapes(), 4096) {
+                    Some(png) => self.platform.save_png(&title, &png),
+                    None => self.show_toast("Could not make the picture"),
+                }
+            }
+            Act::Copy(text) => {
+                self.platform.copy_text(&text);
+                self.show_toast("Copied");
+            }
+            Act::Nothing => {}
         }
+    }
+
+    fn panel(&mut self, kind: PanelKind) {
+        self.overlay = Some(Overlay::Panel { kind, scroll: 0.0 });
+        self.focus = None;
+    }
+
+    fn share(&mut self) {
+        let Some(board) = &mut self.board else {
+            return;
+        };
+        if !board.extra.contains_key("lanShare") && !board.extra.contains_key("lanHost") {
+            let n = random_token(12).bytes().fold(0u64, |a, b| a.wrapping_mul(37).wrapping_add(b as u64));
+            let code = format!("{:06}", 100_000 + n % 900_000);
+            board.extra.insert("lanHost".into(), Value::String(code));
+            self.unsaved = true;
+            self.save_due = Some(self.now + 300);
+            self.sync_relay_codes();
+        }
+        self.lan_ip = net::local_ip();
+        self.panel(PanelKind::Share);
+    }
+
+    fn new_board_id() -> String {
+        let salt = (wall_millis() as u64)
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .rotate_left(17)
+            % 46_656;
+        format!("b{}{}", base36(wall_millis() as u64), base36(salt))
     }
 
     fn done(&mut self) {
@@ -1727,13 +1935,14 @@ impl App {
                         } else {
                             name.to_string()
                         };
-                        let salt = (wall_millis() as u64)
-                            .wrapping_mul(6_364_136_223_846_793_005)
-                            .rotate_left(17)
-                            % 46_656;
-                        let id = format!("b{}{}", base36(wall_millis() as u64), base36(salt));
+                        let id = Self::new_board_id();
                         let updated = self.timestamp();
-                        self.send(Job::Create { id, title, updated });
+                        self.send(Job::Create {
+                            id,
+                            title,
+                            updated,
+                            extra: Map::new(),
+                        });
                     }
                     AskFor::Rename(id) => {
                         if !name.is_empty() {
@@ -1745,7 +1954,19 @@ impl App {
                             });
                         }
                     }
-                    AskFor::Text(r) => self.ed.commit_text(&r.id, r.x, r.y, &text),
+                    AskFor::Join => {
+                        let input = name.to_string();
+                        let relay = self.settings.relay_url.clone();
+                        let wake = self.wake.clone();
+                        let (tx, rx) = mpsc::channel();
+                        self.joining = Some(rx);
+                        std::thread::spawn(move || {
+                            let found = net::discover(&input, &relay);
+                            let _ = tx.send((share_code(&input), found));
+                            wake();
+                        });
+                        self.show_toast("Looking for the board…");
+                    }
                 }
             }
             Overlay::Confirm { purpose, .. } => match purpose {
@@ -1758,7 +1979,7 @@ impl App {
                     self.platform.install_update(&url);
                 }
             },
-            Overlay::Menu { .. } => {}
+            Overlay::Menu { .. } | Overlay::Panel { .. } => {}
         }
     }
 
@@ -1989,15 +2210,31 @@ impl App {
             None,
         );
         ui.push(
-            Rf::new(62.0 * d, 0.0, (w - 62.0 * d - 112.0 * d).max(0.0), 64.0 * d),
+            Rf::new(62.0 * d, 0.0, (w - 62.0 * d - 212.0 * d).max(0.0), 64.0 * d),
             Look::Label {
-                text: "Canvas Studio".into(),
+                text: "Inkboard".into(),
                 face: Face::Regular,
                 size: 22.0 * d,
                 color: INK,
                 center: false,
             },
             None,
+        );
+        ui.push(
+            Rf::new(w - 200.0 * d, 8.0 * d, 48.0 * d, 48.0 * d),
+            Look::AppIcon {
+                icon: icon::JOIN,
+                badge: false,
+            },
+            Some(Act::Join),
+        );
+        ui.push(
+            Rf::new(w - 152.0 * d, 8.0 * d, 48.0 * d, 48.0 * d),
+            Look::AppIcon {
+                icon: icon::CLAUDE,
+                badge: false,
+            },
+            Some(Act::Claude),
         );
         ui.push(
             Rf::new(w - 104.0 * d, 8.0 * d, 48.0 * d, 48.0 * d),
@@ -2048,17 +2285,31 @@ impl App {
             SaveState::Saving => ("Saving…", false),
             SaveState::Failed => ("Save failed • tap to retry", true),
         };
+        let status = if failed {
+            status.to_string()
+        } else if let Some(code) = self.host_code() {
+            format!("{status} • sharing {code}")
+        } else if self.link.is_some() {
+            match self.link_online {
+                Some(true) => format!("{status} • live"),
+                Some(false) => format!("{status} • reconnecting…"),
+                None => format!("{status} • connecting…"),
+            }
+        } else {
+            status.to_string()
+        };
+        let sharing = self.host_code().is_some() || self.link.is_some();
         let title_w = if wide {
             let tw = font::measure(Face::Medium, 14.0 * d, &title)
                 .0
-                .max(font::measure(Face::Regular, 11.0 * d, status).0);
+                .max(font::measure(Face::Regular, 11.0 * d, &status).0);
             tw.min(220.0 * d) + 12.0 * d
         } else {
             0.0
         };
         let x0 = 10.0 * d;
         let y0 = 10.0 * d;
-        let panel_w = pad * 2.0 + b * 4.0 + title_w;
+        let panel_w = pad * 2.0 + b * 5.0 + title_w;
         ui.panel(Rf::new(x0, y0, panel_w, pad * 2.0 + b));
         let mut x = x0 + pad;
         let y = y0 + pad;
@@ -2081,7 +2332,7 @@ impl App {
                 Rf::new(x, y, title_w, b),
                 Look::TitleBlock {
                     title,
-                    status: status.into(),
+                    status,
                     failed,
                 },
                 if failed { Some(Act::Retry) } else { None },
@@ -2091,6 +2342,8 @@ impl App {
         ui.btn(x, y, b, icon::UNDO, false, ed.doc.can_undo(), Act::Undo);
         x += b;
         ui.btn(x, y, b, icon::REDO, false, ed.doc.can_redo(), Act::Redo);
+        x += b;
+        ui.btn(x, y, b, icon::SHARE, sharing, true, Act::Share);
 
         // Selection actions.
         let selected = ed.doc.selected_ids().len();
@@ -2101,10 +2354,8 @@ impl App {
             if inks > 0 {
                 acts.push((icon::TO_TEXT, Act::Convert));
             }
-            if texts == 1 && selected == 1 {
-                acts.push((icon::EDIT_TEXT, Act::EditText));
-            }
             if texts > 0 {
+                acts.push((icon::FONT, Act::FontPanel));
                 acts.push((icon::BIGGER, Act::Bigger));
                 acts.push((icon::SMALLER, Act::Smaller));
             }
@@ -2234,22 +2485,25 @@ impl App {
         }
 
         // Bottom centre: tools.
-        let tb = if large { 54.0 } else { 44.0 } * d;
-        let tools: [(u32, Tool); 7] = [
-            (icon::SELECT, Tool::Select),
-            (icon::HAND, Tool::Hand),
-            (icon::PEN, Tool::Pen),
-            (icon::ERASER, Tool::Eraser),
-            (icon::ARROW, Tool::Arrow),
-            (icon::RECTANGLE, Tool::Rectangle),
-            (icon::ELLIPSE, Tool::Ellipse),
+        let tools: [(u32, Tool, PenMode); 9] = [
+            (icon::SELECT, Tool::Select, PenMode::Ink),
+            (icon::HAND, Tool::Hand, PenMode::Ink),
+            (icon::PEN, Tool::Pen, PenMode::Ink),
+            (icon::WRITE, Tool::Pen, PenMode::Write),
+            (icon::SMART, Tool::Pen, PenMode::Shape),
+            (icon::ERASER, Tool::Eraser, PenMode::Ink),
+            (icon::ARROW, Tool::Arrow, PenMode::Ink),
+            (icon::RECTANGLE, Tool::Rectangle, PenMode::Ink),
+            (icon::ELLIPSE, Tool::Ellipse, PenMode::Ink),
         ];
+        let tb = (if large { 54.0 } else { 44.0 } * d)
+            .min((w - 20.0 * d - pad * 2.0) / tools.len() as f32);
         let tw = pad * 2.0 + tb * tools.len() as f32;
         let tx = (w - tw) / 2.0;
         let ty = h - 10.0 * d - (pad * 2.0 + tb);
         ui.panel(Rf::new(tx, ty, tw, pad * 2.0 + tb));
-        for (i, (code, tool)) in tools.iter().enumerate() {
-            let active = ed.tool() == *tool;
+        for (i, (code, tool, mode)) in tools.iter().enumerate() {
+            let active = ed.tool() == *tool && (*tool != Tool::Pen || ed.pen_mode() == *mode);
             ui.btn(
                 tx + pad + tb * i as f32,
                 ty + pad,
@@ -2257,7 +2511,7 @@ impl App {
                 *code,
                 active,
                 true,
-                Act::Tool(tool.index() as usize),
+                Act::Tool(tool.index() as usize, *mode),
             );
         }
     }
@@ -2268,6 +2522,10 @@ impl App {
         match kind {
             MenuKind::Main => {
                 let mut v = vec![
+                    item("Share board…", None, Act::Share),
+                    item("Connect Claude…", None, Act::Claude),
+                    item("Export as PNG", None, Act::Export),
+                    Entry::Rule,
                     item("Zoom to fit", None, Act::Fit),
                     item("Show grid", Some(s.grid), Act::Toggle(Opt::Grid)),
                     Entry::Rule,
@@ -2297,15 +2555,10 @@ impl App {
                     Some(s.palm),
                     Act::Toggle(Opt::Palm),
                 ));
-                v.push(item("Text font…", None, Act::FontMenu));
+                v.push(item("Text font…", None, Act::FontPanel));
                 v.push(item("Display and speed…", None, Act::Display));
                 v
             }
-            MenuKind::Fonts => FONTS
-                .iter()
-                .enumerate()
-                .map(|(i, f)| item(f, Some(s.font == i as u8), Act::Font(i as u8)))
-                .collect(),
             MenuKind::Display => vec![item(
                 "Full panel resolution (slower on 4K)",
                 Some(s.full_res),
@@ -2517,8 +2770,441 @@ impl App {
                 y += body_h + 24.0 * d;
                 self.dialog_buttons(ui, dx + dw - 24.0 * d, y, cancel, ok);
             }
+            Overlay::Panel { kind, scroll } => self.layout_panel(ui, *kind, *scroll),
         }
     }
+
+    /// The open board's share code, when this device shares it.
+    fn host_code(&self) -> Option<String> {
+        self.board
+            .as_ref()?
+            .extra
+            .get("lanHost")?
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn relay_online(&self) -> bool {
+        self.relay
+            .as_ref()
+            .is_some_and(|r| r.online.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn lan_mcp(&self) -> Option<String> {
+        let ip = self.lan_ip?;
+        Some(format!("http://{ip}:{}/mcp/{}", net::PORT, self.settings.mcp_key))
+    }
+
+    fn public_mcp(&self) -> Option<String> {
+        let base = self.settings.relay_url.trim_end_matches('/');
+        (!base.is_empty()).then(|| {
+            format!(
+                "{base}/d/{}/mcp/{}",
+                self.settings.relay_id, self.settings.mcp_key
+            )
+        })
+    }
+
+    /// Size of the panel sheet and the height its content needs.
+    fn panel_frame(&self, kind: PanelKind) -> (Rf, f32, f32) {
+        let d = self.d;
+        let (w, h) = (self.w as f32, self.h as f32);
+        let dw = (w - 80.0 * d).clamp((280.0 * d).min(w - 16.0 * d), 680.0 * d);
+        let inner = dw - 48.0 * d;
+        let (_, content) = self.panel_rows(kind, inner);
+        let chrome = 24.0 * d + 32.0 * d + 16.0 * d + 24.0 * d + 40.0 * d + 24.0 * d;
+        let dh = (chrome + content).min(h - 32.0 * d).max(chrome.min(h));
+        let r = Rf::new((w - dw) / 2.0, ((h - dh) / 2.0).max(8.0 * d), dw, dh);
+        let view = dh - chrome;
+        (r, content, view)
+    }
+
+    fn panel_max_scroll(&self) -> f32 {
+        match &self.overlay {
+            Some(Overlay::Panel { kind, .. }) => {
+                let (_, content, view) = self.panel_frame(*kind);
+                (content - view).max(0.0)
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Content of a panel, positioned from (0, 0), and its height.
+    fn panel_rows(&self, kind: PanelKind, inner: f32) -> (Vec<(Rf, Look, Option<Act>)>, f32) {
+        let d = self.d;
+        let mut out: Vec<(Rf, Look, Option<Act>)> = Vec::new();
+        let mut y = 0.0;
+        let para = |out: &mut Vec<(Rf, Look, Option<Act>)>, y: &mut f32, text: &str, face: Face, color: u32| {
+            let lines = paint::wrap(face, 14.0 * d, text, inner).len() as f32;
+            out.push((
+                Rf::new(0.0, *y, inner, lines * 20.0 * d),
+                Look::Para {
+                    text: text.into(),
+                    face,
+                    size: 14.0 * d,
+                    line: 20.0 * d,
+                    color,
+                    center: false,
+                },
+                None,
+            ));
+            *y += lines * 20.0 * d + 12.0 * d;
+        };
+        let code = |out: &mut Vec<(Rf, Look, Option<Act>)>, y: &mut f32, text: &str| {
+            let bw = font::measure(Face::Medium, 14.0 * d, "Copy").0 + 32.0 * d;
+            let cw = inner - bw - 8.0 * d;
+            let lines = wrap_chars(14.0 * d, text, cw - 24.0 * d).len() as f32;
+            let ch = (lines * 20.0 * d + 16.0 * d).max(40.0 * d);
+            out.push((Rf::new(0.0, *y, cw, ch), Look::Code(text.into()), None));
+            out.push((
+                Rf::new(inner - bw, *y + (ch - 40.0 * d) / 2.0, bw, 40.0 * d),
+                Look::DlgBtn {
+                    text: "Copy".into(),
+                    filled: false,
+                },
+                Some(Act::Copy(text.into())),
+            ));
+            *y += ch + 16.0 * d;
+        };
+        match kind {
+            PanelKind::Claude => {
+                para(&mut out, &mut y, "Claude can read the open board, add notes, shapes, arrows and whole diagrams, move or delete things, and look at a picture of the board. Add this panel to Claude as an MCP connector:", Face::Regular, ON_VARIANT);
+                para(&mut out, &mut y, "From anywhere", Face::Medium, ON_SURFACE);
+                let online = self.relay_online();
+                para(
+                    &mut out,
+                    &mut y,
+                    if online {
+                        "Relay online. Works from claude.ai, the Claude apps and Claude Code."
+                    } else {
+                        "Relay offline right now. This address starts working as soon as the relay can be reached."
+                    },
+                    Face::Regular,
+                    if online { ON_VARIANT } else { ERROR },
+                );
+                if let Some(url) = self.public_mcp() {
+                    code(&mut out, &mut y, &url);
+                }
+                para(&mut out, &mut y, "On this network", Face::Medium, ON_SURFACE);
+                match self.lan_mcp() {
+                    Some(url) => code(&mut out, &mut y, &url),
+                    None => para(&mut out, &mut y, "Connect to Wi-Fi or Ethernet to get a local address.", Face::Regular, ON_VARIANT),
+                }
+                para(&mut out, &mut y, "Claude Code", Face::Medium, ON_SURFACE);
+                if let Some(url) = self.public_mcp().or_else(|| self.lan_mcp()) {
+                    code(&mut out, &mut y, &format!("claude mcp add --transport http inkboard {url}"));
+                }
+                para(&mut out, &mut y, "Claude app or claude.ai: Settings → Connectors → Add custom connector, name it Inkboard and paste the address from anywhere.", Face::Regular, ON_VARIANT);
+                para(&mut out, &mut y, "Suggested models: Claude Opus 5.5 for diagrams, plans and big layouts; Claude Sonnet 5.5 for quick notes and edits.", Face::Regular, ON_VARIANT);
+                para(&mut out, &mut y, "Anyone with these addresses can change the open board. Keep them private.", Face::Regular, ERROR);
+            }
+            PanelKind::Share => {
+                if let Some(c) = self.host_code() {
+                    para(&mut out, &mut y, "On another device open Inkboard, tap Join (the person-plus icon) and enter:", Face::Regular, ON_VARIANT);
+                    out.push((
+                        Rf::new(0.0, y, inner, 56.0 * d),
+                        Look::Label {
+                            text: c.clone(),
+                            face: Face::Bold,
+                            size: 40.0 * d,
+                            color: PRIMARY,
+                            center: true,
+                        },
+                        None,
+                    ));
+                    y += 64.0 * d;
+                    code(&mut out, &mut y, &c);
+                    let route = if self.relay_online() {
+                        "Devices on this network connect directly; others connect through the relay."
+                    } else {
+                        "Devices on this network connect directly. The relay is offline, so other networks cannot join yet."
+                    };
+                    para(&mut out, &mut y, route, Face::Regular, ON_VARIANT);
+                    if let Some(ip) = self.lan_ip {
+                        para(&mut out, &mut y, &format!("This panel: {ip}"), Face::Regular, STATUS);
+                    }
+                    let sw = font::measure(Face::Medium, 14.0 * d, "Stop sharing").0 + 32.0 * d;
+                    out.push((
+                        Rf::new(0.0, y, sw, 40.0 * d),
+                        Look::DlgBtn {
+                            text: "Stop sharing".into(),
+                            filled: false,
+                        },
+                        Some(Act::StopShare),
+                    ));
+                    y += 52.0 * d;
+                } else {
+                    let state = match self.link_online {
+                        Some(true) => "live: changes appear on both devices.",
+                        Some(false) => "reconnecting to the device that shares it…",
+                        None => "connecting to the device that shares it…",
+                    };
+                    para(&mut out, &mut y, &format!("This board was joined from another device and is {state}"), Face::Regular, ON_VARIANT);
+                }
+            }
+            PanelKind::Fonts => {
+                let gap = 8.0 * d;
+                let cols = (((inner + gap) / (168.0 * d)).floor() as usize).max(1);
+                let tw = (inner - gap * (cols as f32 - 1.0)) / cols as f32;
+                let th = 56.0 * d;
+                for (i, _) in text::FONT_NAMES.iter().enumerate() {
+                    let (c, r) = (i % cols, i / cols);
+                    out.push((
+                        Rf::new(c as f32 * (tw + gap), r as f32 * (th + gap), tw, th),
+                        Look::FontTile {
+                            font: i as u8,
+                            chosen: self.settings.font == i as u8,
+                        },
+                        Some(Act::Font(i as u8)),
+                    ));
+                }
+                let rows = text::FONT_NAMES.len().div_ceil(cols) as f32;
+                y = rows * (th + gap);
+            }
+        }
+        (out, y.max(0.0))
+    }
+
+    fn layout_panel(&self, ui: &mut Ui, kind: PanelKind, scroll: f32) {
+        let d = self.d;
+        let (w, h) = (self.w as f32, self.h as f32);
+        let (r, _, view) = self.panel_frame(kind);
+        ui.push(
+            Rf::new(0.0, 0.0, w, h),
+            Look::Scrim(0x8a000000),
+            Some(Act::Outside),
+        );
+        ui.push(
+            r,
+            Look::Surface {
+                color: DIALOG,
+                radius: 28.0,
+                elev: 3.0,
+                border: false,
+            },
+            Some(Act::Nothing),
+        );
+        let title = match kind {
+            PanelKind::Share => "Share board",
+            PanelKind::Claude => "Connect Claude",
+            PanelKind::Fonts => "Text font",
+        };
+        let inner = r.w - 48.0 * d;
+        ui.push(
+            Rf::new(r.x + 24.0 * d, r.y + 24.0 * d, inner, 32.0 * d),
+            Look::Label {
+                text: title.into(),
+                face: Face::Regular,
+                size: 24.0 * d,
+                color: ON_SURFACE,
+                center: false,
+            },
+            None,
+        );
+        let top = r.y + 24.0 * d + 32.0 * d + 16.0 * d;
+        let bottom = top + view;
+        let (rows, _) = self.panel_rows(kind, inner);
+        for (rr, look, act) in rows {
+            let placed = Rf::new(r.x + 24.0 * d + rr.x, top + rr.y - scroll, rr.w, rr.h);
+            if placed.y >= top - 0.5 && placed.bottom() <= bottom + 0.5 {
+                ui.push(placed, look, act);
+            }
+        }
+        let ow = font::measure(Face::Medium, 14.0 * d, "Done").0 + 48.0 * d;
+        let by = r.bottom() - 24.0 * d - 40.0 * d;
+        if self.panel_max_scroll() > 0.0 {
+            ui.push(
+                Rf::new(r.x + 24.0 * d, by, inner - ow - 8.0 * d, 40.0 * d),
+                Look::Label {
+                    text: "Drag to see more".into(),
+                    face: Face::Regular,
+                    size: 12.0 * d,
+                    color: STATUS,
+                    center: false,
+                },
+                None,
+            );
+        }
+        ui.push(
+            Rf::new(r.right() - 24.0 * d - ow, by, ow, 40.0 * d),
+            Look::DlgBtn {
+                text: "Done".into(),
+                filled: true,
+            },
+            Some(Act::Cancel),
+        );
+    }
+
+    // ------------------------------------------------------------ sharing
+
+    fn shape_map(&self) -> HashMap<String, Value> {
+        self.ed
+            .doc
+            .shapes()
+            .iter()
+            .map(|s| (s.id.clone(), s.to_json()))
+            .collect()
+    }
+
+    /// Joined boards remember where they came from; reopening reconnects.
+    fn start_link(&mut self) {
+        self.link = None;
+        self.known.clear();
+        self.link_online = None;
+        let Some(share) = self.board.as_ref().and_then(|b| b.extra.get("lanShare")) else {
+            return;
+        };
+        let (Some(host), Some(code)) = (share["host"].as_str(), share["code"].as_str()) else {
+            return;
+        };
+        self.known = self.shape_map();
+        self.ops_sent = 0;
+        self.link = Some(net::link(host.to_string(), code.to_string(), self.wake.clone()));
+    }
+
+    /// Tells the relay which share codes may be looked up.
+    fn sync_relay_codes(&mut self) {
+        let code = self.host_code().unwrap_or_default();
+        if let Some(relay) = &self.relay {
+            if let Ok(mut c) = relay.codes.lock() {
+                *c = code;
+            }
+        }
+    }
+
+    fn take_net(&mut self) {
+        while let Ok(req) = self.net_rx.try_recv() {
+            let resp = self.answer(&req);
+            let _ = req.reply.send(resp);
+        }
+    }
+
+    fn answer(&mut self, req: &net::Req) -> net::Resp {
+        let path = req.path.trim_end_matches('/');
+        if let Some(key) = path.strip_prefix("/mcp/") {
+            if key != self.settings.mcp_key {
+                return net::Resp::empty(404);
+            }
+            let version = self.version.clone();
+            return net::mcp(self, &req.method, &req.body, &version);
+        }
+        if path == "/health" {
+            return net::Resp::json(200, &json!({ "app": "Inkboard", "version": self.version }));
+        }
+        let Some(what) = path.strip_prefix("/canvas/") else {
+            return net::Resp::empty(404);
+        };
+        let code = req.query.get("code").cloned().unwrap_or_default();
+        if code.is_empty() || self.host_code().as_deref() != Some(code.as_str()) {
+            return net::Resp::json(404, &json!({ "error": "No board is shared with that code" }));
+        }
+        match what {
+            "hello" => {
+                let name = self.board.as_ref().map(|b| b.title.clone()).unwrap_or_default();
+                net::Resp::json(200, &json!({ "name": name }))
+            }
+            "board" => {
+                let since = req.query.get("since").and_then(|s| s.parse::<u64>().ok());
+                let mut v = json!({ "revision": self.doc_gen });
+                if since != Some(self.doc_gen) {
+                    v["shapes"] = Value::Array(
+                        self.ed.doc.shapes().iter().map(|s| s.to_json()).collect(),
+                    );
+                }
+                net::Resp::json(200, &v)
+            }
+            "ops" if req.method == "POST" => {
+                let ops = serde_json::from_slice::<Value>(&req.body)
+                    .ok()
+                    .and_then(|v| v["operations"].as_array().cloned())
+                    .unwrap_or_default();
+                match net::parse_ops(&ops) {
+                    Ok((put, remove)) => {
+                        if !put.is_empty() || !remove.is_empty() {
+                            self.ed.apply_remote(put, remove);
+                            self.take_editor_events();
+                        }
+                        net::Resp::json(200, &json!({ "revision": self.doc_gen }))
+                    }
+                    Err(e) => net::Resp::json(400, &json!({ "error": e })),
+                }
+            }
+            _ => net::Resp::empty(404),
+        }
+    }
+
+    fn take_link(&mut self) {
+        let mut snapshot = None;
+        let mut status = None;
+        if let Some(link) = &self.link {
+            while let Ok(ev) = link.events.try_recv() {
+                match ev {
+                    net::LinkEvent::Snapshot { shapes, batches, .. } => {
+                        if batches >= self.ops_sent {
+                            snapshot = Some(shapes);
+                        }
+                    }
+                    net::LinkEvent::Status(on) => status = Some(on),
+                }
+            }
+        }
+        if let Some(on) = status {
+            if self.link_online != Some(on) {
+                self.link_online = Some(on);
+                self.full = true;
+            }
+        }
+        let Some(shapes) = snapshot else {
+            return;
+        };
+        let theirs: HashMap<String, Value> = shapes
+            .into_iter()
+            .filter_map(|v| Some((v["id"].as_str()?.to_string(), v)))
+            .collect();
+        let mine = self.shape_map();
+        let mut put = Vec::new();
+        for (id, v) in &theirs {
+            if mine.get(id) != Some(v) {
+                if let Ok(s) = Shape::from_json(v) {
+                    put.push(s);
+                }
+            }
+        }
+        let remove: Vec<String> = mine.keys().filter(|id| !theirs.contains_key(*id)).cloned().collect();
+        // What the host has is now known, so these changes are not sent back.
+        self.known = theirs;
+        if !put.is_empty() || !remove.is_empty() {
+            self.ed.apply_remote(put, remove);
+            self.take_editor_events();
+        }
+    }
+
+    fn take_join(&mut self) {
+        let Some(rx) = &self.joining else {
+            return;
+        };
+        let Ok((code, found)) = rx.try_recv() else {
+            return;
+        };
+        self.joining = None;
+        match found {
+            Ok((host, name)) => {
+                let mut extra = Map::new();
+                extra.insert("lanShare".into(), json!({ "host": host, "code": code }));
+                let title = if name.is_empty() { "Shared board".to_string() } else { name };
+                let id = Self::new_board_id();
+                let updated = self.timestamp();
+                self.send(Job::Create {
+                    id,
+                    title,
+                    updated,
+                    extra,
+                });
+            }
+            Err(e) => self.show_toast(&e),
+        }
+    }
+
 
     /// A text button and a filled button, right aligned at `right`.
     fn dialog_buttons(&self, ui: &mut Ui, right: f32, y: f32, cancel: &str, ok: &str) {
@@ -2587,7 +3273,11 @@ impl App {
                 } else {
                     DISABLED
                 };
-                p.icon(*icon, *isz, r.cx(), r.cy(), color);
+                if *icon == icon::ERASER {
+                    p.eraser(*isz, r.cx(), r.cy(), color);
+                } else {
+                    p.icon(*icon, *isz, r.cx(), r.cy(), color);
+                }
             }
             Look::AppIcon { icon, badge } => {
                 p.icon(*icon, 24.0 * d, r.cx(), r.cy(), ON_VARIANT);
@@ -2801,6 +3491,41 @@ impl App {
                     if *failed { ERROR } else { STATUS },
                 );
             }
+            Look::Code(text) => {
+                p.rrect(r, 8.0 * d, CHOSEN);
+                let size = 14.0 * d;
+                for (i, l) in wrap_chars(size, text, r.w - 24.0 * d).iter().enumerate() {
+                    let base = middle(p, Face::Regular, size, r.y + 8.0 * d + 20.0 * d * i as f32, 20.0 * d);
+                    p.text(Face::Regular, size, l, r.x + 12.0 * d, base, ON_SURFACE);
+                }
+            }
+            Look::FontTile { font: f, chosen } => {
+                if *chosen {
+                    p.rrect(r, 10.0 * d, FAB_BG);
+                    p.rrect_line(r, 10.0 * d, PRIMARY, 2.0 * d);
+                } else {
+                    p.rrect(r, 10.0 * d, WHITE);
+                    p.rrect_line(r, 10.0 * d, BORDER, d.max(1.0));
+                }
+                let name = text::FONT_NAMES[*f as usize];
+                let px = (22.0 * d).round() as u32;
+                let mut cache = self.font_tiles.borrow_mut();
+                let bitmap = cache
+                    .entry((*f, px))
+                    .or_insert_with(|| text::rasterize(name, px as f64, INK, *f));
+                match bitmap {
+                    Some(b) if b.width as f32 <= r.w - 16.0 * d => {
+                        let x = r.cx() - b.width as f32 / 2.0;
+                        let y = r.cy() - b.height as f32 / 2.0;
+                        p.image(&b.rgba, b.width, b.height, x, y);
+                    }
+                    _ => {
+                        let tw = font::measure(Face::Regular, 16.0 * d, name).0.min(r.w - 16.0 * d);
+                        let base = middle(p, Face::Regular, 16.0 * d, r.y, r.h);
+                        p.text_fit(Face::Regular, 16.0 * d, name, r.cx() - tw / 2.0, base, r.w - 16.0 * d, INK);
+                    }
+                }
+            }
             Look::Toast(text) => {
                 p.shadow(r, 4.0 * d, d, 1.0);
                 p.rrect(r, 4.0 * d, TOAST_BG);
@@ -2830,6 +3555,66 @@ impl App {
             }
             Hl::None => {}
         }
+    }
+}
+
+/// Splits `text` into lines no wider than `width`, breaking anywhere (for
+/// addresses and commands, which have few spaces).
+fn wrap_chars(size: f32, text: &str, width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for c in text.chars() {
+        line.push(c);
+        if line.chars().count() > 1 && font::measure(Face::Regular, size, &line).0 > width {
+            line.pop();
+            lines.push(std::mem::take(&mut line));
+            line.push(c);
+        }
+    }
+    lines.push(line);
+    lines
+}
+
+/// The whole board as a PNG no larger than `max_side` on either side.
+fn board_png(shapes: &[Arc<Shape>], max_side: u32) -> Option<Vec<u8>> {
+    let b = crate::document::scene_bounds(shapes)?;
+    let (bw, bh) = (b.width() + 32.0, b.height() + 32.0);
+    let zoom = (max_side as f64 / bw.max(bh)).min(1.5);
+    let w = ((bw * zoom).ceil() as u32).clamp(16, max_side);
+    let h = ((bh * zoom).ceil() as u32).clamp(16, max_side);
+    let rgba = render::thumbnail(shapes, w, h);
+    let size = tiny_skia::IntSize::from_wh(w, h)?;
+    tiny_skia::Pixmap::from_vec(rgba, size)?.encode_png().ok()
+}
+
+impl net::Board for App {
+    fn info(&self) -> Option<(String, usize, u64)> {
+        let b = self.board.as_ref()?;
+        Some((b.title.clone(), self.ed.doc.shapes().len(), self.doc_gen))
+    }
+
+    fn shapes(&self) -> Vec<Value> {
+        if self.board.is_none() {
+            return Vec::new();
+        }
+        self.ed.doc.shapes().iter().map(|s| s.to_json()).collect()
+    }
+
+    fn has(&self, id: &str) -> bool {
+        self.ed.doc.contains(id)
+    }
+
+    fn apply(&mut self, put: Vec<Shape>, remove: Vec<String>) -> u64 {
+        if self.board.is_some() && (!put.is_empty() || !remove.is_empty()) {
+            self.ed.apply_remote(put, remove);
+            self.take_editor_events();
+        }
+        self.doc_gen
+    }
+
+    fn png(&mut self, max_side: u32) -> Option<Vec<u8>> {
+        self.board.as_ref()?;
+        board_png(self.ed.doc.shapes(), max_side)
     }
 }
 
@@ -2956,6 +3741,98 @@ mod tests {
         assert!(!app.is_board_open());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    fn req(app: &mut App, method: &str, path: &str, query: &[(&str, &str)], body: Value) -> (u16, Value) {
+        let (reply, _rx) = mpsc::sync_channel(1);
+        let r = net::Req {
+            method: method.into(),
+            path: path.into(),
+            query: query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body: if body.is_null() { Vec::new() } else { body.to_string().into_bytes() },
+            reply,
+        };
+        let resp = app.answer(&r);
+        (resp.status, serde_json::from_slice(&resp.body).unwrap_or(Value::Null))
+    }
+
+    #[test]
+    fn claude_and_sharing_reach_the_open_board() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.5);
+        settle(&mut app);
+        app.run(Act::NewBoard);
+        app.text_input("Team", true);
+        settle(&mut app);
+        assert!(app.is_board_open());
+        let key = app.settings.mcp_key.clone();
+        assert_eq!(key.len(), 24);
+        // A wrong key is not found; the right one is an MCP server.
+        assert_eq!(req(&mut app, "POST", "/mcp/nope", &[], json!({})).0, 404);
+        let mcp = format!("/mcp/{key}");
+        let (status, init) = req(&mut app, "POST", &mcp, &[], json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}));
+        assert_eq!(status, 200);
+        assert_eq!(init["result"]["serverInfo"]["name"], "inkboard");
+        let add = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_shapes","arguments":{"shapes":[
+            {"id":"c1","tool":"rectangle","points":[[0,0],[200,120]]},
+            {"id":"c2","tool":"arrow","points":[[220,60],[400,60]]}]}}});
+        let (_, added) = req(&mut app, "POST", &mcp, &[], add);
+        assert!(added["result"].get("isError").is_none(), "{added}");
+        assert_eq!(app.ed.doc.shapes().len(), 2);
+        assert!(app.unsaved);
+        let (_, image) = req(&mut app, "POST", &mcp, &[], json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_board_image","arguments":{}}}));
+        assert_eq!(image["result"]["content"][0]["type"], "image");
+        let png = net::unbase64(image["result"]["content"][0]["data"].as_str().unwrap());
+        assert_eq!(&png[1..4], b"PNG");
+
+        // Not shared yet: the canvas endpoints refuse.
+        assert_eq!(req(&mut app, "GET", "/canvas/hello", &[("code", "123456")], Value::Null).0, 404);
+        app.run(Act::Share);
+        let code = app.host_code().unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(matches!(app.overlay, Some(Overlay::Panel { kind: PanelKind::Share, .. })));
+        app.frame(5000);
+        let (_, hello) = req(&mut app, "GET", "/canvas/hello", &[("code", &code)], Value::Null);
+        assert_eq!(hello["name"], "Team");
+        let (_, board) = req(&mut app, "GET", "/canvas/board", &[("code", &code), ("since", "0")], Value::Null);
+        assert_eq!(board["shapes"].as_array().unwrap().len(), 2);
+        let rev = board["revision"].as_u64().unwrap().to_string();
+        let (_, same) = req(&mut app, "GET", "/canvas/board", &[("code", &code), ("since", &rev)], Value::Null);
+        assert!(same.get("shapes").is_none());
+        let ops = json!({"operations":[{"type":"delete","id":"c2"}]});
+        let (status, _) = req(&mut app, "POST", "/canvas/ops", &[("code", &code)], ops);
+        assert_eq!(status, 200);
+        assert_eq!(app.ed.doc.shapes().len(), 1);
+        app.run(Act::StopShare);
+        assert!(app.host_code().is_none());
+        assert_eq!(req(&mut app, "GET", "/canvas/hello", &[("code", &code)], Value::Null).0, 404);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn panels_lay_out_and_choose_fonts() {
+        let (mut app, dir) = app();
+        app.resize(720, 1280, 2.0);
+        settle(&mut app);
+        app.run(Act::Claude);
+        app.frame(3000);
+        assert!(app.nodes.iter().any(|n| matches!(&n.act, Some(Act::Copy(t)) if t.contains("/mcp/"))));
+        app.run(Act::Cancel);
+        app.panel(PanelKind::Fonts);
+        app.frame(3100);
+        let tiles = app.nodes.iter().filter(|n| matches!(n.look, Look::FontTile { .. })).count();
+        assert!(tiles > 4);
+        assert!(app.panel_max_scroll() >= 0.0);
+        app.run(Act::Font(3));
+        assert_eq!(app.settings.font, 3);
+        assert!(app.overlay.is_none());
+        // The settings keep the generated keys.
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["mcpKey"], app.settings.mcp_key.as_str());
+        assert_eq!(share_code("join 654321 please"), "654321");
+        assert_eq!(wrap_chars(14.0, "abcdefghij", 30.0).concat(), "abcdefghij");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
 
     #[test]
     fn dates_are_civil() {

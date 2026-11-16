@@ -1,19 +1,26 @@
-# Canvas Studio Rust 0.5.0
+# Inkboard 0.6.0 (Rust)
 
 The library screen, floating editor toolbars, style panel, menus, dialogs, text/icon drawing and TV remote focus are rendered by Rust. Their layout follows the Flutter app: menu/undo at top left, styles at top right, zoom at bottom left, tools at bottom centre. There are no Kotlin screen or toolbar implementations. A small Android host supplies the Surface, raw input, IME, complex-script text rasterisation, ML Kit and system installation APIs.
 
 ## Included
 
-- Pen, selection/move/resize, marquee selection, eraser, arrows, rectangles and ellipses.
-- Automatic shape tidying and handwriting-to-typed-text conversion, with separate persisted settings. English and Hindi. No keyboard toolbar button; existing text can be edited by double-tapping or selecting it.
-- Five board fonts, colour, width and fill controls.
+- Pen, handwriting-to-text pen, smart-shape pen, selection/move/resize, marquee selection, eraser, arrows, rectangles and ellipses.
+- Automatic shape tidying and handwriting-to-typed-text conversion, with separate persisted settings. English and Hindi. There is no keyboard: board text comes from handwriting or from Claude.
+- 36 board fonts (31 bundled open-licence families, see `assets/licenses`) with a font picker that previews each one; colour, width and fill controls.
+- Export as PNG to Pictures/Inkboard.
+- Share a board with a 6-digit code. Devices on the same network connect directly; other networks go through the relay (`server/relay.mjs`).
+- Claude connector: the panel is a Streamable HTTP MCP server (`/mcp/<key>` on port 18763, and `<relay>/d/<id>/mcp/<key>` from anywhere). Claude can read the open board, add and update shapes, text and diagrams, delete with confirmation and get a PNG picture of the board. Suggested models: Claude Opus 5.5 for diagrams, Claude Sonnet 5.5 for quick edits.
 - Palm rejection, bounded multi-touch forwarding (five contacts), historical/unbuffered input.
 - 1920-pixel maximum drawing-buffer side by default for 4K panels. Full-resolution mode is optional. Only dirty screen rectangles are copied while writing.
 - Atomic saved board files, rename/delete, thumbnails, undo/redo, zoom/fit. Leaving a dirty board waits for the write; a failed write keeps the board open. Backgrounding preserves a stroke already in progress.
 - GitHub OTA checks for `rust-v*` releases, with package/version/signing-certificate validation and Android confirmation before installation.
 - Android API 24+, ARM 32-bit, ARM64, x86 and x86_64 in the same APK.
 
-The package is `com.canvasstudio.rust`, separate from the Flutter app. Earlier Rust boards remain in the same app-private `files/boards` directory. Flutter boards are not automatically imported. Collaboration/Claude MCP and PNG sharing currently remain in the Flutter implementation; they have not been migrated into this Rust UI release.
+The package is `com.canvasstudio.rust`, separate from the Flutter app. Earlier Rust boards remain in the same app-private `files/boards` directory. Flutter boards are not automatically imported. The app is shown as Inkboard; the package name is unchanged so over-the-air updates keep working.
+
+## Relay
+
+`server/relay.mjs` (Node 18+) holds nothing on disk. Panels long-poll `/_dev/poll` with their id and secret; requests to `/d/<id>/...` are queued for that panel, and `/find?code=` maps a share code to the panel sharing it. It listens on 127.0.0.1:18780 and is published over HTTPS (Tailscale Funnel at `https://inkboard.taila6db10.ts.net`, the address built into the app).
 
 ## Build
 

@@ -257,76 +257,69 @@ impl<'a> Painter<'a> {
         }
     }
 
-    /// Canvas Studio's paper-and-pencil mark (brand_logo.dart), filling `r`.
-    pub fn logo(&mut self, r: Rf) {
-        let s = r.w / 108.0;
-        let tf = Transform::from_row(s, 0.0, 0.0, s, r.x - self.ox, r.y - self.oy);
-        let fill = |pm: &mut PixmapMut, path: Option<Path>, color: u32| {
-            if let Some(path) = path {
-                pm.fill_path(&path, &paint(color), FillRule::Winding, tf, None);
-            }
-        };
-        let poly = |pts: &[(f32, f32)]| {
+    /// An eraser tilted on its edge, drawn in a 24-unit box like an icon
+    /// of `size` centred on (cx, cy).
+    pub fn eraser(&mut self, size: f32, cx: f32, cy: f32, color: u32) {
+        let s = size / 24.0;
+        let tf = Transform::from_row(s, 0.0, 0.0, s, cx - 12.0 * s - self.ox, cy - 12.0 * s - self.oy);
+        let poly = |pts: &[(f32, f32)], close: bool| {
             let mut pb = PathBuilder::new();
             pb.move_to(pts[0].0, pts[0].1);
             for p in &pts[1..] {
                 pb.line_to(p.0, p.1);
             }
-            pb.close();
+            if close {
+                pb.close();
+            }
             pb.finish()
         };
-        fill(
-            &mut self.pm,
-            rrect_path(Rf::new(0.0, 0.0, 108.0, 108.0), 25.0),
-            0xff6750d8,
-        );
-        fill(
-            &mut self.pm,
-            rrect_path(Rf::new(28.0, 23.0, 52.0, 64.0), 8.0),
-            0xffffffff,
-        );
-        fill(
-            &mut self.pm,
-            rrect_path(Rf::new(38.0, 36.0, 23.0, 4.0), 2.0),
-            0xffe7e0ff,
-        );
-        fill(
-            &mut self.pm,
-            rrect_path(Rf::new(38.0, 46.0, 13.0, 4.0), 2.0),
-            0xffe7e0ff,
-        );
-        fill(
-            &mut self.pm,
-            poly(&[(40.0, 61.0), (64.0, 37.0), (76.0, 49.0), (52.0, 73.0)]),
-            0xffff8966,
-        );
-        let cap = {
-            let mut pb = PathBuilder::new();
-            pb.move_to(64.0, 37.0);
-            pb.line_to(68.0, 33.0);
-            pb.quad_to(72.0, 29.0, 76.0, 33.0);
-            pb.line_to(80.0, 37.0);
-            pb.quad_to(84.0, 41.0, 80.0, 45.0);
-            pb.line_to(76.0, 49.0);
-            pb.close();
-            pb.finish()
+        let stroke = tiny_skia::Stroke {
+            width: 2.0,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
         };
-        fill(&mut self.pm, cap, 0xffffb39b);
-        fill(
-            &mut self.pm,
-            poly(&[(44.0, 65.0), (68.0, 41.0), (72.0, 45.0), (48.0, 69.0)]),
-            0xffffa184,
-        );
-        fill(
-            &mut self.pm,
-            poly(&[(36.0, 77.0), (40.0, 61.0), (52.0, 73.0)]),
-            0xffffd8aa,
-        );
-        fill(
-            &mut self.pm,
-            poly(&[(36.0, 77.0), (38.0, 69.0), (44.0, 75.0)]),
-            0xff453587,
-        );
+        if let Some(tip) = poly(&[(3.5, 14.5), (7.1, 10.9), (14.1, 17.9), (10.5, 21.5)], true) {
+            self.pm.fill_path(&tip, &paint(color), FillRule::Winding, tf, None);
+        }
+        if let Some(body) = poly(&[(3.5, 14.5), (12.5, 5.5), (19.5, 12.5), (10.5, 21.5)], true) {
+            self.pm.stroke_path(&body, &paint(color), &stroke, tf, None);
+        }
+        if let Some(floor) = poly(&[(13.5, 21.5), (21.0, 21.5)], false) {
+            self.pm.stroke_path(&floor, &paint(color), &stroke, tf, None);
+        }
+    }
+
+    /// Inkboard's mark: a white board with a pen stroke, filling `r`.
+    pub fn logo(&mut self, r: Rf) {
+        let s = r.w / 108.0;
+        let tf = Transform::from_row(s, 0.0, 0.0, s, r.x - self.ox, r.y - self.oy);
+        if let Some(bg) = rrect_path(Rf::new(0.0, 0.0, 108.0, 108.0), 25.0) {
+            self.pm.fill_path(&bg, &paint(0xff6750d8), FillRule::Winding, tf, None);
+        }
+        let line = |width: f32| tiny_skia::Stroke {
+            width,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+        let mut legs = PathBuilder::new();
+        legs.move_to(40.0, 80.0);
+        legs.line_to(34.0, 92.0);
+        legs.move_to(68.0, 80.0);
+        legs.line_to(74.0, 92.0);
+        if let Some(legs) = legs.finish() {
+            self.pm.stroke_path(&legs, &paint(0xffffffff), &line(5.0), tf, None);
+        }
+        if let Some(board) = rrect_path(Rf::new(18.0, 24.0, 72.0, 58.0), 8.0) {
+            self.pm.fill_path(&board, &paint(0xffffffff), FillRule::Winding, tf, None);
+        }
+        let mut swoosh = PathBuilder::new();
+        swoosh.move_to(31.0, 64.0);
+        swoosh.cubic_to(42.0, 36.0, 58.0, 76.0, 77.0, 42.0);
+        if let Some(swoosh) = swoosh.finish() {
+            self.pm.stroke_path(&swoosh, &paint(0xff6750d8), &line(7.0), tf, None);
+        }
     }
 }
 

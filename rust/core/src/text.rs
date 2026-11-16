@@ -20,9 +20,24 @@ pub trait TextHost: Send + Sync {
     fn rasterize(&self, text: &str, font_px: f64, color: u32, font: u8) -> Option<TextBitmap>;
 }
 
-/// Font choices for board text. The name is what is stored in board files;
-/// the host maps each one to a system typeface.
-pub const FONTS: [&str; 5] = ["sans", "serif", "mono", "hand", "script"];
+/// Font choices for board text. The id is what is stored in board files;
+/// the host maps each one to a system or bundled typeface. New fonts are only
+/// ever appended so stored indexes keep their meaning.
+pub const FONTS: [&str; 36] = [
+    "sans", "serif", "mono", "hand", "script", "inter", "opensans", "lato", "montserrat", "poppins", "nunito",
+    "oswald", "raleway", "ubuntu", "merriweather", "playfair", "lora", "robotoslab", "jetbrains", "sourcecode",
+    "caveat", "patrick", "kalam", "indie", "architects", "shadows", "comicneue", "marker", "amatic", "pacifico",
+    "greatvibes", "lobster", "bebas", "notodeva", "hind", "tiro",
+];
+
+/// Names shown to people for each entry of [`FONTS`].
+pub const FONT_NAMES: [&str; 36] = [
+    "Sans", "Serif", "Mono", "Handwriting", "Script", "Inter", "Open Sans", "Lato", "Montserrat", "Poppins", "Nunito",
+    "Oswald", "Raleway", "Ubuntu", "Merriweather", "Playfair Display", "Lora", "Roboto Slab", "JetBrains Mono",
+    "Source Code Pro", "Caveat", "Patrick Hand", "Kalam", "Indie Flower", "Architects Daughter", "Shadows Into Light",
+    "Comic Neue", "Permanent Marker", "Amatic SC", "Pacifico", "Great Vibes", "Lobster", "Bebas Neue",
+    "Noto Sans Devanagari", "Hind", "Tiro Devanagari",
+];
 
 pub fn font_index(name: &str) -> u8 {
     FONTS.iter().position(|f| *f == name).unwrap_or(0) as u8

@@ -1,6 +1,7 @@
 package com.canvasstudio.rust
 
 import android.app.Application
+import android.content.res.AssetManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
@@ -31,19 +32,32 @@ object RustApp {
 /** Measures and draws text for the engine, which calls in from its render thread. */
 object TextHost {
     const val LINE_HEIGHT = 1.3f
-    val FONT_NAMES = arrayOf("Sans", "Serif", "Mono", "Handwriting", "Script")
+    /** Same order as `text::FONTS` in the engine; bundled faces live in assets/fonts. */
+    private val FONT_IDS = arrayOf(
+        "sans", "serif", "mono", "shantell", "dancing", "inter", "opensans", "lato", "montserrat", "poppins", "nunito",
+        "oswald", "raleway", "ubuntu", "merriweather", "playfair", "lora", "robotoslab", "jetbrains", "sourcecode",
+        "caveat", "patrick", "kalam", "indie", "architects", "shadows", "comicneue", "marker", "amatic", "pacifico",
+        "greatvibes", "lobster", "bebas", "notodeva", "hind", "tiro",
+    )
+    @Volatile var assets: AssetManager? = null
+    private val faces = arrayOfNulls<Typeface>(FONT_IDS.size)
 
-    private val faces: Array<Typeface> by lazy {
-        arrayOf(
-            Typeface.SANS_SERIF,
-            Typeface.SERIF,
-            Typeface.MONOSPACE,
-            Typeface.create("casual", Typeface.NORMAL),
-            Typeface.create("cursive", Typeface.NORMAL),
-        )
+    fun typeface(font: Int): Typeface {
+        val i = font.coerceIn(0, FONT_IDS.size - 1)
+        faces[i]?.let { return it }
+        val face = when (FONT_IDS[i]) {
+            "sans" -> Typeface.SANS_SERIF
+            "serif" -> Typeface.SERIF
+            "mono" -> Typeface.MONOSPACE
+            else -> try {
+                Typeface.createFromAsset(assets, "fonts/${FONT_IDS[i]}.ttf")
+            } catch (e: Exception) {
+                Typeface.SANS_SERIF
+            }
+        }
+        faces[i] = face
+        return face
     }
-
-    fun typeface(font: Int): Typeface = faces[font.coerceIn(0, faces.size - 1)]
 
     private fun paint(size: Float, font: Int) = Paint(Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG).apply {
         textSize = size
@@ -91,6 +105,7 @@ object TextHost {
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        TextHost.assets = assets
         Native.init(TextHost::class.java)
     }
 }

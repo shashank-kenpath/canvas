@@ -1,17 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- TV banner: the Inkboard mark; the launcher shows the name. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="320dp"
     android:height="180dp"
     android:viewportWidth="320"
     android:viewportHeight="180">
     <path
-        android:fillColor="#2f6fed"
+        android:fillColor="#6750d8"
         android:pathData="M0,0h320v180h-320z" />
-    <path
-        android:fillColor="#00000000"
-        android:pathData="M112,122 C128,74 144,62 160,86 C176,110 192,94 208,42"
-        android:strokeColor="#ffffff"
-        android:strokeLineCap="round"
-        android:strokeLineJoin="round"
-        android:strokeWidth="12" />
+    <group android:translateX="83" android:translateY="13" android:scaleX="1.42" android:scaleY="1.42">
+        <path
+            android:fillColor="#00000000"
+            android:pathData="M40,80 L34,92 M68,80 L74,92"
+            android:strokeColor="#ffffff"
+            android:strokeLineCap="round"
+            android:strokeWidth="5" />
+        <path
+            android:fillColor="#ffffff"
+            android:pathData="M26,24 H82 A8,8 0 0 1 90,32 V74 A8,8 0 0 1 82,82 H26 A8,8 0 0 1 18,74 V32 A8,8 0 0 1 26,24 Z" />
+        <path
+            android:fillColor="#00000000"
+            android:pathData="M31,64 C42,36 58,76 77,42"
+            android:strokeColor="#6750d8"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round"
+            android:strokeWidth="7" />
+    </group>
 </vector>

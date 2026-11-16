@@ -51,6 +51,8 @@ pub enum PenMode {
     Ink,
     /// Replaces a rough outline with a clean shape as soon as the pen lifts.
     Shape,
+    /// Reads everything written as typed text after a short pause.
+    Write,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -401,6 +403,27 @@ impl Editor {
         self.invalidate_all();
         self.events |= EV_STATE;
         Ok(())
+    }
+
+    /// Brings in shapes changed on another device: `put` adds or replaces,
+    /// `remove` deletes. It is one undo step, like any other change.
+    pub fn apply_remote(&mut self, put: Vec<Shape>, remove: Vec<String>) {
+        let mut drop: Vec<String> = remove;
+        let mut add: Vec<Shape> = Vec::new();
+        for s in put {
+            if self.doc.get(&s.id).is_some_and(|old| **old == s) {
+                continue;
+            }
+            if self.doc.contains(&s.id) {
+                drop.push(s.id.clone());
+            }
+            add.push(s);
+        }
+        if drop.is_empty() && add.is_empty() {
+            return;
+        }
+        let applied = self.doc.swap(drop, add);
+        self.on_applied(applied);
     }
 
     pub fn set_tool(&mut self, tool: Tool, pen_mode: PenMode) {
@@ -1100,6 +1123,8 @@ impl Editor {
                 let snapped = held.or_else(|| {
                     if self.pen_mode == PenMode::Shape {
                         recognize_shape(&raw)
+                    } else if self.pen_mode == PenMode::Write {
+                        None
                     } else if self.auto_convert {
                         auto = true;
                         self.auto_shape(&raw)
@@ -1113,7 +1138,7 @@ impl Editor {
                     if auto {
                         self.last_auto = Some((raw.clone(), time));
                     }
-                } else if self.auto_text {
+                } else if self.auto_text || self.pen_mode == PenMode::Write {
                     self.note_ink(&raw.id, raw.bounds(), time);
                 }
                 let applied = self.doc.add(snapped.unwrap_or(raw));

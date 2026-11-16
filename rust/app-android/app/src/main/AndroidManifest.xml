@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Only used to download the handwriting model once. -->
+    <!-- Handwriting model download, updates, board sharing and the Claude connector. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
@@ -16,7 +16,7 @@
         android:enableOnBackInvokedCallback="false"
         android:hardwareAccelerated="true"
         android:icon="@drawable/icon"
-        android:label="Canvas Studio"
+        android:label="Inkboard"
         android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"

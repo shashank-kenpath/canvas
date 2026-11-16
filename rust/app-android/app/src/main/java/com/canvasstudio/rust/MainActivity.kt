@@ -195,5 +195,38 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     fun installUpdate(url: String) { onMain { updater.download(url) } }
     fun setFullResolution(on: Boolean) { onMain { surface.maxSide = if (on) 0 else BoardSurface.MAX_SIDE } }
     fun finishApp() { onMain { finish() } }
+
+    fun copyText(text: String) { onMain {
+        val clip = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        clip.setPrimaryClip(android.content.ClipData.newPlainText("Inkboard", text))
+    } }
+
+    /** Saves an exported board to Pictures/Inkboard (app pictures before Android 10). */
+    fun savePng(title: String, png: ByteArray) {
+        Thread {
+            val safe = title.replace(Regex("[^A-Za-z0-9 _-]"), "").trim().ifEmpty { "Board" }
+            val name = "$safe ${System.currentTimeMillis() / 1000}.png"
+            val message = try {
+                if (android.os.Build.VERSION.SDK_INT >= 29) {
+                    val values = android.content.ContentValues().apply {
+                        put(android.provider.MediaStore.Images.Media.DISPLAY_NAME, name)
+                        put(android.provider.MediaStore.Images.Media.MIME_TYPE, "image/png")
+                        put(android.provider.MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Inkboard")
+                    }
+                    val uri = contentResolver.insert(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                        ?: throw java.io.IOException("no media store")
+                    contentResolver.openOutputStream(uri)?.use { it.write(png) } ?: throw java.io.IOException("no stream")
+                    "Saved to Pictures/Inkboard"
+                } else {
+                    val dir = getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES) ?: filesDir
+                    File(dir, name).writeBytes(png)
+                    "Saved to ${dir.path}"
+                }
+            } catch (e: Exception) {
+                "Could not save the picture"
+            }
+            main.post { notifyRust(message) }
+        }.start()
+    }
     private fun notifyRust(message: String) { val h = handle; if (h != 0L) RustApp.toast(h, message) }
 }
