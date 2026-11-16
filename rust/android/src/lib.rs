@@ -14,6 +14,8 @@
 #![cfg(target_os = "android")]
 #![allow(non_snake_case)]
 
+mod ui_host;
+
 use canvas_core::editor::{Contact, Editor, PenMode};
 use canvas_core::geom::{IRect, Pt};
 use canvas_core::render::Layer;

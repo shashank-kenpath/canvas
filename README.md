@@ -1,5 +1,7 @@
 # Canvas Studio — native Android app
 
+The Rust Android port is now in [`rust/`](rust/README.md), with its library, editor controls, menus and dialogs rendered in Rust. Download: [Rust APK](https://annotated-remedies-property-binding.trycloudflare.com/canvas-studio-rust.apk). The Flutter implementation below remains available alongside it.
+
 Version 2 is a native Flutter implementation. The editor uses Flutter CustomPainter, Canvas, TextPainter and native gestures. No WebView, React runtime, JavaScript editor or tldraw SDK is packaged into this APK.
 
 The fetched tldraw repository at `upstream/tldraw` is retained as a reference for interaction concepts. Its React renderer is not a native Flutter renderer; this is a smaller native implementation, not a full port of the tldraw SDK. The previous WebView prototype source remains in `editor/` for reference and is excluded from the native build.

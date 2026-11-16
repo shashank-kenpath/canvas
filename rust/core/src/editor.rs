@@ -768,6 +768,15 @@ impl Editor {
         }
     }
 
+    /// Preserve the last sample when Android backgrounds the app mid-stroke.
+    pub fn finish_input(&mut self, now: u64) {
+        let pointers = self.pointers.clone();
+        for (id, pos) in pointers {
+            self.pointer_up(id, pos * self.dpr, now, false);
+        }
+        self.ignored.clear();
+    }
+
     /// Runs timers; call when [`Editor::next_deadline`] has passed.
     pub fn tick(&mut self, now: u64) {
         if self.snap_deadline.is_some_and(|d| now >= d) {
@@ -848,6 +857,26 @@ impl Editor {
         if vh > 0.0 && bounds.height() * self.zoom > vh * 0.45 {
             return;
         }
+        self.ink_token = self.ink_token.wrapping_add(1);
+        self.ink_requests.push_back(InkRequest {
+            token: self.ink_token,
+            ids: shapes.iter().map(|s| s.id.clone()).collect(),
+            strokes: shapes.iter().map(|s| s.points.clone()).collect(),
+            bounds,
+        });
+        self.events |= EV_INK;
+    }
+
+    /// Number of selected pen strokes.
+    pub fn selected_ink_count(&self) -> usize {
+        self.doc.selected_shapes().iter().filter(|s| s.tool == Tool::Pen).count()
+    }
+
+    /// Asks the host to read the selected pen strokes as handwriting, even
+    /// when automatic conversion is off.
+    pub fn convert_selection(&mut self) {
+        let shapes: Vec<Arc<Shape>> = self.doc.selected_shapes().into_iter().filter(|s| s.tool == Tool::Pen).collect();
+        let Some(bounds) = scene_bounds(&shapes) else { return };
         self.ink_token = self.ink_token.wrapping_add(1);
         self.ink_requests.push_back(InkRequest {
             token: self.ink_token,

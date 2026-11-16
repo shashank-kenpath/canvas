@@ -7,3 +7,4 @@ description = "Canvas Studio whiteboard core: document, tools, recognition, soft
 [dependencies]
 serde_json = "1"
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ab_glyph = "0.2"

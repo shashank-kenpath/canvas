@@ -13,6 +13,7 @@ pub mod render;
 pub mod shape;
 pub mod store;
 pub mod text;
+pub mod ui;
 
 pub use document::Document;
 pub use editor::{Contact, Editor, InkRequest, PenMode, TextRequest};

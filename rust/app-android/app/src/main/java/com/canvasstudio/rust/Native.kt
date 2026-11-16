@@ -7,44 +7,27 @@ import android.graphics.Paint
 import android.graphics.Typeface
 import android.view.Surface
 
-/** The Rust engine. See rust/android/src/lib.rs for what each call does. */
+/** Process-wide text rasterisation bridge used for complex scripts. */
 object Native {
-    init {
-        System.loadLibrary("canvas_android")
-    }
-
-    /** Called on the render thread with a set of EV_ bits. */
-    interface Listener {
-        fun onEvent(bits: Int)
-    }
-
-    const val EV_STATE = 1
-    const val EV_DOC = 2
-    const val EV_TEXT = 4
-    const val EV_HAPTIC = 8
-    const val EV_VIEW = 16
-    const val EV_INK = 32
-
+    init { System.loadLibrary("canvas_android") }
     @JvmStatic external fun init(textClass: Class<*>)
-    @JvmStatic external fun create(listener: Listener): Long
+}
+
+/** Commands are queued to the Rust-owned application/render thread. */
+object RustApp {
+    init { System.loadLibrary("canvas_android") }
+    @JvmStatic external fun create(host: MainActivity, dir: String, settings: String, version: String, utcOffset: Int): Long
     @JvmStatic external fun destroy(handle: Long)
     @JvmStatic external fun surface(handle: Long, surface: Surface?, w: Int, h: Int, dpr: Double)
     @JvmStatic external fun touch(handle: Long, action: Int, base: Long, data: FloatArray, count: Int)
-    @JvmStatic external fun command(handle: Long, command: Int, a: Double, b: Double)
-    @JvmStatic external fun state(handle: Long): DoubleArray?
-    @JvmStatic external fun takeTextRequest(handle: Long): String?
-    @JvmStatic external fun commitText(handle: Long, id: String, x: Double, y: Double, content: String)
-    @JvmStatic external fun takeInkRequest(handle: Long): FloatArray?
-    @JvmStatic external fun commitInk(handle: Long, token: Int, content: String)
-    @JvmStatic external fun loadBoard(handle: Long, dir: String, id: String): String?
-    @JvmStatic external fun saveBoard(handle: Long, dir: String, id: String, title: String, updated: String, evenIfDrawing: Int): Int
-    @JvmStatic external fun listBoards(dir: String): String?
-    @JvmStatic external fun createBoard(dir: String, id: String, title: String, updated: String): Int
-    @JvmStatic external fun deleteBoard(dir: String, id: String): Int
-    @JvmStatic external fun renameBoard(dir: String, id: String, title: String, updated: String): Int
-    @JvmStatic external fun thumbnail(dir: String, id: String, w: Int, h: Int): IntArray?
+    @JvmStatic external fun key(handle: Long, code: Int)
+    @JvmStatic external fun back(handle: Long)
+    @JvmStatic external fun textInput(handle: Long, text: String, submit: Boolean)
+    @JvmStatic external fun inkResult(handle: Long, token: Int, text: String)
+    @JvmStatic external fun updateResult(handle: Long, version: String, url: String, failed: Boolean, manual: Boolean)
+    @JvmStatic external fun toast(handle: Long, text: String)
+    @JvmStatic external fun pause(handle: Long)
 }
-
 /** Measures and draws text for the engine, which calls in from its render thread. */
 object TextHost {
     const val LINE_HEIGHT = 1.3f
