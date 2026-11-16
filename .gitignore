@@ -1,0 +1,18 @@
+# Reference checkout of tldraw and built packages
+upstream/
+artifacts/
+*.tar.gz
+*.apk
+
+node_modules/
+build/
+.dart_tool/
+.gradle/
+*.iml
+*.log
+local.properties
+key.properties
+*.jks
+*.keystore
+*.sqlite*
+.env*

@@ -1,0 +1,20 @@
+name: canvas_studio
+description: Native Flutter drawing app for Android phones and tablets.
+publish_to: none
+version: 2.2.2+6
+environment:
+  sdk: ^3.14.0
+dependencies:
+  flutter:
+    sdk: flutter
+  material_ui: ^1.1.0
+  path_provider: ^2.1.5
+  share_plus: ^13.3.1
+  crypto: ^3.0.7
+  google_mlkit_digital_ink_recognition: ^0.14.1
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+flutter:
+  uses-material-design: true
