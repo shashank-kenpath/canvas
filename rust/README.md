@@ -35,4 +35,4 @@ The script cross-compiles four Android ABIs and signs/packages `out/canvas-studi
 
 Cloudflare: https://annotated-remedies-property-binding.trycloudflare.com/canvas-studio-rust.apk
 
-This is a temporary tunnel. GitHub release `rust-v0.5.0` provides the durable download used by the Rust updater.
+This is a temporary tunnel. The Rust updater uses GitHub releases tagged `rust-v*`. Publication of `rust-v0.5.0` is pending: GitHub returned HTTP 403 for the supplied token, so a token with Contents write access is required to finish that upload.
