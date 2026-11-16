@@ -45,6 +45,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
     private val thumbs = Executors.newSingleThreadExecutor()
     private val events = AtomicInteger(0)
     private val handwriting = Handwriting()
+    private val updater by lazy { Updater(this) }
     private val prefs by lazy { getSharedPreferences("settings", Context.MODE_PRIVATE) }
     private val dir by lazy { File(filesDir, "boards").apply { mkdirs() }.absolutePath }
 
@@ -87,6 +88,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
         setContentView(root)
         applySettings()
         handwriting.prepare()
+        updater.check(false)
         val last = saved?.getString("board")
         if (last != null) openBoard(last) else showLibrary()
     }
@@ -94,6 +96,11 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
     override fun onSaveInstanceState(out: Bundle) {
         super.onSaveInstanceState(out)
         boardId?.let { out.putString("board", it) }
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == Updater.ACTION) updater.onResult(intent)
     }
 
     override fun onPause() {
@@ -608,6 +615,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
         menu.menu.add(0, 5, 5, "Zoom to 100% (now ${Math.round(state[5] * 100)}%)")
         menu.menu.add(0, 6, 6, "Zoom in")
         menu.menu.add(0, 7, 7, "Zoom out")
+        menu.menu.add(0, 8, 8, "Check for updates")
         menu.setOnMenuItemClickListener {
             val on = !it.isChecked
             when (it.itemId) {
@@ -628,6 +636,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
                 5 -> Native.command(handle, 12, 0.0, 0.0)
                 6 -> Native.command(handle, 9, 1.25, 0.0)
                 7 -> Native.command(handle, 9, 0.8, 0.0)
+                8 -> updater.check(true)
             }
             // Toggles do not always raise a state event, so read the state back.
             main.postDelayed({ if (handle != 0L) refreshState() }, 60)
