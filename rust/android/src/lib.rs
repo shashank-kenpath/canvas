@@ -524,6 +524,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_Native_command<'l>(
             11 => ed.set_snap_shapes(a != 0.0),
             12 => ed.zoom_to(1.0, None),
             13 => ed.set_auto_convert(a != 0.0),
+            17 => ed.set_auto_text(a != 0.0),
             14 => ed.set_font(a.clamp(0.0, 255.0) as u8),
             15 => ed.scale_text(a),
             16 => ed.set_palm_rejection(a != 0.0, if b > 0.0 { Some(b) } else { None }),
@@ -539,7 +540,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_Native_command<'l>(
 #[no_mangle]
 pub extern "system" fn Java_com_canvasstudio_rust_Native_state<'l>(env: JNIEnv<'l>, _: JClass<'l>, handle: jlong) -> jdoubleArray {
     let Some(engine) = engine(handle) else { return std::ptr::null_mut() };
-    let values: [f64; 18] = {
+    let values: [f64; 19] = {
         let ed = engine.editor.lock().unwrap();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         [
@@ -561,6 +562,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_Native_state<'l>(env: JNIEnv<'
             flag(ed.auto_convert()),
             ed.selected_text_count() as f64,
             flag(ed.palm_rejection()),
+            flag(ed.auto_text()),
         ]
     };
     let Ok(array) = env.new_double_array(values.len() as i32) else { return std::ptr::null_mut() };

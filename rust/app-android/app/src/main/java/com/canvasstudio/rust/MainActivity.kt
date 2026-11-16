@@ -53,7 +53,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
     private var boardId: String? = null
     private var boardTitle = ""
     private var dirty = false
-    private var state = DoubleArray(18)
+    private var state = DoubleArray(19)
     private var modelNoticeShown = false
 
     private lateinit var library: LinearLayout
@@ -87,7 +87,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
         buildBoard(root)
         setContentView(root)
         applySettings()
-        handwriting.prepare()
+        if (prefs.getBoolean("text", true)) handwriting.prepare()
         updater.check(false)
         val last = saved?.getString("board")
         if (last != null) openBoard(last) else showLibrary()
@@ -128,6 +128,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
 
     private fun applySettings() {
         Native.command(handle, 13, if (prefs.getBoolean("auto", true)) 1.0 else 0.0, 0.0)
+        Native.command(handle, 17, if (prefs.getBoolean("text", true)) 1.0 else 0.0, 0.0)
         Native.command(handle, 16, if (prefs.getBoolean("palm", true)) 1.0 else 0.0, 0.0)
         Native.command(handle, 10, if (prefs.getBoolean("grid", true)) 1.0 else 0.0, 0.0)
         Native.command(handle, 14, prefs.getInt("font", 0).toDouble(), 0.0)
@@ -608,7 +609,8 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
             isCheckable = true
             isChecked = on
         }
-        toggle(1, "Tidy shapes and turn writing into text", state[15] != 0.0)
+        toggle(1, "Tidy drawn shapes", state[15] != 0.0)
+        toggle(9, "Turn handwriting into typed text", state.size > 18 && state[18] != 0.0)
         toggle(2, "Ignore palm touches", state[17] != 0.0)
         toggle(3, "Grid", state[11] != 0.0)
         menu.menu.add(0, 4, 4, "Show everything")
@@ -622,6 +624,10 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
                 1 -> {
                     prefs.edit().putBoolean("auto", on).apply()
                     Native.command(handle, 13, if (on) 1.0 else 0.0, 0.0)
+                }
+                9 -> {
+                    prefs.edit().putBoolean("text", on).apply()
+                    Native.command(handle, 17, if (on) 1.0 else 0.0, 0.0)
                     if (on) handwriting.prepare()
                 }
                 2 -> {

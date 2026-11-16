@@ -93,6 +93,7 @@ pub struct Editor {
     grid: bool,
     snap_shapes: bool,
     auto_convert: bool,
+    auto_text: bool,
     font: u8,
     palm_rejection: bool,
     /// Contacts at least this big (logical pixels) are a palm.
@@ -228,6 +229,7 @@ impl Editor {
             grid: true,
             snap_shapes: true,
             auto_convert: true,
+            auto_text: true,
             font: 0,
             palm_rejection: true,
             palm_size: 52.0,
@@ -452,14 +454,23 @@ impl Editor {
         self.snap_shapes = snap;
     }
 
-    /// When on, pen strokes that look like a shape become that shape and
-    /// handwriting becomes typed text after a short pause.
+    /// When on, pen strokes that look like a shape become that shape.
     pub fn set_auto_convert(&mut self, auto: bool) {
+        self.auto_convert = auto;
+        self.events |= EV_STATE;
+    }
+
+    /// When on, handwriting becomes typed text after a short pause.
+    pub fn set_auto_text(&mut self, auto: bool) {
         if !auto {
             self.forget_pending();
         }
-        self.auto_convert = auto;
+        self.auto_text = auto;
         self.events |= EV_STATE;
+    }
+
+    pub fn auto_text(&self) -> bool {
+        self.auto_text
     }
 
     /// `size` is the smallest contact, in logical pixels, treated as a palm.
@@ -1043,7 +1054,7 @@ impl Editor {
                 // a letter after all: put its ink back and read it as text.
                 if let Some((first, at)) = self.last_auto.take() {
                     let tidy = self.doc.get(&first.id).is_some_and(|s| s.tool != Tool::Pen || s.points.len() == 2);
-                    if self.auto_convert
+                    if self.auto_text
                         && held.is_none()
                         && tidy
                         && self.pending.is_empty()
@@ -1073,7 +1084,7 @@ impl Editor {
                     if auto {
                         self.last_auto = Some((raw.clone(), time));
                     }
-                } else if self.auto_convert {
+                } else if self.auto_text {
                     self.note_ink(&raw.id, raw.bounds(), time);
                 }
                 let applied = self.doc.add(snapped.unwrap_or(raw));

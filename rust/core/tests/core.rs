@@ -241,6 +241,7 @@ fn editor() -> Editor {
     e.resize(W, H, 1.0);
     e.set_grid(false);
     e.set_auto_convert(false);
+    e.set_auto_text(false);
     e.render();
     e
 }
@@ -249,7 +250,20 @@ fn editor() -> Editor {
 fn auto_editor() -> Editor {
     let mut e = editor();
     e.set_auto_convert(true);
+    e.set_auto_text(true);
     e
+}
+
+#[test]
+fn handwriting_can_be_left_as_ink_while_shapes_still_tidy() {
+    let mut e = auto_editor();
+    e.set_auto_text(false);
+    drag(&mut e, &letter(50., 100.), 0);
+    assert!(e.next_deadline().is_none());
+    assert!(e.take_ink_request().is_none());
+    assert_eq!(e.doc.shapes()[0].tool, Tool::Pen);
+    drag(&mut e, &line(p(60., 200.), p(260., 204.), 20), 3000);
+    assert_eq!(e.doc.shapes()[1].points.len(), 2, "a straight stroke still becomes a line");
 }
 
 fn pixel(e: &Editor, x: u32, y: u32) -> [u8; 4] {
