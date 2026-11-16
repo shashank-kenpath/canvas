@@ -312,6 +312,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
         board = FrameLayout(this)
         surface = BoardView(this)
         surface.handle = handle
+        surface.maxSide = if (prefs.getBoolean("fullres", false)) 0 else BoardView.MAX_SIDE
         surface.holder.setFormat(PixelFormat.RGBX_8888)
         surface.holder.addCallback(this)
         board.addView(surface, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
@@ -613,6 +614,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
         toggle(9, "Turn handwriting into typed text", state.size > 18 && state[18] != 0.0)
         toggle(2, "Ignore palm touches", state[17] != 0.0)
         toggle(3, "Grid", state[11] != 0.0)
+        toggle(10, "Full panel resolution (slower on 4K)", surface.maxSide == 0)
         menu.menu.add(0, 4, 4, "Show everything")
         menu.menu.add(0, 5, 5, "Zoom to 100% (now ${Math.round(state[5] * 100)}%)")
         menu.menu.add(0, 6, 6, "Zoom in")
@@ -643,6 +645,10 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
                 6 -> Native.command(handle, 9, 1.25, 0.0)
                 7 -> Native.command(handle, 9, 0.8, 0.0)
                 8 -> updater.check(true)
+                10 -> {
+                    prefs.edit().putBoolean("fullres", on).apply()
+                    surface.maxSide = if (on) 0 else BoardView.MAX_SIDE
+                }
             }
             // Toggles do not always raise a state event, so read the state back.
             main.postDelayed({ if (handle != 0L) refreshState() }, 60)
@@ -656,7 +662,7 @@ class MainActivity : Activity(), Native.Listener, SurfaceHolder.Callback {
     override fun surfaceCreated(holder: SurfaceHolder) {}
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        if (handle != 0L) Native.surface(handle, holder.surface, width, height, resources.displayMetrics.density.toDouble())
+        if (handle != 0L) Native.surface(handle, holder.surface, width, height, (resources.displayMetrics.density * surface.scale).toDouble())
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {

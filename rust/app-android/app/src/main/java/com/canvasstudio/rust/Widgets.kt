@@ -172,15 +172,41 @@ class BoardView(context: Context) : SurfaceView(context) {
     var handle: Long = 0
     private var buffer = FloatArray(STRIDE * 64)
 
+    /** Drawing buffer pixels per view pixel. Below 1 on very large panels. */
+    var scale = 1f
+        private set
+
+    /** Longest side of the drawing buffer; 0 draws at the panel's full resolution. */
+    var maxSide = MAX_SIDE
+        set(value) {
+            field = value
+            fit(width, height)
+        }
+
+    /** Pointers being followed. Big IR panels report dozens; a few are enough. */
+    private val followed = HashSet<Int>()
+
+    private fun fit(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        val longest = maxOf(w, h)
+        scale = if (maxSide > 0 && longest > maxSide) maxSide.toFloat() / longest else 1f
+        if (scale < 1f) holder.setFixedSize(Math.round(w * scale), Math.round(h * scale)) else holder.setSizeFromLayout()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        fit(w, h)
+    }
+
     private fun put(k: Int, e: MotionEvent, pointer: Int, x: Float, y: Float, time: Long, major: Float) {
         val o = k * STRIDE
         if (o + STRIDE > buffer.size) buffer = buffer.copyOf(buffer.size * 2)
         val tool = e.getToolType(pointer)
         buffer[o] = e.getPointerId(pointer).toFloat()
-        buffer[o + 1] = x
-        buffer[o + 2] = y
+        buffer[o + 1] = x * scale
+        buffer[o + 2] = y * scale
         buffer[o + 3] = (time - e.downTime).toFloat()
-        buffer[o + 4] = major
+        buffer[o + 4] = major * scale
         buffer[o + 5] = if (tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER) 1f else 0f
     }
 
@@ -194,25 +220,37 @@ class BoardView(context: Context) : SurfaceView(context) {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 // Deliver samples as they arrive instead of once per frame.
-                if (e.actionMasked == MotionEvent.ACTION_DOWN) requestUnbufferedDispatch(e)
+                if (e.actionMasked == MotionEvent.ACTION_DOWN) {
+                    requestUnbufferedDispatch(e)
+                    followed.clear()
+                }
+                if (followed.size >= MAX_POINTERS) return true
+                followed.add(e.getPointerId(e.actionIndex))
                 one(0, e, e.actionIndex)
             }
             MotionEvent.ACTION_MOVE -> {
                 var k = 0
                 for (h in 0 until e.historySize) {
                     for (p in 0 until e.pointerCount) {
+                        if (e.getPointerId(p) !in followed) continue
                         put(k++, e, p, e.getHistoricalX(p, h), e.getHistoricalY(p, h), e.getHistoricalEventTime(h), e.getHistoricalTouchMajor(p, h))
                     }
                 }
                 for (p in 0 until e.pointerCount) {
+                    if (e.getPointerId(p) !in followed) continue
                     put(k++, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p))
                 }
-                Native.touch(handle, 1, e.downTime, buffer, k)
+                if (k > 0) Native.touch(handle, 1, e.downTime, buffer, k)
             }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> one(2, e, e.actionIndex)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                if (followed.remove(e.getPointerId(e.actionIndex))) one(2, e, e.actionIndex)
+            }
             MotionEvent.ACTION_CANCEL -> {
                 var k = 0
-                for (p in 0 until e.pointerCount) put(k++, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p))
+                for (p in 0 until e.pointerCount) {
+                    if (e.getPointerId(p) in followed) put(k++, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p))
+                }
+                followed.clear()
                 Native.touch(handle, 3, e.downTime, buffer, k)
             }
         }
@@ -221,5 +259,7 @@ class BoardView(context: Context) : SurfaceView(context) {
 
     companion object {
         const val STRIDE = 6
+        const val MAX_SIDE = 1920
+        const val MAX_POINTERS = 5
     }
 }
