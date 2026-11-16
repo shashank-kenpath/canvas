@@ -14,46 +14,45 @@ const collaborationServer = String.fromEnvironment(
   defaultValue: 'https://annotated-remedies-property-binding.trycloudflare.com',
 );
 
-Widget _copyRow(
-  BuildContext context,
-  String label,
-  String value, {
-  Key? key,
-}) => Padding(
-  padding: const EdgeInsets.only(top: 8),
-  child: Row(
-    children: [
-      Expanded(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              label,
-              style: const TextStyle(fontSize: 12, color: Color(0xff8b9098)),
+Widget _copyRow(BuildContext context, String label, String value, {Key? key}) =>
+    Padding(
+      padding: const EdgeInsets.only(top: 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(
+                    fontSize: 12,
+                    color: Color(0xff8b9098),
+                  ),
+                ),
+                Text(
+                  value,
+                  key: key,
+                  maxLines: 3,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 13, fontFamily: 'monospace'),
+                ),
+              ],
             ),
-            Text(
-              value,
-              key: key,
-              maxLines: 3,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 13, fontFamily: 'monospace'),
-            ),
-          ],
-        ),
+          ),
+          IconButton(
+            tooltip: 'Copy $label',
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: value));
+              ScaffoldMessenger.of(context)
+                ..hideCurrentSnackBar()
+                ..showSnackBar(SnackBar(content: Text('$label copied')));
+            },
+            icon: const Icon(Icons.copy, size: 18),
+          ),
+        ],
       ),
-      IconButton(
-        tooltip: 'Copy $label',
-        onPressed: () {
-          Clipboard.setData(ClipboardData(text: value));
-          ScaffoldMessenger.of(context)
-            ..hideCurrentSnackBar()
-            ..showSnackBar(SnackBar(content: Text('$label copied')));
-        },
-        icon: const Icon(Icons.copy, size: 18),
-      ),
-    ],
-  ),
-);
+    );
 
 /// Lets Claude read and draw on the board. Kept apart from sharing with
 /// people, which only ever needs the 6-digit code.
@@ -221,10 +220,7 @@ class _ShareDialogState extends State<_ShareDialog> {
         style: const TextStyle(fontSize: 12, color: Color(0xff8b9098)),
       ),
       const SizedBox(height: 12),
-      const Text(
-        'Board code',
-        style: TextStyle(fontWeight: FontWeight.w600),
-      ),
+      const Text('Board code', style: TextStyle(fontWeight: FontWeight.w600)),
       const SizedBox(height: 4),
       if (code != null) ...[
         Center(

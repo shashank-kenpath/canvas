@@ -1,6 +1,11 @@
 package com.canvasstudio.canvas_studio
 
 import android.content.ActivityNotFoundException
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.view.MotionEvent
+import io.flutter.embedding.engine.FlutterShellArgs
 import android.content.Intent
 import android.content.pm.PackageInfo
 import android.content.pm.PackageManager
@@ -18,8 +23,72 @@ import java.util.concurrent.Executors
 class MainActivity : FlutterActivity() {
     private val updateExecutor = Executors.newSingleThreadExecutor()
 
+    private fun graphicsMode(): String =
+        getSharedPreferences("display", Context.MODE_PRIVATE).getString("graphics", "opengl") ?: "opengl"
+
+    // Large touch panels often ship slow or software Vulkan drivers, which makes
+    // every frame take seconds. OpenGL is the default; the user can switch.
+    override fun getFlutterShellArgs(): FlutterShellArgs {
+        val args = super.getFlutterShellArgs()
+        when (graphicsMode()) {
+            "vulkan" -> args.add("--impeller-backend=vulkan")
+            "classic" -> args.add("--enable-impeller=false")
+            else -> args.add("--impeller-backend=opengles")
+        }
+        return args
+    }
+
+    // Deliver touch samples as they arrive instead of batching them per frame.
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            window.decorView.requestUnbufferedDispatch(event)
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun displayInfo(): Map<String, Any> {
+        val metrics = resources.displayMetrics
+        val refresh = try { windowManager.defaultDisplay.refreshRate } catch (_: Exception) { 0f }
+        return mapOf(
+            "graphics" to graphicsMode(),
+            "width" to metrics.widthPixels,
+            "height" to metrics.heightPixels,
+            "density" to metrics.density.toDouble(),
+            "refresh" to refresh.toDouble(),
+            "device" to "${Build.MANUFACTURER} ${Build.MODEL}",
+            "android" to Build.VERSION.RELEASE,
+            "hardware" to (if (Build.VERSION.SDK_INT >= 31) "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}" else Build.HARDWARE),
+        )
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "canvas_studio/display")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "info" -> result.success(displayInfo())
+                    "setGraphics" -> {
+                        val mode = call.argument<String>("mode")
+                        if (mode != "opengl" && mode != "vulkan" && mode != "classic") {
+                            result.error("INVALID_MODE", "Unknown graphics engine.", null)
+                        } else {
+                            getSharedPreferences("display", Context.MODE_PRIVATE)
+                                .edit().putString("graphics", mode).commit()
+                            result.success(null)
+                            // The engine is chosen when the app starts, so restart it.
+                            Handler(Looper.getMainLooper()).postDelayed({
+                                val launch = packageManager.getLaunchIntentForPackage(packageName)
+                                if (launch != null) {
+                                    startActivity(Intent.makeRestartActivityTask(launch.component))
+                                }
+                                Runtime.getRuntime().exit(0)
+                            }, 250)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "canvas_studio/updates")
             .setMethodCallHandler { call, result ->
                 try {

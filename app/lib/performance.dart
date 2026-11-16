@@ -179,9 +179,7 @@ class _DisplayDialogState extends State<_DisplayDialog> {
                           ? Icons.radio_button_checked
                           : Icons.radio_button_unchecked,
                     ),
-                    title: Text(
-                      m.$1 == current ? '${m.$2} (in use)' : m.$2,
-                    ),
+                    title: Text(m.$1 == current ? '${m.$2} (in use)' : m.$2),
                     subtitle: Text(m.$3),
                     onTap: () => setState(() => mode = m.$1),
                   ),

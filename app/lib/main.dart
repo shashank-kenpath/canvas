@@ -25,6 +25,7 @@ void main() {
     HandwritingRecognition.shared.prepare('en').then((_) {}, onError: (_) {}),
   );
 }
+
 const purple = Color(0xff6750d8);
 const ink = Color(0xff272536);
 

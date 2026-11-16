@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
 
-import 'package:flutter/painting.dart';
 import 'package:flutter/services.dart';
 import 'package:google_mlkit_digital_ink_recognition/google_mlkit_digital_ink_recognition.dart'
     as ml;
@@ -37,7 +36,8 @@ class HandwritingRecognition {
   };
 
   /// True when [language] can be recognized immediately.
-  bool isReady(String language) => _recognizers.containsKey(_language(language));
+  bool isReady(String language) =>
+      _recognizers.containsKey(_language(language));
 
   Future<void> prepare(String language) {
     if (_disposed) {

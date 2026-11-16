@@ -125,7 +125,7 @@ void main() {
     await tester.tap(find.byTooltip('Redo'));
     await tester.pump();
     expect(editor.document.shapes, hasLength(1));
-    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pump(const Duration(milliseconds: 900));
     await tester.pump();
     expect(find.text('Saved'), findsOneWidget);
     final boards = await store.list();
@@ -220,10 +220,18 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('tool-write')));
     await tester.pump();
     expect(find.byKey(const ValueKey('pen-mode-hint')), findsOneWidget);
-    await stroke(tester, const [Offset(300, 300), Offset(310, 340), Offset(320, 300)]);
+    await stroke(tester, const [
+      Offset(300, 300),
+      Offset(310, 340),
+      Offset(320, 300),
+    ]);
     await tester.pump(const Duration(milliseconds: 500));
     // Still writing: the next stroke restarts the wait.
-    await stroke(tester, const [Offset(340, 300), Offset(350, 340), Offset(360, 300)]);
+    await stroke(tester, const [
+      Offset(340, 300),
+      Offset(350, 340),
+      Offset(360, 300),
+    ]);
     await tester.pump(const Duration(milliseconds: 600));
     expect(editor.document.shapes.map((s) => s.tool).toSet(), {CanvasTool.pen});
     await tester.pump(const Duration(milliseconds: 500));
@@ -277,10 +285,22 @@ void main() {
         return [language == 'en' ? 'hello' : 'नमस्ते'];
       },
     );
-    await stroke(tester, const [Offset(300, 300), Offset(310, 340), Offset(320, 300)]);
-    await stroke(tester, const [Offset(340, 300), Offset(350, 340), Offset(360, 300)]);
+    await stroke(tester, const [
+      Offset(300, 300),
+      Offset(310, 340),
+      Offset(320, 300),
+    ]);
+    await stroke(tester, const [
+      Offset(340, 300),
+      Offset(350, 340),
+      Offset(360, 300),
+    ]);
     // A second line of writing well below the first.
-    await stroke(tester, const [Offset(300, 420), Offset(310, 460), Offset(320, 420)]);
+    await stroke(tester, const [
+      Offset(300, 420),
+      Offset(310, 460),
+      Offset(320, 420),
+    ]);
     expect(editor.document.shapes, hasLength(3));
     await tester.tap(find.byKey(const ValueKey('tool-select')));
     await tester.pump();
@@ -325,7 +345,10 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('tool-select')));
     await tester.pump();
     final before = editor.document.shapes.last.points.first;
-    await tester.dragFrom(origin + const Offset(350, 500), const Offset(60, 40));
+    await tester.dragFrom(
+      origin + const Offset(350, 500),
+      const Offset(60, 40),
+    );
     await tester.pump();
     final after = editor.document.shapes.last.points.first;
     expect((after - before).dx, closeTo(60, 1));

@@ -246,7 +246,7 @@ class NativeEditorState extends State<NativeEditor>
     _collab?.submit(document.shapes);
     _sceneTick.value++;
     _liveTick.value++;
-    if (saveStatus != 'Saving…') setState(() => saveStatus = 'Saving…');
+    setState(() => saveStatus = 'Saving…');
     _scheduleSave();
   }
 
@@ -1407,7 +1407,13 @@ class NativeEditorState extends State<NativeEditor>
         Icons.auto_awesome_outlined,
         'Smart shape: rough shapes become clean',
       ),
-      ('eraser', CanvasTool.eraser, ink, Icons.auto_fix_normal_outlined, 'Eraser'),
+      (
+        'eraser',
+        CanvasTool.eraser,
+        ink,
+        Icons.auto_fix_normal_outlined,
+        'Eraser',
+      ),
       ('arrow', CanvasTool.arrow, ink, Icons.north_east, 'Arrow'),
       ('text', CanvasTool.text, ink, Icons.title, 'Text'),
       ('rectangle', CanvasTool.rectangle, ink, Icons.crop_square, 'Rectangle'),
@@ -1598,10 +1604,7 @@ class NativeEditorState extends State<NativeEditor>
         value: 'claude',
         child: Text('Connect Claude…'),
       ),
-      const PopupMenuItem(
-        value: 'display',
-        child: Text('Display and speed…'),
-      ),
+      const PopupMenuItem(value: 'display', child: Text('Display and speed…')),
     ],
   );
 
