@@ -579,6 +579,8 @@ enum ButtonKind {
 
 #[derive(Clone, PartialEq, Debug)]
 enum Look {
+    /// Where the phone pad writes.
+    PadArea,
     /// A QR code of the text, black on white.
     Qr(String),
     Surface {
@@ -1130,6 +1132,10 @@ pub struct App {
     out_gen: u64,
     /// Time of the last touch from the phone remote.
     remote_t: u64,
+    /// Where the phone pad writes, as fractions of the screen (x, y, w, h).
+    pad_area: [f32; 4],
+    /// When the phone pad last spoke; its area shows on the board for a while.
+    pad_seen: Option<u64>,
     /// A board joined from another device.
     link: Option<net::Link>,
     known: HashMap<String, Value>,
@@ -1307,6 +1313,8 @@ impl App {
             doc_gen: 1,
             out_gen: 1,
             remote_t: 0,
+            pad_area: [0.25, 0.25, 0.5, 0.5],
+            pad_seen: None,
             link: None,
             known: HashMap::new(),
             ops_sent: 0,
@@ -3482,6 +3490,15 @@ impl App {
     }
 
     fn layout_board(&self, ui: &mut Ui, c: &BoardChrome) {
+        if self.pad_shown() {
+            let [x, y, w, h] = self.pad_area;
+            let (sw, sh) = (self.w as f32, self.h as f32);
+            ui.push(
+                scale_rect(Rf::new(x * sw, y * sh, w * sw, h * sh), 1.0 / ui.u),
+                Look::PadArea,
+                None,
+            );
+        }
         let s = c.left.h / 88.0;
         let relative = |r: Rf, x: f32, y: f32, w: f32, h: f32, f: f32| {
             Rf::new(r.x + x * f, r.y + y * f, w * f, h * f)
@@ -4304,63 +4321,92 @@ impl App {
         if req.query.get("k").map(String::as_str) != Some(self.settings.remote_key.as_str()) {
             return net::Resp::empty(403);
         }
+        let body = serde_json::from_slice::<Value>(&req.body).unwrap_or(Value::Null);
+        let was_shown = self.pad_shown();
+        self.pad_seen = Some(self.now);
+        let board = self.screen == Screen::Board && self.board.is_some();
+        let (w, h) = (self.w as f32, self.h as f32);
+        let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).map(|f| f as f32);
         match path {
-            "/r/frame" => {
-                let since = req.query.get("since").and_then(|s| s.parse::<u64>().ok());
-                if since == Some(self.out_gen) {
-                    return net::Resp::empty(204);
+            "/r/state" => {}
+            "/r/area" if req.method == "POST" => {
+                // The phone sends the box's x, y and width; its height follows
+                // the pad's shape so writing is not stretched.
+                let aspect = num(&body, "aspect").unwrap_or(1.0).clamp(0.2, 5.0);
+                let bw = num(&body, "w").unwrap_or(self.pad_area[2]).clamp(0.05, 1.0);
+                let mut bh = bw * w.max(1.0) / h.max(1.0) / aspect;
+                let mut bw = bw;
+                if bh > 1.0 {
+                    bw /= bh;
+                    bh = 1.0;
                 }
-                let want = req
-                    .query
-                    .get("w")
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(1280)
-                    .clamp(320, 1920);
-                match remote_jpeg(&self.out, want) {
-                    Some((w, h, jpg)) => {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(jpg);
-                        net::Resp::json(200, &json!({ "gen": self.out_gen, "w": w, "h": h, "jpg": b64 }))
-                    }
-                    None => net::Resp::empty(503),
-                }
+                let x = num(&body, "x").unwrap_or(self.pad_area[0]).clamp(0.0, 1.0 - bw);
+                let y = num(&body, "y").unwrap_or(self.pad_area[1]).clamp(0.0, 1.0 - bh);
+                self.pad_area = [x, y, bw, bh];
             }
-            "/r/input" if req.method == "POST" => {
-                let events = serde_json::from_slice::<Value>(&req.body)
-                    .ok()
-                    .and_then(|v| v.as_array().cloned())
-                    .unwrap_or_default();
-                let (w, h) = (self.w as f32, self.h as f32);
+            "/r/pan" if req.method == "POST" && board => {
+                let fx = num(&body, "fx").unwrap_or(0.5) * w;
+                let fy = num(&body, "fy").unwrap_or(0.5) * h;
+                let dx = num(&body, "dx").unwrap_or(0.0) * w;
+                let dy = num(&body, "dy").unwrap_or(0.0) * h;
+                let scale = num(&body, "scale").unwrap_or(1.0).clamp(0.5, 2.0);
+                self.ed.pan_zoom(
+                    Pt::new(dx as f64, dy as f64),
+                    scale as f64,
+                    Pt::new(fx as f64, fy as f64),
+                );
+            }
+            "/r/cmd" if req.method == "POST" && board => match body.get("cmd").and_then(Value::as_str) {
+                Some("undo") => self.ed.undo(),
+                Some("redo") => self.ed.redo(),
+                _ => {}
+            },
+            "/r/input" if req.method == "POST" && board => {
+                let erase = body.get("erase").and_then(Value::as_bool).unwrap_or(false);
+                let events = body.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
+                let [ax, ay, aw, ah] = self.pad_area;
                 let base = self.now.max(self.remote_t + 1);
-                for e in events.iter().take(2000) {
-                    let num = |i: usize| e.get(i).and_then(Value::as_f64);
-                    let (Some(phase), Some(id), Some(x), Some(y)) = (num(0), num(1), num(2), num(3)) else {
+                for e in events.iter().take(4000) {
+                    let n = |i: usize| e.get(i).and_then(Value::as_f64);
+                    let (Some(phase), Some(id), Some(x), Some(y)) = (n(0), n(1), n(2), n(3)) else {
                         continue;
                     };
-                    let phase = match phase as i64 {
-                        0 => Phase::Down,
-                        1 => Phase::Move,
-                        2 => Phase::Up,
-                        _ => Phase::Cancel,
-                    };
-                    let time = base + num(4).unwrap_or(0.0).clamp(0.0, 5000.0) as u64;
+                    let time = base + n(4).unwrap_or(0.0).clamp(0.0, 10000.0) as u64;
                     self.remote_t = self.remote_t.max(time);
-                    let sample = Sample {
-                        id: 1000 + (id as i32).clamp(0, 99),
-                        x: x.clamp(0.0, 1.0) as f32 * w,
-                        y: y.clamp(0.0, 1.0) as f32 * h,
-                        time,
-                        size: 0.0,
-                        stylus: false,
-                        eraser: false,
-                        norm: 0.0,
-                    };
-                    self.touch(phase, &[sample]);
+                    let id = 1000 + (id as i32).clamp(0, 9);
+                    let pos = Pt::new(
+                        ((ax + x.clamp(0.0, 1.0) as f32 * aw) * w) as f64,
+                        ((ay + y.clamp(0.0, 1.0) as f32 * ah) * h) as f64,
+                    );
+                    let contact = Contact { size: 0.0, stylus: false, eraser: erase, norm: 0.0 };
+                    match phase as i64 {
+                        0 => self.ed.pointer_down_with(id, pos, time, contact),
+                        1 => self.ed.pointer_move_with(id, pos, time, contact),
+                        p => self.ed.pointer_up(id, pos, time, p != 2),
+                    }
                 }
-                net::Resp::json(200, &json!({ "gen": self.out_gen }))
+                self.take_editor_events();
             }
-            _ => net::Resp::empty(404),
+            _ if !board && req.method == "POST" => {}
+            _ => return net::Resp::empty(404),
         }
+        if !was_shown {
+            self.full = true;
+        }
+        net::Resp::json(
+            200,
+            &json!({
+                "board": board,
+                "area": self.pad_area,
+                "screen": [self.w, self.h],
+                "title": self.board.as_ref().map(|b| b.title.clone()),
+            }),
+        )
+    }
+
+    /// The phone pad's box shows on the board while the pad is in use.
+    fn pad_shown(&self) -> bool {
+        self.pad_seen.is_some_and(|t| self.now.saturating_sub(t) < 120_000)
     }
 
     fn lan_mcp(&self) -> Option<String> {
@@ -4458,7 +4504,7 @@ impl App {
                 content.y = text::FONT_NAMES.len().div_ceil(cols) as f32 * (80.0 + gap) - gap;
             }
             PanelKind::Remote => {
-                content.para("Scan with a phone on the same Wi-Fi to draw and move around this screen from your seat. One finger draws, two fingers pan and zoom.", TEXT2);
+                content.para("Scan with a phone on the same Wi-Fi to use it as a writing pad. What you write lands in the blue box on the board; move the box or the board from the phone.", TEXT2);
                 if let Some(url) = self.remote_url() {
                     content.qr(&url);
                     content.copy_code(&url);
@@ -5527,6 +5573,15 @@ impl App {
                 );
             }
             Look::Rule => p.rrect(r, r.h.min(r.w) / 2.0, BORDER),
+            Look::PadArea => {
+                p.rrect(r, 12.0 * u, 0x0f2563eb);
+                p.rrect_line(r, 12.0 * u, 0xcc2563eb, 3.0 * u);
+                let tag = Rf::new(r.x + 12.0 * u, r.y + 12.0 * u, 96.0 * u, 34.0 * u);
+                if r.w > 130.0 * u && r.h > 60.0 * u {
+                    p.rrect(tag, 17.0 * u, 0xff2563eb);
+                    line_text(p, tag, Face::Bold, 18.0 * u, "Phone", 0xffffffff, true);
+                }
+            }
             Look::Notch(side) => {
                 let vertices = match side {
                     Dock::Left => [(r.x, r.cy()), (r.right(), r.y), (r.right(), r.bottom())],
@@ -5862,38 +5917,6 @@ impl net::Board for App {
     }
 }
 
-/// Scales the screen down to `want` pixels wide and encodes it as JPEG.
-fn remote_jpeg(out: &Layer, want: u32) -> Option<(u32, u32, Vec<u8>)> {
-    if out.w == 0 || out.h == 0 {
-        return None;
-    }
-    // Averages a 2x2 patch per output pixel straight from the screen, which
-    // is quick enough to run between frames without a full-size copy.
-    let w = want.min(out.w);
-    let h = ((out.h as u64 * w as u64) / out.w as u64).max(1) as u32;
-    let (sw, sh) = (out.w as usize, out.h as usize);
-    let mut rgb = vec![0u8; w as usize * h as usize * 3];
-    for y in 0..h as usize {
-        let sy = (y * sh / h as usize).min(sh - 1);
-        let sy2 = (sy + 1).min(sh - 1);
-        for x in 0..w as usize {
-            let sx = (x * sw / w as usize).min(sw - 1);
-            let sx2 = (sx + 1).min(sw - 1);
-            let o = (y * w as usize + x) * 3;
-            for c in 0..3 {
-                let px = |xx: usize, yy: usize| out.data[(yy * sw + xx) * 4 + c] as u16;
-                rgb[o + c] = ((px(sx, sy) + px(sx2, sy) + px(sx, sy2) + px(sx2, sy2) + 2) / 4) as u8;
-            }
-        }
-    }
-    let small = image::RgbImage::from_raw(w, h, rgb)?;
-    let mut jpg = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 70)
-        .encode_image(&small)
-        .ok()?;
-    Some((w, h, jpg))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6052,38 +6075,51 @@ mod tests {
     }
 
     #[test]
-    fn a_phone_remote_sees_the_screen_and_draws_on_the_board() {
+    fn a_phone_pad_writes_into_its_box_moves_it_and_pans_the_board() {
         let (mut app, dir) = app();
         app.resize(1280, 800, 1.5);
         settle(&mut app);
-        app.run(Act::NewBoard);
-        app.text_input("Remote", true);
-        settle(&mut app);
         let key = app.settings.remote_key.clone();
         assert_eq!(key.len(), 16);
-        // The page itself is open; the picture and touches need the key.
         assert_eq!(req(&mut app, "GET", "/r", &[], Value::Null).0, 200);
-        assert_eq!(req(&mut app, "GET", "/r/frame", &[("k", "nope")], Value::Null).0, 403);
-        let (status, frame) = req(&mut app, "GET", "/r/frame", &[("k", &key), ("w", "640")], Value::Null);
+        assert_eq!(req(&mut app, "GET", "/r/state", &[("k", "nope")], Value::Null).0, 403);
+        let (status, state) = req(&mut app, "GET", "/r/state", &[("k", &key)], Value::Null);
         assert_eq!(status, 200);
-        assert_eq!(frame["w"], 640);
-        let jpg = net::unbase64(frame["jpg"].as_str().unwrap());
-        assert_eq!(&jpg[..2], &[0xff, 0xd8]);
-        let gen = frame["gen"].as_u64().unwrap().to_string();
-        assert_eq!(req(&mut app, "GET", "/r/frame", &[("k", &key), ("since", &gen)], Value::Null).0, 204);
+        assert_eq!(state["board"], false);
 
-        let before = app.ed.doc.shapes().len();
-        let mut events = vec![json!([0, 0, 0.40, 0.50, 0])];
+        app.run(Act::NewBoard);
+        app.text_input("Pad", true);
+        settle(&mut app);
+        // A square pad on a 1280x800 screen: the box is square on screen too.
+        let (_, state) = req(&mut app, "POST", "/r/area", &[("k", &key)], json!({"x": 0.1, "y": 0.2, "w": 0.25, "aspect": 1.0}));
+        let area: Vec<f64> = state["area"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+        assert!((area[0] - 0.1).abs() < 1e-4 && (area[1] - 0.2).abs() < 1e-4);
+        assert!((area[2] * 1280.0 - area[3] * 800.0).abs() < 0.5, "{area:?}");
+        settle(&mut app);
+        assert!(app.nodes.iter().any(|n| n.look == Look::PadArea));
+
+        let mut events = vec![json!([0, 0, 0.1, 0.5, 0])];
         for i in 1..=20 {
-            events.push(json!([1, 0, 0.40 + i as f64 * 0.01, 0.50 + (i % 3) as f64 * 0.004, i * 8]));
+            events.push(json!([1, 0, 0.1 + i as f64 * 0.04, 0.5 + (i % 3) as f64 * 0.01, i * 8]));
         }
-        events.push(json!([2, 0, 0.60, 0.50, 170]));
-        let (status, _) = req(&mut app, "POST", "/r/input", &[("k", &key)], Value::Array(events));
+        events.push(json!([2, 0, 0.9, 0.5, 170]));
+        let (status, _) = req(&mut app, "POST", "/r/input", &[("k", &key)], json!({"events": events}));
         assert_eq!(status, 200);
         settle(&mut app);
-        assert_eq!(app.ed.doc.shapes().len(), before + 1);
-        // The board repainted, so the phone gets a new picture.
-        assert_eq!(req(&mut app, "GET", "/r/frame", &[("k", &key), ("since", &gen)], Value::Null).0, 200);
+        assert_eq!(app.ed.doc.shapes().len(), 1);
+        // The stroke sits inside the box on screen.
+        let b = app.ed.doc.shapes()[0].bounds();
+        let left = app.ed.camera().x + b.l * app.ed.zoom();
+        let right = app.ed.camera().x + b.r * app.ed.zoom();
+        let (x0, x1) = (area[0] * 1280.0 / 1.5, (area[0] + area[2]) * 1280.0 / 1.5);
+        assert!(left >= x0 - 2.0 && right <= x1 + 2.0, "{left}..{right} not in {x0}..{x1}");
+
+        let cam = app.ed.camera();
+        req(&mut app, "POST", "/r/pan", &[("k", &key)], json!({"dx": 0.1, "dy": 0.0}));
+        assert!((app.ed.camera().x - cam.x - 1280.0 * 0.1 / 1.5).abs() < 0.01);
+        req(&mut app, "POST", "/r/cmd", &[("k", &key)], json!({"cmd": "undo"}));
+        settle(&mut app);
+        assert_eq!(app.ed.doc.shapes().len(), 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 

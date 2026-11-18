@@ -3,157 +3,271 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<meta name="theme-color" content="#111318">
-<title>Inkboard remote</title>
+<meta name="theme-color" content="#eef0f4">
+<title>Inkboard pad</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #111318; color: #e8eaf0; overflow: hidden;
-    overscroll-behavior: none; font: 15px system-ui, sans-serif; -webkit-user-select: none; user-select: none; }
-  canvas { position: fixed; inset: 0; width: 100%; height: 100%; touch-action: none; }
-  #bar { position: fixed; top: 8px; right: 8px; display: flex; gap: 8px; z-index: 2; }
-  #bar button { background: rgba(40,44,54,.85); color: #e8eaf0; border: 0; border-radius: 999px;
-    padding: 8px 14px; font: inherit; }
-  #msg { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); text-align: center;
-    max-width: 80%; z-index: 1; pointer-events: none; opacity: .85; }
-  #dot { width: 8px; height: 8px; border-radius: 50%; background: #e5484d; align-self: center; }
+  :root { --accent: #2563eb; --ink: #1f2430; --muted: #6b7280; --bar: #ffffff; --bg: #eef0f4; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); overflow: hidden;
+    overscroll-behavior: none; font: 15px system-ui, -apple-system, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  body { display: flex; flex-direction: column; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  #bar { display: flex; align-items: center; gap: 6px; padding: 8px; background: var(--bar);
+    box-shadow: 0 1px 0 #dfe2e8; flex-wrap: wrap; }
+  .seg { display: flex; background: var(--bg); border-radius: 12px; padding: 3px; gap: 2px; }
+  button { border: 0; background: transparent; color: var(--ink); font: inherit; font-weight: 600;
+    padding: 9px 12px; border-radius: 10px; min-height: 40px; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .act { background: var(--bg); }
+  button:active { opacity: .7; }
+  #status { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--muted);
+    font-size: 13px; max-width: 40%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: #e5484d; flex: none; }
   #dot.on { background: #30a46c; }
+  #wrap { flex: 1; position: relative; margin: 8px; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 14px;
+    background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.12); touch-action: none; }
+  #hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    text-align: center; padding: 24px; color: var(--muted); pointer-events: none; line-height: 1.5; }
 </style>
 </head>
 <body>
-<canvas id="c"></canvas>
-<div id="msg">Connecting to the board…</div>
-<div id="bar"><span id="dot"></span><button id="full">Full screen</button></div>
+<div id="bar">
+  <div class="seg" id="modes">
+    <button data-m="write" class="on">Write</button>
+    <button data-m="erase">Erase</button>
+    <button data-m="box">Move box</button>
+    <button data-m="board">Move board</button>
+  </div>
+  <button class="act" id="undo">Undo</button>
+  <button class="act" id="redo">Redo</button>
+  <button class="act" id="clear">Clear pad</button>
+  <div id="status"><span id="dot"></span><span id="title">Connecting…</span></div>
+</div>
+<div id="wrap"><canvas id="c"></canvas><div id="hint"></div></div>
 <script>
 (() => {
   const cv = document.getElementById('c'), g = cv.getContext('2d');
-  const msg = document.getElementById('msg'), dot = document.getElementById('dot');
+  const hint = document.getElementById('hint'), dot = document.getElementById('dot'), title = document.getElementById('title');
   let key = new URLSearchParams(location.hash.slice(1)).get('k');
   try { if (key) localStorage.setItem('k', key); else key = localStorage.getItem('k'); } catch (e) {}
-  if (!key) { msg.textContent = 'Scan the QR code on the board again.'; return; }
-  const q = 'k=' + encodeURIComponent(key);
+  const q = '?k=' + encodeURIComponent(key || '');
+  if (!key) { hint.textContent = 'Scan the QR code on the board again.'; return; }
 
-  let img = null, gen = 0, box = { x: 0, y: 0, w: 1, h: 1 };
-  const trail = new Map();       // pointer -> points drawn locally until the board catches up
-  let clearAt = Infinity;        // clear the local trail once a frame newer than this arrives
+  let mode = 'write', dpr = 1, W = 1, H = 1;
+  let area = [0.25, 0.25, 0.5, 0.5], screenWH = [16, 9], board = false;
+  let strokes = [];              // local ink: {pts:[[x,y]], erase}
+  const live = new Map();        // pointerId -> {slot, stroke, last:[x,y]}
 
+  // ---------- server
+  async function call(path, body) {
+    try {
+      const r = await fetch('/r/' + path + q, body === undefined ? { cache: 'no-store' } :
+        { method: 'POST', body: JSON.stringify(body) });
+      if (r.status === 403) { setStatus(false, 'Link out of date — scan the QR code again'); return null; }
+      const j = await r.json();
+      area = j.area; screenWH = j.screen; board = j.board;
+      setStatus(true, board ? (j.title || 'Board') : 'Open a board on the screen');
+      return j;
+    } catch (e) { setStatus(false, 'Reconnecting…'); return null; }
+  }
+  function setStatus(on, text) { dot.className = on ? 'on' : ''; title.textContent = text; showHint(); }
+
+  // One request in flight per kind; later ones merge into the next.
+  const lanes = {};
+  function send(kind, make) {
+    const l = lanes[kind] || (lanes[kind] = { busy: false, pending: null });
+    l.pending = make(l.pending);
+    if (!l.busy) pump(kind, l);
+  }
+  async function pump(kind, l) {
+    while (l.pending) {
+      const body = l.pending; l.pending = null; l.busy = true;
+      await call(kind, body);
+      l.busy = false;
+    }
+    if (kind === 'area' || kind === 'pan') draw();
+  }
+
+  // ---------- touches for writing: [phase, slot, x, y, ms]
+  let t0 = 0;
+  function ev(phase, slot, x, y) {
+    send('input', prev => {
+      const p = prev || { erase: mode === 'erase', events: [] };
+      if (!p.events.length) t0 = performance.now();
+      p.events.push([phase, slot, +(x / W).toFixed(5), +(y / H).toFixed(5), Math.round(performance.now() - t0)]);
+      return p;
+    });
+  }
+
+  // ---------- drawing
   function size() {
-    const d = devicePixelRatio || 1;
-    cv.width = Math.round(innerWidth * d); cv.height = Math.round(innerHeight * d);
+    dpr = devicePixelRatio || 1;
+    const r = cv.getBoundingClientRect();
+    W = r.width; H = r.height;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    sendArea(area[0], area[1], area[2]);
     draw();
   }
+  function sendArea(x, y, w) { send('area', () => ({ x, y, w, aspect: W / H })); }
+
+  function frame() {   // the screen drawn inside the pad, for Move box
+    const a = screenWH[0] / screenWH[1], pad = 16;
+    let fw = W - 2 * pad, fh = fw / a;
+    if (fh > H - 2 * pad) { fh = H - 2 * pad; fw = fh * a; }
+    return { x: (W - fw) / 2, y: (H - fh) / 2, w: fw, h: fh };
+  }
   function draw() {
-    const W = cv.width, H = cv.height;
-    g.fillStyle = '#111318'; g.fillRect(0, 0, W, H);
-    if (img) {
-      const s = Math.min(W / img.width, H / img.height);
-      const w = img.width * s, h = img.height * s;
-      box = { x: (W - w) / 2, y: (H - h) / 2, w, h };
-      g.drawImage(img, box.x, box.y, w, h);
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, W, H);
+    if (mode === 'box') {
+      const f = frame();
+      g.fillStyle = '#f3f4f7'; g.strokeStyle = '#c9cdd6'; g.lineWidth = 2;
+      roundRect(f.x, f.y, f.w, f.h, 10); g.fill(); g.stroke();
+      g.fillStyle = '#9aa1ad'; g.font = '13px system-ui'; g.fillText('Board screen', f.x + 10, f.y + 20);
+      const bx = f.x + area[0] * f.w, by = f.y + area[1] * f.h, bw = area[2] * f.w, bh = area[3] * f.h;
+      g.fillStyle = 'rgba(37,99,235,.12)'; g.strokeStyle = '#2563eb'; g.lineWidth = 3;
+      roundRect(bx, by, bw, bh, 8); g.fill(); g.stroke();
+      return;
     }
-    g.lineCap = g.lineJoin = 'round'; g.strokeStyle = 'rgba(37,99,235,.8)';
-    g.lineWidth = 3 * (devicePixelRatio || 1);
-    for (const pts of trail.values()) {
+    // faint dots like paper
+    g.fillStyle = '#e3e6ec';
+    for (let x = 24; x < W; x += 32) for (let y = 24; y < H; y += 32) g.fillRect(x - 1, y - 1, 2, 2);
+    g.lineCap = g.lineJoin = 'round';
+    for (const s of strokes) {
+      g.strokeStyle = s.erase ? 'rgba(229,72,77,.25)' : '#1f2430';
+      g.lineWidth = s.erase ? 22 : 3;
       g.beginPath();
-      pts.forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1]));
+      s.pts.forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1]));
+      if (s.pts.length === 1) g.lineTo(s.pts[0][0] + .1, s.pts[0][1]);
       g.stroke();
     }
   }
-  addEventListener('resize', size); size();
+  function roundRect(x, y, w, h, r) {
+    g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+    g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+  }
+  function showHint() {
+    hint.textContent = !board ? 'Open a board on the screen to start.'
+      : mode === 'box' ? 'Drag the blue box to choose where you write. Pinch to make it bigger or smaller.'
+      : mode === 'board' ? 'Drag to move the board. Pinch to zoom.'
+      : strokes.length ? '' : 'Write here. It appears inside the blue box on the board. Two fingers move the board.';
+    hint.style.display = hint.textContent ? '' : 'none';
+    hint.style.top = mode === 'box' ? 'auto' : '0';
+  }
+  function eraseLocal(p) {
+    strokes = strokes.filter(s => s.erase || !s.pts.some(q => Math.hypot(q[0] - p[0], q[1] - p[1]) < 14));
+  }
 
-  // Mirror: ask for a new picture whenever the board has repainted.
-  let fails = 0;
-  async function poll() {
-    for (;;) {
-      try {
-        const w = Math.min(1280, Math.max(640, Math.round(Math.max(cv.width, cv.height))));
-        const r = await fetch('/r/frame?' + q + '&since=' + gen + '&w=' + w, { cache: 'no-store' });
-        if (r.status === 403) { msg.textContent = 'This link is out of date. Scan the QR code again.'; dot.className = ''; return; }
-        dot.className = 'on'; fails = 0;
-        if (r.status === 200) {
-          const j = await r.json();
-          const im = new Image();
-          im.src = 'data:image/jpeg;base64,' + j.jpg;
-          await im.decode();
-          img = im; gen = j.gen; msg.style.display = 'none';
-          if (gen > clearAt) { trail.clear(); clearAt = Infinity; }
-          draw();
-          await wait(30);
-        } else {
-          await wait(80);
-        }
-      } catch (e) {
-        dot.className = ''; fails++;
-        msg.style.display = ''; msg.textContent = 'Reconnecting…';
-        await wait(Math.min(3000, 300 * fails));
-      }
-    }
-  }
-  const wait = ms => new Promise(r => setTimeout(r, ms));
-  poll();
+  // ---------- gestures
+  const pos = e => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+  let gesture = null;   // two-finger or move state
 
-  // Touches: [phase, id, x, y, ms since the batch started], x and y from 0 to 1.
-  const ids = new Map();
-  let queue = [], t0 = 0, sending = false;
-  function slot(pid) {
-    if (!ids.has(pid)) { let n = 0; while ([...ids.values()].includes(n)) n++; ids.set(pid, n); }
-    return ids.get(pid);
+  function pair() {
+    const ps = [...live.values()].slice(0, 2).map(v => v.last);
+    return { c: [(ps[0][0] + ps[1][0]) / 2, (ps[0][1] + ps[1][1]) / 2], d: Math.hypot(ps[0][0] - ps[1][0], ps[0][1] - ps[1][1]) || 1 };
   }
-  function at(e) {
-    const d = devicePixelRatio || 1, px = e.clientX * d, py = e.clientY * d;
-    return [px, py, (px - box.x) / box.w, (py - box.y) / box.h];
+  function panBoard(dx, dy, scale, c) {
+    // The pad shows the box, so moving a finger across the whole pad moves
+    // the board by the box's width.
+    send('pan', prev => {
+      const p = prev || { dx: 0, dy: 0, scale: 1 };
+      p.dx += dx / W * area[2]; p.dy += dy / H * area[3]; p.scale *= scale;
+      p.fx = area[0] + c[0] / W * area[2]; p.fy = area[1] + c[1] / H * area[3];
+      return p;
+    });
+    if (strokes.length) { strokes = []; }
   }
-  function push(phase, e) {
-    const [px, py, x, y] = at(e);
-    if (!queue.length) t0 = performance.now();
-    queue.push([phase, slot(e.pointerId), +x.toFixed(5), +y.toFixed(5), Math.round(performance.now() - t0)]);
-    return [px, py];
+  function moveBox(dx, dy, scale) {
+    const f = frame();
+    let w = Math.min(1, Math.max(0.08, area[2] * scale));
+    let h = area[3] * (w / area[2]);
+    let x = area[0] + dx / f.w - (w - area[2]) / 2;
+    let y = area[1] + dy / f.h - (h - area[3]) / 2;
+    x = Math.min(Math.max(0, x), 1 - w); y = Math.min(Math.max(0, y), 1 - Math.min(1, h));
+    area = [x, y, w, h];
+    sendArea(x, y, w);
+    if (strokes.length) strokes = [];
+    draw();
   }
-  async function flush() {
-    if (sending || !queue.length) return;
-    sending = true;
-    const batch = queue; queue = [];
-    try {
-      const r = await fetch('/r/input?' + q, { method: 'POST', body: JSON.stringify(batch) });
-      const j = await r.json();
-      if (batch.some(e => e[0] >= 2) && !ids.size) clearAt = j.gen;
-    } catch (e) {}
-    sending = false;
-    if (queue.length) flush();
-  }
-  setInterval(flush, 25);
 
   cv.addEventListener('pointerdown', e => {
-    if (!img) return;
     cv.setPointerCapture(e.pointerId);
-    const p = push(0, e);
-    trail.set(e.pointerId, [p]);
-    if (trail.size > 1) trail.clear();   // two fingers move the board, no preview
-    draw(); flush();
+    const p = pos(e);
+    let slot = 0; while ([...live.values()].some(v => v.slot === slot)) slot++;
+    const v = { slot, last: p, stroke: null };
+    live.set(e.pointerId, v);
+    if (!board) return;
+    if (live.size === 2) {
+      // a second finger turns any stroke in progress into a gesture
+      for (const o of live.values()) if (o.stroke) {
+        ev(3, o.slot, ...o.last); strokes.splice(strokes.indexOf(o.stroke), 1); o.stroke = null;
+      }
+      gesture = pair(); draw(); return;
+    }
+    if (live.size > 2) return;
+    if (mode === 'write' || mode === 'erase') {
+      v.stroke = { pts: [p], erase: mode === 'erase' };
+      strokes.push(v.stroke);
+      if (mode === 'erase') eraseLocal(p);
+      ev(0, slot, ...p); showHint(); draw();
+    }
   });
   cv.addEventListener('pointermove', e => {
-    if (!ids.has(e.pointerId)) return;
-    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
-    for (const c of (evs.length ? evs : [e])) {
-      const p = push(1, Object.assign({}, { clientX: c.clientX, clientY: c.clientY, pointerId: e.pointerId }));
-      const t = trail.get(e.pointerId); if (t) t.push(p);
+    const v = live.get(e.pointerId); if (!v || !board) return;
+    const list = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
+    if (live.size >= 2) {
+      v.last = pos(list[list.length - 1]);
+      const now = pair(), scale = now.d / gesture.d;
+      const dx = now.c[0] - gesture.c[0], dy = now.c[1] - gesture.c[1];
+      if (mode === 'box') moveBox(dx, dy, scale); else panBoard(dx, dy, scale, now.c);
+      gesture = now; draw(); return;
     }
-    draw();
+    if (v.stroke) {
+      for (const c of list) {
+        const p = pos(c); v.stroke.pts.push(p); v.last = p; ev(1, v.slot, ...p);
+        if (v.stroke.erase) eraseLocal(p);
+      }
+      draw(); return;
+    }
+    const p = pos(list[list.length - 1]);
+    const dx = p[0] - v.last[0], dy = p[1] - v.last[1]; v.last = p;
+    if (mode === 'box') moveBox(dx, dy, 1);
+    else if (mode === 'board') { panBoard(dx, dy, 1, p); draw(); }
   });
-  function end(phase) {
+  function end(cancel) {
     return e => {
-      if (!ids.has(e.pointerId)) return;
-      push(phase, e); ids.delete(e.pointerId); flush();
+      const v = live.get(e.pointerId); if (!v) return;
+      live.delete(e.pointerId);
+      if (v.stroke) {
+        ev(cancel ? 3 : 2, v.slot, ...pos(e));
+        if (v.stroke.erase) { strokes.splice(strokes.indexOf(v.stroke), 1); }
+        draw();
+      }
+      if (live.size < 2) gesture = null;
+      showHint();
     };
   }
-  cv.addEventListener('pointerup', end(2));
-  cv.addEventListener('pointercancel', end(3));
+  cv.addEventListener('pointerup', end(false));
+  cv.addEventListener('pointercancel', end(true));
   cv.addEventListener('contextmenu', e => e.preventDefault());
 
-  document.getElementById('full').onclick = async () => {
-    try {
-      if (document.fullscreenElement) await document.exitFullscreen();
-      else { await document.documentElement.requestFullscreen(); await screen.orientation.lock('landscape'); }
-    } catch (e) {}
+  // ---------- buttons
+  document.querySelectorAll('#modes button').forEach(b => b.onclick = () => {
+    mode = b.dataset.m;
+    document.querySelectorAll('#modes button').forEach(o => o.classList.toggle('on', o === b));
+    showHint(); draw();
+  });
+  document.getElementById('undo').onclick = () => {
+    for (let i = strokes.length - 1; i >= 0; i--) if (!strokes[i].erase) { strokes.splice(i, 1); break; }
+    send('cmd', () => ({ cmd: 'undo' })); draw(); showHint();
   };
+  document.getElementById('redo').onclick = () => send('cmd', () => ({ cmd: 'redo' }));
+  document.getElementById('clear').onclick = () => { strokes = []; draw(); showHint(); };
+
+  addEventListener('resize', () => setTimeout(size, 50));
+  call('state').then(() => { size(); showHint(); });
+  setInterval(() => { if (!live.size) call('state').then(() => { if (mode === 'box') draw(); }); }, 4000);
 })();
 </script>
 </body>

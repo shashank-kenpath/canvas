@@ -492,6 +492,16 @@ impl Editor {
     pub fn camera(&self) -> Pt {
         self.camera
     }
+    /// Moves the view by `d` and zooms by `scale` about `focus`, both in
+    /// buffer pixels, as a two finger gesture would.
+    pub fn pan_zoom(&mut self, d: Pt, scale: f64, focus: Pt) {
+        let focus = focus / self.dpr;
+        let anchor = self.world(focus);
+        self.zoom = (self.zoom * scale).clamp(0.1, 8.0);
+        self.camera = focus - anchor * self.zoom + d / self.dpr;
+        self.view_changed();
+    }
+
     /// Shows the board from `camera` at `zoom`, as saved with a page.
     pub fn set_view(&mut self, camera: Pt, zoom: f64) {
         self.camera = camera;
