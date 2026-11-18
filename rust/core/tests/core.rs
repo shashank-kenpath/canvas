@@ -892,3 +892,98 @@ fn prediction_runs_ahead_while_writing_and_leaves_no_trace() {
     assert!(e.doc.shapes()[0].bounds().r <= 221.0);
     assert_matches_full_repaint(&mut e);
 }
+
+#[test]
+fn a_hand_resting_before_writing_is_ignored() {
+    // The palm reports a finger-sized contact, lands first and stays put.
+    let palm = Contact { size: 30.0, stylus: false, eraser: false };
+    let finger = Contact { size: 14.0, stylus: false, eraser: false };
+    let mut e = editor();
+    e.pointer_down_with(5, p(300., 250.), 0, palm);
+    e.pointer_move_with(5, p(303., 252.), 150, palm);
+    e.pointer_down_with(0, p(50., 50.), 600, finger); // then the writer
+    for i in 1..=20 {
+        e.pointer_move_with(0, p(50.0 + i as f64 * 5.0, 50.), 600 + i * 8, finger);
+        e.pointer_move_with(5, p(303., 252. + (i % 3) as f64), 600 + i * 8, palm);
+    }
+    e.pointer_up(0, p(150., 50.), 800, false);
+    // A second word while the hand still rests.
+    e.pointer_down_with(1, p(50., 80.), 900, finger);
+    e.pointer_move_with(1, p(120., 80.), 950, finger);
+    e.pointer_up(1, p(120., 80.), 1000, false);
+    e.pointer_up(5, p(303., 254.), 1100, false);
+    e.render();
+    assert_eq!(e.doc.shapes().len(), 2, "both words, and no dot from the palm");
+    assert!(e.doc.shapes().iter().all(|s| s.bounds().b < 90.0));
+    assert!(!e.pointer_down_now());
+    assert_matches_full_repaint(&mut e);
+
+    // The same with several writers allowed: the palm is not a writer.
+    let mut e = editor();
+    e.set_multi_ink(true);
+    e.pointer_down_with(5, p(300., 250.), 0, palm);
+    e.pointer_down_with(0, p(50., 50.), 500, finger);
+    e.pointer_move_with(0, p(150., 50.), 550, finger);
+    e.pointer_up(0, p(150., 50.), 600, false);
+    e.pointer_up(5, p(300., 250.), 700, false);
+    assert_eq!(e.doc.shapes().len(), 1);
+    assert!(e.doc.shapes()[0].bounds().b < 60.0);
+
+    // A palm that lands as two touches looks like a pinch: writing after it
+    // undoes the zoom and draws.
+    let mut e = editor();
+    e.pointer_down_with(5, p(300., 250.), 0, palm);
+    e.pointer_down_with(6, p(330., 260.), 40, palm);
+    e.pointer_move_with(6, p(334., 262.), 80, palm);
+    e.pointer_down_with(0, p(50., 50.), 500, finger);
+    e.pointer_move_with(0, p(150., 50.), 550, finger);
+    e.pointer_up(0, p(150., 50.), 600, false);
+    e.pointer_up(5, p(300., 250.), 700, false);
+    e.pointer_up(6, p(334., 262.), 700, false);
+    assert_eq!(e.zoom(), 1.0);
+    assert_eq!(e.doc.shapes().len(), 1);
+
+    // A hand that rests and lifts without writing leaves nothing.
+    let mut e = editor();
+    e.pointer_down_with(5, p(300., 250.), 0, palm);
+    e.pointer_move_with(5, p(301., 251.), 500, palm);
+    e.pointer_up(5, p(301., 251.), 1200, false);
+    assert_eq!(e.doc.shapes().len(), 0);
+
+    // A quick tap is still a dot, and a finger that pauses mid-stroke keeps it.
+    let mut e = editor();
+    e.pointer_down_with(0, p(50., 50.), 0, finger);
+    e.pointer_up(0, p(50., 50.), 80, false);
+    e.pointer_down_with(1, p(60., 100.), 200, finger);
+    e.pointer_move_with(1, p(160., 100.), 260, finger);
+    e.pointer_down_with(2, p(300., 250.), 900, palm); // lands after a pause
+    e.pointer_move_with(1, p(200., 100.), 950, finger);
+    e.pointer_up(2, p(300., 250.), 980, false);
+    e.pointer_up(1, p(200., 100.), 1000, false);
+    assert_eq!(e.doc.shapes().len(), 2);
+}
+
+#[test]
+fn slow_jittery_ink_is_smoothed_and_ends_where_the_finger_lifts() {
+    let finger = Contact { size: 14.0, stylus: false, eraser: false };
+    let draw = |e: &mut Editor| {
+        e.pointer_down_with(0, p(50., 100.), 0, finger);
+        // Slow writing on a panel that wobbles by ±2 px.
+        for i in 1..=60u64 {
+            let y = if i % 2 == 0 { 102.0 } else { 98.0 };
+            e.pointer_move_with(0, p(50.0 + i as f64 * 2.0, y), i * 8, finger);
+        }
+        e.pointer_up(0, p(170., 100.), 490, false);
+        e.doc.shapes()[0].points.clone()
+    };
+    let wobble = |pts: &[Pt]| pts[5..pts.len() - 1].iter().map(|q| (q.y - 100.0).abs()).fold(0.0, f64::max);
+    let mut raw = editor();
+    raw.set_smoothing(false);
+    let rough = draw(&mut raw);
+    let mut e = editor();
+    assert!(e.smoothing());
+    let smooth = draw(&mut e);
+    assert!(wobble(&rough) >= 2.0);
+    assert!(wobble(&smooth) < 1.0, "wobble {}", wobble(&smooth));
+    assert_eq!(*smooth.last().unwrap(), p(170., 100.));
+}

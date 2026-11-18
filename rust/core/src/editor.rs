@@ -38,6 +38,42 @@ pub struct Contact {
     pub eraser: bool,
 }
 
+/// Adaptive low-pass filter (One-Euro) for live ink: strong smoothing when
+/// the hand moves slowly, where touch-panel jitter shows as wobble, and little
+/// lag when it moves fast.
+#[derive(Clone, Copy, Default)]
+struct Smoother {
+    /// Filtered position, filtered velocity (px/s) and time of the last sample.
+    last: Option<(Pt, Pt, u64)>,
+}
+
+impl Smoother {
+    /// Cut-off (Hz) when still.
+    const MIN_CUTOFF: f64 = 2.0;
+    /// How fast the cut-off rises with speed (per px/s).
+    const BETA: f64 = 0.07;
+    /// Cut-off (Hz) for the speed estimate.
+    const D_CUTOFF: f64 = 5.0;
+
+    fn reset(&mut self, p: Pt, t: u64) {
+        self.last = Some((p, Pt::ZERO, t));
+    }
+
+    fn filter(&mut self, p: Pt, t: u64) -> Pt {
+        let Some((prev, dprev, t0)) = self.last else {
+            self.reset(p, t);
+            return p;
+        };
+        let dt = t.saturating_sub(t0).max(1) as f64 / 1000.0;
+        let alpha = |cutoff: f64| 1.0 / (1.0 + 1.0 / (2.0 * std::f64::consts::PI * cutoff * dt));
+        let v = (p - prev) / dt;
+        let dv = dprev + (v - dprev) * alpha(Self::D_CUTOFF);
+        let out = prev + (p - prev) * alpha(Self::MIN_CUTOFF + Self::BETA * dv.len());
+        self.last = Some((out, dv, t));
+        out
+    }
+}
+
 /// A second stroke being written at the same time as the main one.
 struct Extra {
     pointer: i32,
@@ -45,6 +81,9 @@ struct Extra {
     points: Vec<Pt>,
     bounds: Rect,
     last_screen: Pt,
+    /// When it touched down, in milliseconds.
+    born: u64,
+    smooth: Smoother,
 }
 
 /// Handwriting the host should read and answer with [`Editor::commit_ink`].
@@ -93,6 +132,14 @@ pub struct TextRequest {
 
 /// How long the pen rests before handwriting is read, in milliseconds.
 const INK_PAUSE: u64 = 1100;
+/// A touch that has stayed put for this long (milliseconds) and then sees a
+/// new contact land is a resting hand, not a writer.
+const REST_MS: u64 = 220;
+/// How far (logical pixels) a resting hand may drift.
+const REST_TRAVEL: f64 = 12.0;
+/// A mark held still this long (milliseconds) without moving is a hand that
+/// rested and lifted, not a dot.
+const REST_DOT_MS: u64 = 800;
 
 const EMPTY: IRect = IRect { x0: 0, y0: 0, x1: 0, y1: 0 };
 
@@ -117,6 +164,11 @@ pub struct Editor {
     multi_ink: bool,
     /// How far ahead (milliseconds) the live stroke is drawn.
     predict_ms: f64,
+    /// Filter touch jitter out of live ink.
+    smoothing: bool,
+    smooth: Smoother,
+    /// The unfiltered position of the drawing finger (logical pixels).
+    raw_screen: Pt,
     stylus_seen: bool,
     tool_override: Option<Tool>,
     extras: Vec<Extra>,
@@ -140,7 +192,10 @@ pub struct Editor {
     start_world: Pt,
     anchor_world: Pt,
     start_zoom: f64,
+    start_camera: Pt,
     pinch_distance: f64,
+    /// Where the two pinch contacts first touched.
+    pinch_origin: [Pt; 2],
     stylus: Option<i32>,
     stylus_lifted: Option<u64>,
     primary_size: f64,
@@ -262,6 +317,9 @@ impl Editor {
             pen_priority: false,
             multi_ink: false,
             predict_ms: 0.0,
+            smoothing: true,
+            smooth: Smoother::default(),
+            raw_screen: Pt::ZERO,
             stylus_seen: false,
             tool_override: None,
             extras: Vec::new(),
@@ -279,7 +337,9 @@ impl Editor {
             start_world: Pt::ZERO,
             anchor_world: Pt::ZERO,
             start_zoom: 1.0,
+            start_camera: Pt::ZERO,
             pinch_distance: 1.0,
+            pinch_origin: [Pt::ZERO; 2],
             stylus: None,
             stylus_lifted: None,
             primary_size: 0.0,
@@ -544,6 +604,15 @@ impl Editor {
     }
 
     /// Lets several fingers write separate strokes at the same time.
+    /// Filters touch-panel jitter out of freehand ink.
+    pub fn set_smoothing(&mut self, on: bool) {
+        self.smoothing = on;
+    }
+
+    pub fn smoothing(&self) -> bool {
+        self.smoothing
+    }
+
     pub fn set_multi_ink(&mut self, on: bool) {
         self.multi_ink = on;
     }
@@ -696,6 +765,48 @@ impl Editor {
         self.primary = None;
     }
 
+    /// How far (logical pixels) an extra stroke has spread.
+    fn extra_travel(&self, e: &Extra) -> f64 {
+        (e.bounds.width() + e.bounds.height()) * self.zoom
+    }
+
+    /// Ignores, until they lift, the touches that have lain still since they
+    /// landed: a resting hand. Whatever they drew or zoomed is undone.
+    fn drop_resting(&mut self, time: u64) {
+        let rests = |born: u64, travel: f64| time.saturating_sub(born) >= REST_MS && travel < REST_TRAVEL;
+        let primary_rests = match self.mode {
+            Mode::Draw | Mode::Erase | Mode::Shape => self.pointers.len() == 1 && rests(self.down_stamp, self.travel),
+            Mode::Pinch => {
+                self.pointers.len() == 2
+                    && self.pointers.iter().zip(self.pinch_origin).all(|((_, p), o)| rests(self.down_stamp, p.dist(o)))
+            }
+            _ => false,
+        };
+        if primary_rests {
+            if self.mode == Mode::Pinch {
+                self.zoom = self.start_zoom;
+                self.camera = self.start_camera;
+                self.view_changed();
+            }
+            self.cancel_action();
+            let ids: Vec<i32> = self.pointers.drain(..).map(|(id, _)| id).collect();
+            self.ignored.extend(ids);
+            self.mode = Mode::None;
+            self.primary = None;
+        }
+        let mut i = 0;
+        while i < self.extras.len() {
+            if rests(self.extras[i].born, self.extra_travel(&self.extras[i])) {
+                let e = self.extras.remove(i);
+                self.ignored.push(e.pointer);
+                self.damage_world(&e.bounds, self.width / 2.0);
+                self.overlay_dirty = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     pub fn pointer_down_with(&mut self, id: i32, pos: Pt, time: u64, contact: Contact) {
         let pos = pos / self.dpr;
         if contact.stylus {
@@ -723,6 +834,11 @@ impl Editor {
                 self.ignored.push(id);
                 return;
             }
+            // Most people rest the hand first and then write: what has been
+            // lying still is that hand, and the new touch is the writer.
+            if !contact.stylus {
+                self.drop_resting(time);
+            }
         }
         if self.pointers.is_empty() {
             self.ignored.clear();
@@ -735,7 +851,15 @@ impl Editor {
             // Another writer: start a stroke of its own.
             let w = self.world(pos);
             let shape_id = self.next_id();
-            self.extras.push(Extra { pointer: id, id: shape_id, points: vec![w], bounds: Rect::from_points(w, w), last_screen: pos });
+            self.extras.push(Extra {
+                pointer: id,
+                id: shape_id,
+                points: vec![w],
+                bounds: Rect::from_points(w, w),
+                last_screen: pos,
+                born: time,
+                smooth: Smoother { last: Some((pos, Pt::ZERO, time)) },
+            });
             self.damage_world(&Rect::from_points(w, w), self.width / 2.0);
             return;
         }
@@ -759,6 +883,8 @@ impl Editor {
             self.pinch_distance = f64::max(24.0, a.dist(b));
             self.anchor_world = self.world((a + b) / 2.0);
             self.start_zoom = self.zoom;
+            self.start_camera = self.camera;
+            self.pinch_origin = [a, b];
             self.mode = Mode::Pinch;
             return;
         }
@@ -788,13 +914,22 @@ impl Editor {
             return;
         }
         if let Some(i) = self.extras.iter().position(|e| e.pointer == id) {
+            if self.is_palm(contact) && self.extra_travel(&self.extras[i]) < 2.0 * REST_TRAVEL {
+                let e = self.extras.remove(i);
+                self.ignored.push(id);
+                self.damage_world(&e.bounds, self.width / 2.0);
+                self.overlay_dirty = true;
+                return;
+            }
+            let pos = if self.smoothing { self.extras[i].smooth.filter(pos, time) } else { pos };
             self.extend_extra(i, pos);
             return;
         }
         // A hand that lands edge first only reports its full size a moment
-        // later: drop what it started.
+        // later, and one that rests may spread at any time: drop what it
+        // started.
         if self.is_palm(contact)
-            && time.saturating_sub(self.down_stamp) < 450
+            && (time.saturating_sub(self.down_stamp) < 450 || self.travel < 2.0 * REST_TRAVEL)
             && self.pointers.iter().any(|(p, _)| *p == id)
         {
             if Some(id) == self.primary || self.mode == Mode::Pinch {
@@ -825,24 +960,32 @@ impl Editor {
             return;
         }
         self.travel += pos.dist(previous);
+        self.raw_screen = pos;
+        let pos = if self.smoothing && self.mode == Mode::Draw { self.smooth.filter(pos, time) } else { pos };
         self.continue_(pos, time);
     }
 
     pub fn pointer_up(&mut self, id: i32, pos: Pt, time: u64, cancelled: bool) {
         let pos = pos / self.dpr;
-        if self.stylus == Some(id) {
+        let was_stylus = self.stylus == Some(id);
+        if was_stylus {
             self.stylus = None;
             self.stylus_lifted = Some(time);
         }
+        let palm_rejection = self.palm_rejection;
+        let rested = |born: u64, travel: f64| {
+            palm_rejection && !was_stylus && time.saturating_sub(born) >= REST_DOT_MS && travel < 3.0
+        };
         if let Some(i) = self.ignored.iter().position(|p| *p == id) {
             self.ignored.remove(i);
             return;
         }
         if let Some(i) = self.extras.iter().position(|e| e.pointer == id) {
             self.extend_extra(i, pos);
+            let dropped = rested(self.extras[i].born, self.extra_travel(&self.extras[i]));
             let e = self.extras.remove(i);
             self.damage_world(&e.bounds, self.width / 2.0);
-            if !cancelled {
+            if !cancelled && !dropped {
                 let shape = Shape::new(e.id, Tool::Pen, e.points).styled(self.color, self.width, false);
                 let applied = self.doc.add(shape);
                 self.on_applied(applied);
@@ -865,9 +1008,15 @@ impl Editor {
             return;
         }
         if Some(id) == self.primary {
-            if cancelled {
+            let resting_mark = self.mode == Mode::Draw && rested(self.down_stamp, self.travel);
+            if cancelled || resting_mark {
                 self.cancel_action();
             } else {
+                // The filtered ink trails the finger a little: end where it lifted.
+                if self.mode == Mode::Draw {
+                    self.raw_screen = pos;
+                    self.continue_(pos, time);
+                }
                 self.finish(pos, time);
             }
             self.mode = Mode::None;
@@ -1050,6 +1199,8 @@ impl Editor {
                 self.draft = Some(vec![w]);
                 self.draft_bounds = Rect::from_points(w, w);
                 self.last_screen = position;
+                self.smooth.reset(position, time);
+                self.raw_screen = position;
                 self.snapped = None;
                 self.ink_deadline = None;
                 self.reset_still(position, time);
@@ -1182,6 +1333,13 @@ impl Editor {
         }
         let had = !self.prediction.is_empty();
         self.prediction.clear();
+        // Filtered ink trails the finger slightly; a live tail to the finger
+        // hides that, and the stroke catches up when it lifts.
+        let mut position = position;
+        if self.smoothing && self.raw_screen.dist(position) > 0.5 {
+            position = self.raw_screen;
+            self.prediction.push(self.world(position));
+        }
         if self.predict_ms > 0.0 && self.recent.len() >= 3 {
             let (p0, t0) = self.recent[0];
             let dt = time.saturating_sub(t0) as f64;
