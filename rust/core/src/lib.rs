@@ -8,10 +8,14 @@
 pub mod document;
 pub mod editor;
 pub mod geom;
+pub mod math;
+mod mindmap;
+pub mod import;
 pub mod recognize;
 pub mod render;
 pub mod shape;
 pub mod store;
+pub mod table;
 pub mod text;
 pub mod ui;
 

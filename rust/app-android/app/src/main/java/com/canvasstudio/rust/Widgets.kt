@@ -9,6 +9,8 @@ class BoardSurface(context: Context) : SurfaceView(context) {
     var handle = 0L
     private var samples = FloatArray(STRIDE * 64)
     private val followed = HashSet<Int>()
+    /** IR frames report real contact widths (finger, pen tip, back nib, palm). */
+    private var irPanel = false
     var scale = 1f
         private set
     var maxSide = MAX_SIDE
@@ -20,7 +22,7 @@ class BoardSurface(context: Context) : SurfaceView(context) {
         if (scale < 1f) holder.setFixedSize(Math.round(w * scale), Math.round(h * scale)) else holder.setSizeFromLayout()
     }
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) { super.onSizeChanged(w, h, oldw, oldh); fit(w, h) }
-    private fun put(k: Int, e: MotionEvent, p: Int, x: Float, y: Float, time: Long, major: Float) {
+    private fun put(k: Int, e: MotionEvent, p: Int, x: Float, y: Float, time: Long, major: Float, size: Float) {
         val o = k * STRIDE
         if (o + STRIDE > samples.size) samples = samples.copyOf(maxOf(samples.size * 2, o + STRIDE))
         samples[o] = e.getPointerId(p).toFloat()
@@ -29,35 +31,39 @@ class BoardSurface(context: Context) : SurfaceView(context) {
         samples[o + 3] = (time - e.downTime).toFloat()
         samples[o + 4] = major * scale
         samples[o + 5] = when (e.getToolType(p)) { MotionEvent.TOOL_TYPE_ERASER -> 2f; MotionEvent.TOOL_TYPE_STYLUS -> 1f; else -> 0f }
+        samples[o + 6] = if (irPanel) size else 0f
     }
     private fun one(action: Int, e: MotionEvent, p: Int) {
-        put(0, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p))
+        put(0, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p), e.getSize(p))
         RustApp.touch(handle, action, e.downTime, samples, 1)
     }
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (handle == 0L) return false
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
-                if (e.actionMasked == MotionEvent.ACTION_DOWN) { requestUnbufferedDispatch(e); followed.clear() }
+                if (e.actionMasked == MotionEvent.ACTION_DOWN) {
+                    requestUnbufferedDispatch(e); followed.clear()
+                    irPanel = e.device?.name?.contains("irtouch", ignoreCase = true) == true
+                }
                 if (followed.size < MAX_POINTERS) { followed.add(e.getPointerId(e.actionIndex)); one(0, e, e.actionIndex) }
             }
             MotionEvent.ACTION_MOVE -> {
                 var n = 0
                 for (h in 0 until e.historySize) for (p in 0 until e.pointerCount) {
-                    if (e.getPointerId(p) in followed) put(n++, e, p, e.getHistoricalX(p, h), e.getHistoricalY(p, h), e.getHistoricalEventTime(h), e.getHistoricalTouchMajor(p, h))
+                    if (e.getPointerId(p) in followed) put(n++, e, p, e.getHistoricalX(p, h), e.getHistoricalY(p, h), e.getHistoricalEventTime(h), e.getHistoricalTouchMajor(p, h), e.getHistoricalSize(p, h))
                 }
-                for (p in 0 until e.pointerCount) if (e.getPointerId(p) in followed) put(n++, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p))
+                for (p in 0 until e.pointerCount) if (e.getPointerId(p) in followed) put(n++, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p), e.getSize(p))
                 if (n > 0) RustApp.touch(handle, 1, e.downTime, samples, n)
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> if (followed.remove(e.getPointerId(e.actionIndex))) one(2, e, e.actionIndex)
             MotionEvent.ACTION_CANCEL -> {
                 var n = 0
-                for (p in 0 until e.pointerCount) if (e.getPointerId(p) in followed) put(n++, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p))
+                for (p in 0 until e.pointerCount) if (e.getPointerId(p) in followed) put(n++, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p), e.getSize(p))
                 followed.clear()
                 RustApp.touch(handle, 3, e.downTime, samples, n)
             }
         }
         return true
     }
-    companion object { const val STRIDE = 6; const val MAX_SIDE = 1920; const val MAX_POINTERS = 5 }
+    companion object { const val STRIDE = 7; const val MAX_SIDE = 1920; const val MAX_POINTERS = 5 }
 }

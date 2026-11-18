@@ -4,7 +4,8 @@
 //! undo step costs the same on a full board as on an empty one.
 
 use crate::geom::{Pt, Rect};
-use crate::shape::Shape;
+use crate::mindmap;
+use crate::shape::{Shape, Tool};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -145,6 +146,19 @@ impl Document {
         if applied.is_empty() {
             return (applied, Applied::default());
         }
+        let changed_nodes: HashSet<_> = applied.iter()
+            .filter(|c| c.before.iter().chain(&c.after).any(|s| s.tool == Tool::MindNode))
+            .map(|c| c.id.as_str())
+            .collect();
+        if !changed_nodes.is_empty() {
+            for (parent, child) in mindmap::connections(&self.shapes).chain(mindmap::connections(&next)) {
+                if changed_nodes.contains(parent.id.as_str()) || changed_nodes.contains(child.id.as_str()) {
+                    let area = mindmap::connection_bounds(parent.bounds(), child.bounds());
+                    report.areas.push((area, 3.0));
+                    only_appends = false;
+                }
+            }
+        }
         if !only_appends {
             report.appended.clear();
         }
@@ -198,7 +212,9 @@ impl Document {
     }
 
     pub fn remove_many<I: IntoIterator<Item = String>>(&mut self, ids: I) -> Applied {
-        let changes = ids.into_iter().filter(|id| self.contains(id)).map(|id| (id, None)).collect();
+        let ids: HashSet<_> = ids.into_iter().filter(|id| self.contains(id)).collect();
+        let ids = mindmap::subtree_ids(&self.shapes, ids);
+        let changes = ids.into_iter().map(|id| (id, None)).collect();
         self.commit(changes)
     }
 
@@ -214,7 +230,7 @@ impl Document {
     pub fn select_many<I: IntoIterator<Item = String>>(&mut self, ids: I) -> bool {
         let mut next: Vec<String> = Vec::new();
         for id in ids {
-            if self.contains(&id) && !next.contains(&id) {
+            if self.get(&id).is_some_and(|shape| !shape.page_background) && !next.contains(&id) {
                 next.push(id);
             }
         }

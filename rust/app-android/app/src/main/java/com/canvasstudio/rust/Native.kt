@@ -29,6 +29,7 @@ object RustApp {
     @JvmStatic external fun toast(handle: Long, text: String)
     /** [files] is a JSON array with the text of each picked board file. */
     @JvmStatic external fun importBoards(handle: Long, files: String)
+    @JvmStatic external fun fileResult(handle: Long, token: Int, name: String, mime: String, bytes: Array<ByteArray>?, error: String?)
     @JvmStatic external fun pause(handle: Long)
 }
 /** Measures and draws text for the engine, which calls in from its render thread. */

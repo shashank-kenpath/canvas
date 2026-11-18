@@ -721,8 +721,8 @@ fn a_shape_followed_by_writing_goes_back_to_ink() {
 
 #[test]
 fn palms_are_ignored() {
-    let big = Contact { size: 90.0, stylus: false, eraser: false };
-    let finger = Contact { size: 14.0, stylus: false, eraser: false };
+    let big = Contact { size: 90.0, stylus: false, eraser: false, norm: 0.0 };
+    let finger = Contact { size: 14.0, stylus: false, eraser: false, norm: 0.0 };
     // A palm resting before and during a stroke changes nothing.
     let mut e = editor();
     e.pointer_down_with(5, p(300., 250.), 0, big);
@@ -751,7 +751,7 @@ fn palms_are_ignored() {
     assert_matches_full_repaint(&mut e);
 
     // With a pen, the hand holding it never draws or zooms.
-    let pen = Contact { size: 4.0, stylus: true, eraser: false };
+    let pen = Contact { size: 4.0, stylus: true, eraser: false, norm: 0.0 };
     let mut e = editor();
     e.pointer_down_with(7, p(250., 220.), 0, finger); // hand touches first
     e.pointer_move_with(7, p(256., 226.), 20, finger);
@@ -811,7 +811,7 @@ fn the_pen_tail_erases_whatever_tool_is_chosen() {
     let mut e = editor();
     drag(&mut e, &line(p(40., 100.), p(240., 100.), 20), 0);
     assert_eq!(e.doc.shapes().len(), 1);
-    let tail = Contact { size: 8.0, stylus: true, eraser: true };
+    let tail = Contact { size: 8.0, stylus: true, eraser: true, norm: 0.0 };
     e.pointer_down_with(3, p(140., 60.), 3000, tail);
     for i in 1..=10 {
         e.pointer_move_with(3, p(140., 60.0 + i as f64 * 8.0), 3000 + i * 8, tail);
@@ -823,8 +823,8 @@ fn the_pen_tail_erases_whatever_tool_is_chosen() {
 
 #[test]
 fn with_pen_priority_fingers_pan_once_a_stylus_is_used() {
-    let pen = Contact { size: 4.0, stylus: true, eraser: false };
-    let finger = Contact { size: 14.0, stylus: false, eraser: false };
+    let pen = Contact { size: 4.0, stylus: true, eraser: false, norm: 0.0 };
+    let finger = Contact { size: 14.0, stylus: false, eraser: false, norm: 0.0 };
     let mut e = editor();
     e.set_pen_priority(true);
     // No stylus seen yet: a finger still writes (IR panels report fingers).
@@ -896,8 +896,8 @@ fn prediction_runs_ahead_while_writing_and_leaves_no_trace() {
 #[test]
 fn a_hand_resting_before_writing_is_ignored() {
     // The palm reports a finger-sized contact, lands first and stays put.
-    let palm = Contact { size: 30.0, stylus: false, eraser: false };
-    let finger = Contact { size: 14.0, stylus: false, eraser: false };
+    let palm = Contact { size: 30.0, stylus: false, eraser: false, norm: 0.0 };
+    let finger = Contact { size: 14.0, stylus: false, eraser: false, norm: 0.0 };
     let mut e = editor();
     e.pointer_down_with(5, p(300., 250.), 0, palm);
     e.pointer_move_with(5, p(303., 252.), 150, palm);
@@ -965,7 +965,7 @@ fn a_hand_resting_before_writing_is_ignored() {
 
 #[test]
 fn slow_jittery_ink_is_smoothed_and_ends_where_the_finger_lifts() {
-    let finger = Contact { size: 14.0, stylus: false, eraser: false };
+    let finger = Contact { size: 14.0, stylus: false, eraser: false, norm: 0.0 };
     let draw = |e: &mut Editor| {
         e.pointer_down_with(0, p(50., 100.), 0, finger);
         // Slow writing on a panel that wobbles by ±2 px.
@@ -986,4 +986,90 @@ fn slow_jittery_ink_is_smoothed_and_ends_where_the_finger_lifts() {
     assert!(wobble(&rough) >= 2.0);
     assert!(wobble(&smooth) < 1.0, "wobble {}", wobble(&smooth));
     assert_eq!(*smooth.last().unwrap(), p(170., 100.));
+}
+
+/// The IR panel reports every contact at one size, so the hand is told apart
+/// by where it lands and how it moves.
+#[test]
+fn a_palm_landing_with_the_pen_is_ignored() {
+    let mut e = editor();
+    e.pointer_down(0, p(300., 200.), 0); // pen
+    e.pointer_down(1, p(350., 260.), 20); // palm, below right, with it
+    for i in 1..=30u64 {
+        e.pointer_move(0, p(300.0 + i as f64 * 6.0, 200.0 + (i % 5) as f64 * 4.0), 20 + i * 10);
+        e.pointer_move(1, p(350.0 + i as f64 * 1.0, 260.), 20 + i * 10);
+    }
+    e.pointer_up(1, p(380., 260.), 330, false);
+    e.pointer_up(0, p(480., 200.), 340, false);
+    assert_eq!(e.zoom(), 1.0, "no accidental zoom");
+    assert_eq!(e.doc.shapes().len(), 1);
+    assert_eq!(e.doc.shapes()[0].points[0], p(300., 200.), "ink starts where the pen landed");
+}
+
+#[test]
+fn a_palm_that_lands_first_and_drags_gives_way_to_the_pen() {
+    let mut e = editor();
+    e.pointer_down(0, p(400., 300.), 0); // palm, moving along
+    for i in 1..=20u64 {
+        e.pointer_move(0, p(400.0 + i as f64 * 3.0, 300.), i * 15);
+    }
+    e.pointer_down(1, p(380., 230.), 320); // pen, above it
+    for i in 1..=20u64 {
+        e.pointer_move(1, p(380.0 + i as f64 * 8.0, 230.), 320 + i * 10);
+        e.pointer_move(0, p(460.0 + i as f64 * 2.0, 300.), 320 + i * 10);
+    }
+    e.pointer_up(1, p(540., 230.), 530, false);
+    e.pointer_up(0, p(500., 300.), 540, false);
+    assert_eq!(e.doc.shapes().len(), 1, "only the pen writes");
+    assert_eq!(e.doc.shapes()[0].points[0], p(380., 230.));
+}
+
+#[test]
+fn two_writers_still_work_but_a_palm_beside_one_does_not() {
+    let mut e = editor();
+    e.set_multi_ink(true);
+    e.pointer_down(0, p(100., 100.), 0);
+    e.pointer_move(0, p(140., 100.), 300);
+    e.pointer_down(1, p(700., 100.), 310); // a second writer, far away
+    e.pointer_move(1, p(760., 100.), 400);
+    e.pointer_down(2, p(150., 160.), 410); // the first writer's palm
+    e.pointer_move(2, p(160., 160.), 420);
+    e.pointer_up(2, p(160., 160.), 430, false);
+    e.pointer_up(1, p(760., 100.), 440, false);
+    e.pointer_up(0, p(180., 100.), 450, false);
+    assert_eq!(e.doc.shapes().len(), 2);
+}
+
+fn ir(raw: f64) -> Contact {
+    Contact { size: 2.0, stylus: false, eraser: false, norm: raw / 32767.0 }
+}
+
+#[test]
+fn the_pens_back_nib_erases_on_an_ir_panel() {
+    let mut e = editor();
+    e.pointer_down_with(0, p(100., 100.), 0, ir(35.));
+    e.pointer_move_with(0, p(300., 100.), 50, ir(35.));
+    e.pointer_up(0, p(300., 100.), 60, false);
+    assert_eq!(e.doc.shapes().len(), 1, "the tip writes");
+    // The nib lands edge first (tip sized) and widens a moment later.
+    e.pointer_down_with(1, p(200., 60.), 1000, ir(35.));
+    e.pointer_move_with(1, p(200., 80.), 1020, ir(120.));
+    e.pointer_move_with(1, p(200., 140.), 1040, ir(150.));
+    e.pointer_up(1, p(200., 140.), 1060, false);
+    assert_eq!(e.doc.shapes().len(), 0, "the nib erased the stroke without drawing");
+}
+
+#[test]
+fn a_wide_ir_contact_is_a_palm_even_after_it_moved() {
+    let mut e = editor();
+    e.pointer_down_with(0, p(100., 300.), 0, ir(70.));
+    for i in 1..=40u64 {
+        e.pointer_move_with(0, p(100.0 + i as f64 * 5.0, 300.), i * 20, ir(if i < 30 { 70. } else { 520. }));
+    }
+    e.pointer_up(0, p(300., 300.), 820, false);
+    assert_eq!(e.doc.shapes().len(), 0);
+    e.pointer_down_with(1, p(100., 100.), 1000, ir(15.)); // a finger still writes
+    e.pointer_move_with(1, p(200., 100.), 1050, ir(15.));
+    e.pointer_up(1, p(200., 100.), 1060, false);
+    assert_eq!(e.doc.shapes().len(), 1);
 }

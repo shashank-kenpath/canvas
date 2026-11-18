@@ -232,7 +232,7 @@ fn render_loop(vm: JavaVM, listener: GlobalRef, editor: Arc<Mutex<Editor>>, rx: 
                             let id = s[0] as i32;
                             let pos = Pt::new(s[1] as f64, s[2] as f64);
                             let time = (base as f64 + s[3] as f64).max(0.0);
-                            let contact = Contact { size: s[4].max(0.0) as f64, stylus: s[5] != 0.0, eraser: s[5] > 1.5 };
+                            let contact = Contact { size: s[4].max(0.0) as f64, stylus: s[5] != 0.0, eraser: s[5] > 1.5, norm: 0.0 };
                             newest_sample = Some(time);
                             stats.samples += 1;
                             match action {

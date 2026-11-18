@@ -18,6 +18,18 @@ The library screen, floating editor toolbars, style panel, menus, dialogs, text/
 
 The package is `com.canvasstudio.rust`, separate from the Flutter app. Earlier Rust boards remain in the same app-private `files/boards` directory. Flutter boards are not automatically imported. The app is shown as Inkboard; the package name is unchanged so over-the-air updates keep working.
 
+## Insert files
+
+Open a board and select **+ (Insert)** in the dock.
+
+- **Image** inserts a movable, resizable image from PNG, JPEG, WebP, GIF (first frame), or BMP.
+- **PDF → New pages** appends one board page per PDF page and locks each background against touch selection and erasing. **PDF → Current page** places the pages below one another as movable images.
+- **Document** imports SVG as an image, PPTX as editable slide pages, DOCX as flowing text, images, and tables, and the first XLSX worksheet as editable tables. XLSX formulas use their saved results. Complex Office layouts can lose formatting, and unsupported slide objects can fall back to text.
+
+The Android picker accepts files up to 32 MiB. PDF import accepts up to 80 pages and uses Android's rasterizer, with a 1,920-pixel longest side and a 32 MiB total raster payload. PPTX import accepts up to 80 slides. Large worksheet and document tables are split to fit Inkboard's table editor.
+
+Local board JSON stores an `imageRef` for each image. The matching SHA-256-named PNG or JPEG bytes live in the board's sibling `<id>.assets` directory, which belongs with the JSON when copying the app-private files. Board sharing sends the image bytes as base64 `imageData` inline, so a joined device needs only the normal sharing connection. Sharing and PNG export use the open page.
+
 ## Relay
 
 `server/relay.mjs` (Node 18+) holds nothing on disk. Panels long-poll `/_dev/poll` with their id and secret; requests to `/d/<id>/...` are queued for that panel, and `/find?code=` maps a share code to the panel sharing it. It listens on 127.0.0.1:18780 and is published over HTTPS (Tailscale Funnel at `https://inkboard.taila6db10.ts.net`, the address built into the app).

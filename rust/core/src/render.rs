@@ -5,14 +5,22 @@
 //! proportion to that region and never to the size of the screen.
 
 use crate::geom::{IRect, Pt, Rect};
+use crate::import::ImageAsset;
+use crate::mindmap;
 use crate::shape::{Shape, Tool};
 use crate::text;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use tiny_skia::{
     FillRule, FilterQuality, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PixmapMut,
     PixmapPaint, Stroke, Transform,
 };
+
+mod board_objects;
+pub(crate) use board_objects::draw_connection;
+
+#[path = "math/draw.rs"]
+mod math_draw;
 
 pub const BACKGROUND: u32 = 0xfff9fafb;
 pub const GRID_DOT: u32 = 0xffd9dce1;
@@ -214,6 +222,8 @@ pub fn paint_bounds(s: &Shape) -> Rect {
     let pad = match s.tool {
         Tool::Arrow if !s.points.is_empty() => s.width / 2.0 + arrow_head_length(s),
         Tool::Text => s.font_size * 0.35,
+        Tool::Formula => s.font_size * 0.45,
+        Tool::Graph => (s.bounds().shortest_side() * 0.005).max(s.width / 2.0),
         _ => s.width / 2.0,
     };
     s.bounds().inflate(pad)
@@ -243,18 +253,36 @@ fn text_bitmap(content: &str, font_px: f64, color: u32, font: u8) -> Option<Arc<
     bitmap
 }
 
-fn draw_text(t: &mut Target, s: &Shape, alpha: f32, ts: Transform, plain: bool) {
-    if s.text.is_empty() {
+fn draw_text_at(
+    t: &mut Target,
+    s: &Shape,
+    (content, a, size): (&str, Pt, f64),
+    alpha: f32,
+    ts: Transform,
+    plain: bool,
+) {
+    let color = if s.tool == Tool::Text { s.color } else { 0xff14161c };
+    draw_label(t, (content, a, size), (s.font, color), alpha, ts, plain);
+}
+
+fn draw_label(
+    t: &mut Target,
+    (content, a, size): (&str, Pt, f64),
+    (font, color): (u8, u32),
+    alpha: f32,
+    ts: Transform,
+    plain: bool,
+) {
+    if content.is_empty() {
         return;
     }
     let scale = t.view.scale();
     // Very large text is rendered once at a capped size and scaled up.
-    let font_px = ((s.font_size * scale).clamp(1.0, 384.0) * 4.0).round() / 4.0;
-    let Some(bitmap) = text_bitmap(&s.text, font_px, s.color, s.font) else {
+    let font_px = ((size * scale).clamp(1.0, 384.0) * 4.0).round() / 4.0;
+    let Some(bitmap) = text_bitmap(content, font_px, color, font) else {
         return;
     };
-    let unit = (s.font_size / font_px) as f32; // world units per bitmap pixel
-    let a = s.points[0];
+    let unit = (size / font_px) as f32; // world units per bitmap pixel
     let mut paint = PixmapPaint { opacity: alpha, ..PixmapPaint::default() };
     let exact = plain && (unit as f64 * scale - 1.0).abs() < 0.01;
     let transform = if exact {
@@ -267,6 +295,49 @@ fn draw_text(t: &mut Target, s: &Shape, alpha: f32, ts: Transform, plain: bool) 
         paint.quality = FilterQuality::Bilinear;
         ts.pre_translate(a.x as f32, a.y as f32).pre_scale(unit, unit)
     };
+    t.pm.draw_pixmap(0, 0, bitmap.as_ref().as_ref(), &paint, transform, None);
+}
+
+type ImageCache = VecDeque<([u8; 32], Option<Arc<Pixmap>>)>;
+
+fn image_bitmap(asset: &ImageAsset) -> Option<Arc<Pixmap>> {
+    static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
+    const MAX_PIXELS_BYTES: usize = 48 << 20;
+    let cache = CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
+    let hash = asset.hash();
+    let cached = |cache: &mut ImageCache| {
+        let position = cache.iter().position(|(key, _)| *key == hash)?;
+        let entry = cache.remove(position)?;
+        let value = entry.1.clone();
+        cache.push_back(entry);
+        Some(value)
+    };
+    if let Some(bitmap) = cached(&mut cache.lock().unwrap()) {
+        return bitmap;
+    }
+    let bitmap = asset.pixmap().map(Arc::new);
+    let mut cache = cache.lock().unwrap();
+    if let Some(bitmap) = cached(&mut cache) {
+        return bitmap;
+    }
+    let bytes = |bitmap: &Option<Arc<Pixmap>>| bitmap.as_ref().map_or(0, |p| p.data().len());
+    let mut total = bytes(&bitmap) + cache.iter().map(|(_, p)| bytes(p)).sum::<usize>();
+    while cache.len() >= 64 || total > MAX_PIXELS_BYTES {
+        let Some((_, oldest)) = cache.pop_front() else { break };
+        total -= bytes(&oldest);
+    }
+    cache.push_back((hash, bitmap.clone()));
+    bitmap
+}
+
+fn draw_image(t: &mut Target, shape: &Shape, alpha: f32, transform: Transform) {
+    let Some(bitmap) = shape.image.as_deref().and_then(image_bitmap) else { return };
+    let bounds = shape.bounds();
+    let transform = transform.pre_translate(bounds.l as f32, bounds.t as f32).pre_scale(
+        (bounds.width() / f64::from(bitmap.width())) as f32,
+        (bounds.height() / f64::from(bitmap.height())) as f32,
+    );
+    let paint = PixmapPaint { opacity: alpha, quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
     t.pm.draw_pixmap(0, 0, bitmap.as_ref().as_ref(), &paint, transform, None);
 }
 
@@ -326,7 +397,12 @@ pub fn draw_shape(t: &mut Target, s: &Shape, alpha: f32, extra: Option<Transform
                 t.pm.stroke_path(&path, &paint, &stroke, ts, None);
             }
         }
-        Tool::Text => draw_text(t, s, alpha, ts, extra.is_none()),
+        Tool::Text => draw_text_at(t, s, (&s.text, a, s.font_size), alpha, ts, extra.is_none()),
+        Tool::Formula => math_draw::draw_formula(t, s, alpha, ts),
+        Tool::Graph => math_draw::draw_graph(t, s, alpha, ts),
+        Tool::Image => draw_image(t, s, alpha, ts),
+        Tool::Table => board_objects::draw_table(t, s, alpha, ts),
+        Tool::MindNode => board_objects::draw_mind_node(t, s, alpha, ts),
         Tool::Pen => {
             if s.is_dot() {
                 if let Some(path) = PathBuilder::from_circle(a.x as f32, a.y as f32, (s.width / 2.0) as f32) {
@@ -465,6 +541,9 @@ pub fn thumbnail(shapes: &[Arc<Shape>], w: u32, h: u32) -> Vec<u8> {
     }
     if let Some(mut t) = Target::new(&mut buf, region, view) {
         draw_background(&mut t, false);
+        for (parent, child) in mindmap::connections(shapes) {
+            draw_connection(&mut t, parent.bounds(), child.bounds(), child.color);
+        }
         for s in shapes {
             draw_shape(&mut t, s, 1.0, None);
         }

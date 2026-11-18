@@ -10,3 +10,9 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "si
 ab_glyph = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "0.26"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+quick-xml = "0.38"
+resvg = { version = "0.45", default-features = false, features = ["text", "raster-images"] }
+sha2 = "0.10"
+zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }

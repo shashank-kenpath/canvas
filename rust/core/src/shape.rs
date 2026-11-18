@@ -1,9 +1,12 @@
 //! One shape on the board, and its JSON form (identical to the Flutter app's).
 
 use crate::geom::{segment_distance, Pt, Rect};
+use crate::math::{self, GraphRange};
+use crate::import::ImageAsset;
+use crate::table::Table;
 use crate::text;
 use serde_json::{json, Map, Value};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Tool {
@@ -20,10 +23,15 @@ pub enum Tool {
     Diamond,
     Star,
     Hexagon,
+    Table,
+    MindNode,
+    Image,
+    Formula,
+    Graph,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 13] = [
+    pub const ALL: [Tool; 18] = [
         Tool::Select,
         Tool::Hand,
         Tool::Pen,
@@ -37,6 +45,11 @@ impl Tool {
         Tool::Diamond,
         Tool::Star,
         Tool::Hexagon,
+        Tool::Table,
+        Tool::MindNode,
+        Tool::Image,
+        Tool::Formula,
+        Tool::Graph,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -53,6 +66,11 @@ impl Tool {
             Tool::Diamond => "diamond",
             Tool::Star => "star",
             Tool::Hexagon => "hexagon",
+            Tool::Table => "table",
+            Tool::MindNode => "mindnode",
+            Tool::Image => "image",
+            Tool::Formula => "formula",
+            Tool::Graph => "graph",
         }
     }
     pub fn by_name(name: &str) -> Option<Tool> {
@@ -100,6 +118,11 @@ pub struct Shape {
     pub font_size: f64,
     /// Index into [`text::FONTS`].
     pub font: u8,
+    pub table: Option<Box<Table>>,
+    pub parent_id: Option<String>,
+    pub graph_range: GraphRange,
+    pub(crate) image: Option<Arc<ImageAsset>>,
+    pub(crate) page_background: bool,
     bounds: Rect,
 }
 
@@ -115,6 +138,11 @@ impl Shape {
             text: String::new(),
             font_size: 24.0,
             font: 0,
+            table: (tool == Tool::Table).then(Box::default),
+            parent_id: None,
+            graph_range: GraphRange::default(),
+            image: None,
+            page_background: false,
             bounds: Rect::ZERO,
         };
         s.bounds = s.compute_bounds();
@@ -148,6 +176,17 @@ impl Shape {
         s
     }
 
+    pub(crate) fn with_table(mut self, table: Table) -> Shape {
+        self.table = Some(Box::new(table));
+        self
+    }
+
+    pub(crate) fn with_image(mut self, image: Arc<ImageAsset>, page_background: bool) -> Shape {
+        self.image = Some(image);
+        self.page_background = page_background;
+        self
+    }
+
     pub fn bounds(&self) -> Rect {
         self.bounds
     }
@@ -176,8 +215,13 @@ impl Shape {
         let Some(first) = self.points.first() else {
             return Rect::ZERO;
         };
-        if self.tool == Tool::Text {
-            let (w, h) = text::measure(&self.text, self.font_size, self.font);
+        if matches!(self.tool, Tool::Text | Tool::Formula) {
+            let (w, h) = if self.tool == Tool::Formula {
+                let layout = math::formula_layout(&self.text, self.font_size, self.font);
+                (layout.width, layout.height)
+            } else {
+                text::measure(&self.text, self.font_size, self.font)
+            };
             return Rect::ltrb(
                 first.x,
                 first.y,
@@ -199,6 +243,10 @@ impl Shape {
     }
 
     pub fn to_json(&self) -> Value {
+        self.to_json_with_image_ref(None)
+    }
+
+    pub(crate) fn to_json_with_image_ref(&self, reference: Option<String>) -> Value {
         let mut m = Map::new();
         m.insert("id".into(), json!(self.id));
         m.insert("tool".into(), json!(self.tool.name()));
@@ -215,6 +263,27 @@ impl Shape {
         }
         if self.font != 0 {
             m.insert("font".into(), json!(text::FONTS[self.font as usize]));
+        }
+        if let Some(table) = &self.table {
+            m.insert("rows".into(), json!(table.rows()));
+            m.insert("columns".into(), json!(table.columns()));
+            m.insert("cells".into(), json!(table.cells()));
+        }
+        if let Some(parent) = &self.parent_id {
+            m.insert("parentId".into(), json!(parent));
+        }
+        if self.tool == Tool::Graph {
+            m.insert("graphRange".into(), json!({"x": self.graph_range.x(), "y": self.graph_range.y()}));
+        }
+        if let Some(image) = &self.image {
+            let (key, value) = match reference {
+                Some(reference) => ("imageRef", reference),
+                None => ("imageData", image.base64()),
+            };
+            m.insert(key.into(), Value::String(value));
+            if self.page_background {
+                m.insert("pageBackground".into(), Value::Bool(true));
+            }
         }
         Value::Object(m)
     }
@@ -255,6 +324,52 @@ impl Shape {
         let text = o.get("text").and_then(Value::as_str).unwrap_or("");
         let font = o.get("font").and_then(Value::as_str).map(text::font_index).unwrap_or(0);
         let mut shape = Shape::new(id, tool, points).styled(color, width, filled);
+        if matches!(tool, Tool::Table | Tool::MindNode) {
+            let bounds = shape.bounds();
+            if shape.points.len() != 2 || bounds.shortest_side() <= 0.0
+                || !bounds.longest_side().is_finite()
+            {
+                return Err("Tables and mind-map nodes need two opposite box corners.".into());
+            }
+        }
+        if tool == Tool::Table {
+            shape = shape.with_table(Table::from_json(o));
+        }
+        if tool == Tool::Image {
+            let bounds = shape.bounds();
+            if shape.points.len() != 2 || bounds.shortest_side() <= 0.0 || !bounds.longest_side().is_finite() {
+                return Err("Images need two opposite box corners.".into());
+            }
+            let data = o.get("imageData").and_then(Value::as_str).ok_or("Image data missing.")?;
+            let background = o.get("pageBackground").and_then(Value::as_bool).unwrap_or(false);
+            shape = shape.with_image(Arc::new(ImageAsset::from_base64(data)?), background);
+        }
+        if tool == Tool::MindNode {
+            shape.parent_id = o.get("parentId").and_then(Value::as_str)
+                .filter(|parent| !parent.is_empty() && *parent != id).map(str::to_string);
+        }
+        if tool == Tool::Formula {
+            if shape.points.len() != 1 {
+                return Err("Formulas need one origin point.".into());
+            }
+            math::validate_formula(text)?;
+        }
+        if tool == Tool::Graph {
+            let bounds = shape.bounds();
+            if shape.points.len() != 2 || bounds.shortest_side() <= 0.0 || !bounds.longest_side().is_finite() {
+                return Err("Graphs need two opposite box corners.".into());
+            }
+            math::validate_graph(text)?;
+            if let Some(range) = o.get("graphRange").filter(|value| !value.is_null()) {
+                let axis = |key: &str| -> Option<[f64; 2]> {
+                    let pair = range.get(key)?.as_array()?;
+                    let [low, high] = pair.as_slice() else { return None };
+                    Some([low.as_f64()?, high.as_f64()?])
+                };
+                shape.graph_range = axis("x").zip(axis("y")).and_then(|(x, y)| GraphRange::new(x, y))
+                    .ok_or("Graph range needs increasing, finite x and y ends.")?;
+            }
+        }
         shape.font = font;
         Ok(shape.with_text(text, font_size))
     }
@@ -271,7 +386,9 @@ impl Shape {
             return false;
         }
         match self.tool {
-            Tool::Text => bounds.inflate(tolerance).contains(point),
+            Tool::Text | Tool::Formula | Tool::Graph => bounds.inflate(tolerance).contains(point),
+            Tool::Image => !self.page_background && bounds.inflate(tolerance).contains(point),
+            Tool::Table | Tool::MindNode => reach.contains(point),
             Tool::Rectangle => {
                 if self.filled && bounds.contains(point) {
                     return true;

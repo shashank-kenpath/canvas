@@ -13,6 +13,7 @@ import com.google.mlkit.vision.digitalink.recognition.DigitalInkRecognitionModel
 import com.google.mlkit.vision.digitalink.recognition.DigitalInkRecognizer
 import com.google.mlkit.vision.digitalink.recognition.DigitalInkRecognizerOptions
 import com.google.mlkit.vision.digitalink.recognition.Ink
+import org.json.JSONArray
 
 /** Thin ML Kit bridge. Language/settings/replacement decisions belong to Rust. */
 class Handwriting(private val context: Context) {
@@ -78,7 +79,12 @@ class Handwriting(private val context: Context) {
         pending.addOnCompleteListener { result ->
             if (closed || !result.isSuccessful) { main.removeCallbacks(timeout); complete("") }
             else entry.client.recognize(built)
-                .addOnSuccessListener { recognized -> main.removeCallbacks(timeout); complete(recognized.candidates.firstOrNull()?.text ?: "") }
+                .addOnSuccessListener { recognized ->
+                    main.removeCallbacks(timeout)
+                    val candidates = JSONArray()
+                    recognized.candidates.take(5).forEach { candidates.put(it.text) }
+                    complete(candidates.toString())
+                }
                 .addOnFailureListener { error -> Log.w(TAG, "Handwriting could not be read", error); main.removeCallbacks(timeout); complete("") }
         }
     }

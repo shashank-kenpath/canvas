@@ -13,6 +13,9 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod share;
+pub(crate) use share::snapshot;
+
 pub const PORT: u16 = 18763;
 const MAX_BODY: usize = 8 << 20;
 
@@ -433,7 +436,7 @@ pub fn link(host: String, code: String, wake: Arc<dyn Fn() + Send + Sync>) -> Li
         let mut batches = 0u64;
         let mut revision = 0u64;
         let mut online: Option<bool> = None;
-        let t = Duration::from_secs(3);
+        let t = Duration::from_secs(8);
         while !flag.load(Ordering::SeqCst) {
             let pause = if host.starts_with("https://") { 900 } else { 500 };
             match ops_rx.recv_timeout(Duration::from_millis(pause)) {
@@ -450,28 +453,20 @@ pub fn link(host: String, code: String, wake: Arc<dyn Fn() + Send + Sync>) -> Li
             }
             let mut ok = true;
             if !queued.is_empty() {
-                let body = json!({ "operations": queued }).to_string();
-                match request("POST", &host, &format!("/canvas/ops?code={code}"), Some(body.as_bytes()), t) {
-                    Ok((200, _)) => {
-                        queued.clear();
-                        revision = 0;
-                    }
-                    _ => ok = false,
+                ok = share::send_ops(&host, &code, &mut queued, t).is_ok();
+                if ok {
+                    revision = 0;
                 }
             }
             if ok {
-                match request("GET", &host, &format!("/canvas/board?code={code}&since={revision}"), None, t) {
-                    Ok((200, body)) => {
-                        if let Ok(v) = serde_json::from_slice::<Value>(&body) {
-                            let rev = v.get("revision").and_then(Value::as_u64).unwrap_or(0);
-                            if let Some(shapes) = v.get("shapes").and_then(Value::as_array) {
-                                revision = rev;
-                                let _ = ev_tx.send(LinkEvent::Snapshot { revision: rev, shapes: shapes.clone(), batches });
-                                wake();
-                            }
-                        }
+                match share::fetch(&host, &code, revision, t) {
+                    Ok(Some((rev, shapes))) => {
+                        revision = rev;
+                        let _ = ev_tx.send(LinkEvent::Snapshot { revision: rev, shapes, batches });
+                        wake();
                     }
-                    _ => ok = false,
+                    Ok(None) => {}
+                    Err(_) => ok = false,
                 }
             }
             if online != Some(ok) {
@@ -644,14 +639,28 @@ fn shape_schema() -> Value {
         "type": "object",
         "properties": {
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
-            "tool": { "type": "string", "enum": ["pen", "rectangle", "ellipse", "arrow", "text", "line", "triangle", "diamond", "star", "hexagon"] },
+            "tool": { "type": "string", "enum": ["pen", "rectangle", "ellipse", "arrow", "text", "line", "triangle", "diamond", "star", "hexagon", "table", "mindnode", "formula", "graph", "image"] },
             "points": { "type": "array", "items": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }, "minItems": 1, "maxItems": 5000 },
             "color": { "type": "integer", "description": "ARGB 0xAARRGGBB" },
             "width": { "type": "number", "exclusiveMinimum": 0 },
             "filled": { "type": "boolean" },
             "text": { "type": "string", "maxLength": 5000 },
             "fontSize": { "type": "number", "exclusiveMinimum": 0 },
-            "font": { "type": "string", "enum": crate::text::FONTS.to_vec() }
+            "font": { "type": "string", "enum": crate::text::FONTS.to_vec() },
+            "rows": { "type": "integer", "minimum": 1, "maximum": crate::table::MAX_SIZE, "default": crate::table::DEFAULT_SIZE, "description": "Number of table rows" },
+            "columns": { "type": "integer", "minimum": 1, "maximum": crate::table::MAX_SIZE, "default": crate::table::DEFAULT_SIZE, "description": "Number of table columns" },
+            "cells": { "type": "array", "items": { "type": "string" }, "maxItems": crate::table::MAX_SIZE * crate::table::MAX_SIZE, "description": "Table cell text in row-major order. Omit or use empty strings for blank cells." },
+            "parentId": { "type": "string", "description": "ID of the parent mind-map node. Omit for a root node." },
+            "imageData": { "type": "string", "description": "Required for image shapes. Base64 PNG or JPEG bytes. Use two opposing box corners." },
+            "pageBackground": { "type": "boolean", "description": "For an image shape, lock it against touch selection and erasing." },
+            "graphRange": {
+                "type": "object", "description": "Optional graph axis ranges. Defaults to [-10, 10] on both axes.",
+                "properties": {
+                    "x": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                    "y": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 }
+                },
+                "required": ["x", "y"]
+            }
         },
         "required": ["id", "tool", "points"]
     })
@@ -668,11 +677,11 @@ fn tools() -> Value {
           "inputSchema": obj(json!({ "offset": { "type": "integer", "minimum": 0, "default": 0 }, "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 } }), json!([])), "annotations": ro },
         { "name": "get_board_image", "description": "See the whole board as a PNG picture.",
           "inputSchema": obj(json!({ "size": { "type": "integer", "minimum": 128, "maximum": 2048, "default": 1024 } }), json!([])), "annotations": ro },
-        { "name": "add_shapes", "description": "Add pen, rectangle, ellipse, arrow, text, line, triangle, diamond, star or hexagon shapes to the board. Use unique IDs. Only id, tool and points are required. Points are [x,y] pairs. Use start and end points for line and arrow, and two opposite box corners for rectangle, ellipse, triangle, diamond, star and hexagon. The optional color, width (stroke, default 3.0) and filled fields control styling. filled tints the interior of closed shapes. Text also accepts text, fontSize and font.",
+        { "name": "add_shapes", "description": "Add shapes to the board with unique IDs. Points are [x,y] pairs. Use start and end points for line and arrow, and two opposite corners for box shapes, tables, mind nodes, graphs and images. An image requires imageData containing base64-encoded PNG or JPEG bytes. A formula uses one origin point and its linear math source in text (e.g. x^2+1/2). A graph uses functions of x in text (e.g. y=x^2; y=sin(x)) and accepts graphRange. The optional color, width and filled fields control styling. Text, formulas and mind nodes accept fontSize and font. Tables default to 3 rows and 3 columns and accept rows, columns and cells in row-major order. A mindnode with a parentId connects to its parent. Supply the box position for every node.",
           "inputSchema": obj(json!({ "shapes": { "type": "array", "items": shape_schema(), "minItems": 1, "maxItems": 100 } }), json!(["shapes"])), "annotations": rw },
         { "name": "update_shape", "description": "Replace one existing shape using its current ID and complete shape fields. Read it with list_shapes first.",
           "inputSchema": obj(json!({ "shape": shape_schema() }), json!(["shape"])), "annotations": rw },
-        { "name": "delete_shapes", "description": "Delete specified shape IDs. This removes user work; get confirmation before calling.",
+        { "name": "delete_shapes", "description": "Delete specified shape IDs, including descendants of any deleted mind-map nodes. This removes user work. Get confirmation before calling.",
           "inputSchema": obj(json!({ "ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 100 } }), json!(["ids"])),
           "annotations": { "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false } }
     ])
@@ -868,5 +877,48 @@ mod tests {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(unbase64("aGVsbG8="), b"hello");
         assert_eq!(parse_query("code=12%2034&x=a+b")["code"], "12 34");
+    }
+
+    #[test]
+    fn mcp_add_shapes_accepts_formula_and_graph_sources() {
+        let data = json!({ "shapes": [
+            { "id": "equation", "tool": "formula", "points": [[5, 10]], "text": "sum_(i=1)^n i" },
+            { "id": "plot", "tool": "graph", "points": [[0, 100], [400, 380]],
+              "text": "y=x^2; y=sin(x)", "graphRange": { "x": [-3, 3], "y": [-2, 6] } }
+        ]});
+        let schema = shape_schema();
+        let names = schema["properties"]["tool"]["enum"].as_array().unwrap();
+        assert!(names.contains(&json!("formula")) && names.contains(&json!("graph")));
+        let mut board = Fake(Vec::new());
+        call_tool(&mut board, "add_shapes", &data).unwrap();
+        assert_eq!(board.0[0].tool, crate::Tool::Formula);
+        assert_eq!(board.0[1].graph_range.y(), [-2.0, 6.0]);
+        let document = json!({ "version": 1, "shapes": board.shapes() });
+        let restored = crate::Document::decode(&document.to_string()).unwrap();
+        assert_eq!(restored, board.0);
+    }
+
+    #[test]
+    fn mcp_and_share_ops_preserve_table_cells_and_mind_map_links() {
+        let data = json!({ "shapes": [
+            { "id": "table", "tool": "table", "points": [[0, 0], [400, 200]],
+                "rows": 2, "columns": 3, "cells": ["Monday", "", "", "", "", "Friday"] },
+            { "id": "root", "tool": "mindnode", "points": [[500, 0], [700, 80]], "text": "Plan" },
+            { "id": "child", "tool": "mindnode", "points": [[750, 0], [950, 80]],
+                "parentId": "root", "text": "Ideas" }
+        ]});
+        let schema = shape_schema();
+        let allowed = schema["properties"]["tool"]["enum"].as_array().unwrap();
+        assert!(allowed.contains(&json!("table")));
+        assert!(allowed.contains(&json!("mindnode")));
+        let mut board = Fake(Vec::new());
+        call_tool(&mut board, "add_shapes", &data).unwrap();
+
+        let snapshot = board.0.iter().map(|s| (s.id.clone(), s.to_json())).collect();
+        let (mut put, remove) = parse_ops(&diff(&HashMap::new(), &snapshot)).unwrap();
+        assert!(remove.is_empty());
+        put.sort_by(|a, b| a.id.cmp(&b.id));
+        board.0.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(put, board.0);
     }
 }

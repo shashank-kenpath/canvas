@@ -3,6 +3,7 @@
 //! `synced`). Keys this app does not understand are kept and written back.
 
 use crate::document::decode_shapes;
+use crate::import::storage;
 use crate::shape::Shape;
 use serde_json::{json, Map, Value};
 use std::fs;
@@ -39,12 +40,16 @@ fn board_path(dir: &Path, id: &str) -> Result<PathBuf, String> {
 }
 
 pub fn encode(id: &str, title: &str, updated: &str, shapes: &[Arc<Shape>], extra: &Map<String, Value>) -> String {
+    encode_board(id, title, updated, shapes.iter().map(|s| s.to_json()).collect(), extra)
+}
+
+pub(crate) fn encode_board(id: &str, title: &str, updated: &str, shapes: Vec<Value>, extra: &Map<String, Value>) -> String {
     let mut m = Map::new();
     m.insert("version".into(), json!(1));
     m.insert("id".into(), json!(id));
     m.insert("title".into(), json!(title));
     m.insert("updated".into(), json!(updated));
-    m.insert("shapes".into(), Value::Array(shapes.iter().map(|s| s.to_json()).collect()));
+    m.insert("shapes".into(), Value::Array(shapes));
     for (k, v) in extra {
         if !m.contains_key(k) {
             m.insert(k.clone(), v.clone());
@@ -53,8 +58,30 @@ pub fn encode(id: &str, title: &str, updated: &str, shapes: &[Arc<Shape>], extra
     Value::Object(m).to_string()
 }
 
+pub(crate) struct ImageRefs(PathBuf);
+
+impl ImageRefs {
+    pub(crate) fn new(dir: &Path, id: &str) -> Result<Self, String> {
+        Ok(Self(storage::dir(&board_path(dir, id)?)))
+    }
+
+    pub(crate) fn encode(&self, shapes: &[Arc<Shape>]) -> Result<Vec<Value>, String> {
+        shapes.iter().map(|shape| {
+            let reference = shape.image.as_deref().map(|image| storage::stage(&self.0, image)).transpose()?;
+            Ok(shape.to_json_with_image_ref(reference))
+        }).collect()
+    }
+}
+
 pub fn parse(source: &str) -> Result<BoardFile, String> {
-    let v: Value = serde_json::from_str(source).map_err(|e| format!("Not a board file: {e}"))?;
+    parse_value(decode(source)?)
+}
+
+fn decode(source: &str) -> Result<Value, String> {
+    serde_json::from_str(source).map_err(|e| format!("Not a board file: {e}"))
+}
+
+fn parse_value(v: Value) -> Result<BoardFile, String> {
     let shapes = decode_shapes(&v)?;
     let Value::Object(mut m) = v else {
         return Err("Not a board file.".into());
@@ -70,14 +97,30 @@ pub fn parse(source: &str) -> Result<BoardFile, String> {
 }
 
 pub fn load(dir: &Path, id: &str) -> Result<BoardFile, String> {
-    let source = fs::read_to_string(board_path(dir, id)?).map_err(|e| e.to_string())?;
-    parse(&source)
+    load_pages(dir, id, true)
+}
+
+pub(crate) fn load_pages(dir: &Path, id: &str, all_pages: bool) -> Result<BoardFile, String> {
+    let path = board_path(dir, id)?;
+    let source = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let mut board = decode(&source)?;
+    storage::hydrate(&mut board, &path, all_pages)?;
+    parse_value(board)
 }
 
 /// Writes the whole file under a temporary name, flushes it to disk and then
 /// renames it into place, so a crash or power cut never leaves half a board.
 pub fn save_atomic(dir: &Path, id: &str, contents: &str) -> Result<(), String> {
     let target = board_path(dir, id)?;
+    let externalized;
+    let contents = if contents.contains("\"imageData\"") {
+        let mut board = decode(contents)?;
+        storage::externalize(&mut board, &target)?;
+        externalized = board.to_string();
+        &externalized
+    } else {
+        contents
+    };
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let temp = dir.join(format!("{id}.tmp"));
     let write = || -> std::io::Result<()> {
@@ -94,11 +137,14 @@ pub fn save_atomic(dir: &Path, id: &str, contents: &str) -> Result<(), String> {
 }
 
 pub fn delete(dir: &Path, id: &str) -> Result<(), String> {
-    match fs::remove_file(board_path(dir, id)?) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
+    let path = board_path(dir, id)?;
+    if let Err(error) = fs::remove_file(&path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(error.to_string());
+        }
     }
+    let _ = fs::remove_dir_all(storage::dir(&path));
+    Ok(())
 }
 
 /// Changes only the title and timestamp, leaving every other byte of meaning

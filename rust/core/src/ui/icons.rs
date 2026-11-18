@@ -58,9 +58,10 @@ pub enum Ico {
     Pdf,
     Palette,
     Dock,
+    Graph,
 }
 
-pub const ALL: [Ico; 53] = [
+pub const ALL: [Ico; 54] = [
     Ico::Back,
     Ico::More,
     Ico::Kebab,
@@ -114,10 +115,11 @@ pub const ALL: [Ico; 53] = [
     Ico::Pdf,
     Ico::Palette,
     Ico::Dock,
+    Ico::Graph,
 ];
 
 impl Ico {
-    pub const ALL: [Ico; 53] = ALL;
+    pub const ALL: [Ico; 54] = ALL;
 }
 
 fn outline(path: &mut PathBuilder, pts: &[(f32, f32)]) {
@@ -488,6 +490,10 @@ pub(super) fn paths(ico: Ico) -> (Option<Path>, Option<Path>) {
             );
             push_polyline(&mut stroke, &[(14.0, 11.0), (20.0, 17.0)]);
             push_polyline(&mut stroke, &[(20.0, 11.0), (14.0, 17.0)]);
+        }
+        Graph => {
+            push_polyline(&mut stroke, &[(4.0, 4.0), (4.0, 20.0), (20.0, 20.0)]);
+            push_polyline(&mut stroke, &[(7.0, 14.0), (10.0, 10.0), (13.0, 13.0), (19.0, 6.0)]);
         }
         Image => {
             rounded_rect(&mut stroke, 3.0, 4.0, 18.0, 16.0, 2.0);

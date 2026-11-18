@@ -1,7 +1,8 @@
 //! Android owns the window and system APIs; the complete UI runs in Rust.
 use super::{log, now_ms, present, string, Window};
+use canvas_core::import::{FileKind, PickerFile};
 use canvas_core::ui::app::{App, Phase, Platform, Sample};
-use jni::objects::{GlobalRef, JClass, JFloatArray, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JByteArray, JClass, JFloatArray, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 use std::path::PathBuf;
@@ -131,6 +132,10 @@ impl Platform for AndroidUi {
         self.call("pickBoards", "()V", &[]);
     }
 
+    fn pick_file(&mut self, token: i32, kind: FileKind) {
+        self.call("pickFile", "(II)V", &[JValue::Int(token), JValue::Int(kind.picker_id())]);
+    }
+
     fn exit(&mut self) {
         self.call("finishApp", "()V", &[]);
     }
@@ -146,6 +151,7 @@ enum Event {
     Update(Option<(String, String)>, bool, bool),
     Toast(String),
     Import(Vec<String>),
+    File(i32, PickerFile),
     Pause(SyncSender<()>),
     Wake,
     Quit,
@@ -216,6 +222,7 @@ fn drive(mut app: App, rx: Receiver<Event>) {
                 }
                 Event::Toast(text) => app.toast(&text),
                 Event::Import(files) => app.import_boards(files),
+                Event::File(token, file) => app.file_result(token, file),
                 Event::Pause(ack) => app.pause(ack),
                 Event::Wake => {}
                 Event::Quit => quit = true,
@@ -343,7 +350,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_RustApp_touch(
     data: JFloatArray,
     count: jint,
 ) {
-    let n = (count.max(0) as usize * 6).min(env.get_array_length(&data).unwrap_or(0) as usize);
+    let n = (count.max(0) as usize * 7).min(env.get_array_length(&data).unwrap_or(0) as usize);
     let mut data_copy = vec![0.0; n];
     if env
         .get_float_array_region(&data, 0, &mut data_copy)
@@ -352,7 +359,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_RustApp_touch(
         return;
     }
     let samples = data_copy
-        .chunks_exact(6)
+        .chunks_exact(7)
         .filter(|s| s.iter().all(|v| v.is_finite()))
         .map(|s| Sample {
             id: s[0] as i32,
@@ -362,6 +369,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_RustApp_touch(
             size: s[4].max(0.0),
             stylus: s[5] != 0.0,
             eraser: s[5] > 1.5,
+            norm: s[6],
         })
         .collect();
     let phase = match action {
@@ -450,6 +458,57 @@ pub extern "system" fn Java_com_canvasstudio_rust_RustApp_importBoards(
     let files: Vec<String> = serde_json::from_str(&files).unwrap_or_default();
     send(h, Event::Import(files));
 }
+
+#[no_mangle]
+pub extern "system" fn Java_com_canvasstudio_rust_RustApp_fileResult(
+    mut env: JNIEnv,
+    _: JClass,
+    handle: jlong,
+    token: jint,
+    name: JString,
+    mime: JString,
+    data: JObjectArray,
+    error: JString,
+) {
+    let file = if !error.is_null() {
+        PickerFile::Error(string(&mut env, &error))
+    } else if data.is_null() {
+        PickerFile::Cancelled
+    } else {
+        let name = string(&mut env, &name);
+        let mime = string(&mut env, &mime);
+        let pdf = mime == "application/pdf";
+        let mut read = || -> jni::errors::Result<Option<Vec<Vec<u8>>>> {
+            let count = env.get_array_length(&data)?;
+            if !(1..=if pdf { 80 } else { 1 }).contains(&count) {
+                return Ok(None);
+            }
+            let mut files = Vec::with_capacity(count as usize);
+            let mut size_left = 32 << 20;
+            for index in 0..count {
+                let bytes = JByteArray::from(env.get_object_array_element(&data, index)?);
+                let size = env.get_array_length(&bytes)?;
+                if size == 0 || size > size_left {
+                    return Ok(None);
+                }
+                size_left -= size;
+                files.push(env.convert_byte_array(&bytes)?);
+                env.delete_local_ref(bytes)?;
+            }
+            Ok(Some(files))
+        };
+        match read() {
+            Ok(Some(files)) if pdf => PickerFile::Pdf(files),
+            Ok(Some(mut files)) => PickerFile::File { name, mime, bytes: files.remove(0) },
+            _ => {
+                let _ = env.exception_clear();
+                PickerFile::Error("Could not read the selected file".into())
+            }
+        }
+    };
+    send(handle, Event::File(token, file));
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_canvasstudio_rust_RustApp_pause(_: JNIEnv, _: JClass, h: jlong) {
     let (tx, rx) = mpsc::sync_channel(1);

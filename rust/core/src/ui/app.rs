@@ -7,9 +7,11 @@ use super::net;
 use super::paint::{self, Painter, Rf};
 use crate::editor::{Contact, Editor, PenMode, EV_DOC, EV_HAPTIC, EV_INK, EV_TEXT, EV_VIEW};
 use crate::geom::{IRect, Pt};
+use crate::import::{FileKind, Imported};
 use crate::render::{self, Layer};
 use crate::shape::{Shape, Tool};
 use crate::store::{self, BoardFile, BoardMeta};
+use crate::table::{self, Cell};
 use crate::text;
 use serde_json::{json, Map, Value};
 use std::cell::RefCell;
@@ -18,6 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use tiny_skia::PixmapMut;
+
+mod board_objects;
+mod math_ui;
+mod media;
+use media::PendingFile;
 
 // ------------------------------------------------------------------ colours
 
@@ -58,6 +65,15 @@ const SHAPES: [(Tool, Ico, &str); 9] = [
     (Tool::Hexagon, Ico::Hexagon, "Hexagon"),
     (Tool::Pen, Ico::Smart, "Smart shapes"),
 ];
+const INSERT: &[(Ico, &str, InsertKind)] = &[
+    (Ico::Image, "Image", InsertKind::File(FileKind::Image)),
+    (Ico::Pdf, "PDF", InsertKind::File(FileKind::Pdf)),
+    (Ico::Page, "Document", InsertKind::File(FileKind::Document)),
+    (Ico::Table, "Table", InsertKind::Table),
+    (Ico::MindMap, "Mind map", InsertKind::MindMap),
+    (Ico::Formula, "Formula", InsertKind::Formula),
+    (Ico::Graph, "Graph", InsertKind::Graph),
+];
 const RELAY: &str = "https://inkboard.taila6db10.ts.net";
 const LANGS: [(&str, &str); 1] = [("en", "English")];
 
@@ -90,6 +106,8 @@ pub trait Platform: Send {
     /// Lets the user choose board files to bring in. The host answers with
     /// [`App::import_boards`].
     fn pick_boards(&mut self) {}
+    /// Opens the system picker and reports its result through `App::file_result`.
+    fn pick_file(&mut self, _token: i32, _kind: FileKind) {}
     fn exit(&mut self) {}
 }
 
@@ -105,6 +123,9 @@ pub struct Sample {
     pub stylus: bool,
     /// The eraser end of a stylus.
     pub eraser: bool,
+    /// Android's normalised contact size (`MotionEvent.getSize`), sent only
+    /// for IR panels whose sizes are known to mean something; else 0.
+    pub norm: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +164,7 @@ enum Job {
         updated: String,
         shapes: Vec<Arc<Shape>>,
         extra: Map<String, Value>,
+        pages: Vec<Page>,
         seq: u64,
         ack: Option<SyncSender<()>>,
     },
@@ -183,6 +205,7 @@ enum Done {
         ok: bool,
     },
     Created(String, bool),
+    File(i32, Result<Imported, String>),
 }
 
 fn disk_worker(
@@ -194,7 +217,7 @@ fn disk_worker(
     while let Ok(job) = jobs.recv() {
         let out = match job {
             Job::List => Done::Listed(store::list(&dir)),
-            Job::Thumb { id, updated, w, h } => match store::load(&dir, &id) {
+            Job::Thumb { id, updated, w, h } => match store::load_pages(&dir, &id, false) {
                 Ok(board) => {
                     let shapes: Vec<Arc<Shape>> = board.shapes.into_iter().map(Arc::new).collect();
                     Done::Thumb {
@@ -216,12 +239,21 @@ fn disk_worker(
                 title,
                 updated,
                 shapes,
-                extra,
+                mut extra,
+                pages,
                 seq,
                 ack,
             } => {
-                let contents = store::encode(&id, &title, &updated, &shapes, &extra);
-                let ok = store::save_atomic(&dir, &id, &contents).is_ok();
+                let mut save = || -> Result<(), String> {
+                    let images = store::ImageRefs::new(&dir, &id)?;
+                    if !pages.is_empty() {
+                        let pages = pages.iter().map(|page| page.encode(&images)).collect::<Result<_, _>>()?;
+                        extra.insert("pages".into(), Value::Array(pages));
+                    }
+                    let contents = store::encode_board(&id, &title, &updated, images.encode(&shapes)?, &extra);
+                    store::save_atomic(&dir, &id, &contents)
+                };
+                let ok = save().is_ok();
                 if let Some(ack) = ack {
                     let _ = ack.send(());
                 }
@@ -449,6 +481,15 @@ struct InkStyle {
     width: f64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InsertKind {
+    File(FileKind),
+    Table,
+    MindMap,
+    Formula,
+    Graph,
+}
+
 /// What a control does.
 #[derive(Clone, PartialEq, Debug)]
 enum Act {
@@ -478,6 +519,15 @@ enum Act {
     Highlighter,
     Shapes,
     Shape(usize),
+    Insert,
+    InsertItem(InsertKind),
+    ImportPdf(bool),
+    TableDimensions(isize, isize),
+    AddTopic { sibling: bool },
+    EditMath,
+    Plot,
+    GraphRange,
+    GraphAdjust { pan: Pt, scale: Option<f64> },
     PagePrev,
     PageNext,
     PageAdd,
@@ -516,6 +566,7 @@ enum ButtonKind {
     AccentTint,
     Danger,
     DangerTint,
+    Disabled,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -672,7 +723,7 @@ struct BoardChrome {
     zoom: Rf,
     dock: Rf,
     dock_scale: f32,
-    buttons: [Rf; 8],
+    buttons: [Rf; 9],
     dividers: [Rf; 2],
     pages: Rf,
     selection: Rf,
@@ -843,6 +894,8 @@ enum AskFor {
     Rename(String),
     Join,
     Text { id: String, x: f64, y: f64 },
+    Cell { id: String, cell: Cell },
+    Math { id: String, tool: Tool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -867,6 +920,9 @@ enum Overlay {
     },
     Style,
     Shapes,
+    Insert { pdf: bool },
+    TableSize { rows: usize, columns: usize },
+    GraphRange,
     Ask {
         title: String,
         text: String,
@@ -893,7 +949,7 @@ enum PageChange {
     Delete,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Page {
     shapes: Vec<Arc<Shape>>,
     view: Option<(Pt, f64)>,
@@ -928,10 +984,10 @@ impl Page {
         (point.is_finite() && zoom.is_finite()).then_some((point, zoom))
     }
 
-    fn encode(&self) -> Value {
+    fn encode(&self, images: &store::ImageRefs) -> Result<Value, String> {
         let (camera, zoom) = self.view.unwrap_or((Pt::ZERO, 1.0));
-        let shapes: Vec<_> = self.shapes.iter().map(|shape| shape.to_json()).collect();
-        json!({ "shapes": shapes, "camera": [camera.x, camera.y], "zoom": zoom })
+        let shapes = images.encode(&self.shapes)?;
+        Ok(json!({ "shapes": shapes, "camera": [camera.x, camera.y], "zoom": zoom }))
     }
 }
 
@@ -1000,6 +1056,7 @@ pub struct App {
 
     jobs: Sender<Job>,
     done: Receiver<Done>,
+    file_done: Sender<Done>,
 
     w: u32,
     h: u32,
@@ -1027,6 +1084,8 @@ pub struct App {
     close_after_save: bool,
     pages: Vec<Page>,
     page: usize,
+    file_token: i32,
+    pending_file: Option<PendingFile>,
     pen_style: InkStyle,
     hl_style: InkStyle,
     highlighter: bool,
@@ -1144,6 +1203,7 @@ impl App {
         let _ = std::fs::create_dir_all(&dir);
         let (jobs, job_rx) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
+        let file_done = done_tx.clone();
         let worker_dir = dir.clone();
         let disk_wake = wake.clone();
         let _ = std::thread::Builder::new()
@@ -1175,6 +1235,7 @@ impl App {
             settings,
             jobs,
             done,
+            file_done,
             w: 0,
             h: 0,
             d: 1.0,
@@ -1199,6 +1260,8 @@ impl App {
             close_after_save: false,
             pages: Vec::new(),
             page: 0,
+            file_token: 0,
+            pending_file: None,
             pen_style: InkStyle {
                 color: PALETTE[0],
                 width: PEN_WIDTHS[1],
@@ -1541,6 +1604,7 @@ impl App {
     fn take_disk(&mut self) {
         while let Ok(done) = self.done.try_recv() {
             match done {
+                Done::File(token, result) => self.apply_file(token, result),
                 Done::Listed(list) => {
                     self.boards = list;
                     self.listed = true;
@@ -1692,12 +1756,6 @@ impl App {
                 json!({ "camera": [camera.x, camera.y], "zoom": zoom }),
             );
         }
-        if self.pages.len() > 1 {
-            extra.insert(
-                "pages".into(),
-                Value::Array(self.pages[1..].iter().map(Page::encode).collect()),
-            );
-        }
         self.save_seq += 1;
         self.unsaved = false;
         self.save_state = SaveState::Saving;
@@ -1707,6 +1765,7 @@ impl App {
             updated: self.timestamp(),
             shapes: self.pages[0].shapes.clone(),
             extra,
+            pages: self.pages[1..].to_vec(),
             seq: self.save_seq,
             ack,
         };
@@ -1750,6 +1809,7 @@ impl App {
             PageChange::Delete if len > 1 => self.page.min(len - 2),
             _ => return,
         };
+        self.pending_file = None;
         self.ed.finish_input(self.now);
         self.take_editor_events();
         self.captures.clear();
@@ -1799,6 +1859,7 @@ impl App {
         if self.close_after_save {
             return;
         }
+        self.pending_file = None;
         self.ed.finish_input(self.now);
         self.take_editor_events();
         if self.unsaved
@@ -1888,22 +1949,21 @@ impl App {
         if events & EV_TEXT != 0 {
             if let Some(request) = self.ed.take_text_request() {
                 if self.board.is_some() && self.overlay.is_none() && !self.close_after_save {
-                    let title = if request.id.is_empty() {
-                        "Add text"
+                    let math_tool = self.ed.doc.get(&request.id).map(|s| s.tool)
+                        .filter(|tool| matches!(tool, Tool::Formula | Tool::Graph));
+                    if let Some(tool) = math_tool {
+                        self.ask_math(tool, request.id, &request.text);
+                    } else if let Some(cell) = request.cell {
+                        self.ask("Edit cell", &request.text, "Type here", true, AskFor::Cell { id: request.id, cell });
                     } else {
-                        "Edit text"
-                    };
-                    self.ask(
-                        title,
-                        &request.text,
-                        "Type here",
-                        true,
-                        AskFor::Text {
+                        let title = if request.id.is_empty() { "Add text" } else { "Edit text" };
+                        let purpose = AskFor::Text {
                             id: request.id,
                             x: request.x,
                             y: request.y,
-                        },
-                    );
+                        };
+                        self.ask(title, &request.text, "Type here", true, purpose);
+                    }
                 }
             }
         }
@@ -1927,7 +1987,12 @@ impl App {
     /// The text handwriting `token` reads as; empty leaves the ink alone.
     pub fn ink_result(&mut self, token: u32, text: &str) {
         if let Some(ids) = self.ink.remove(&token) {
-            self.ed.commit_ink(&ids, text);
+            if let Ok(candidates) = serde_json::from_str::<Vec<String>>(text) {
+                let candidates: Vec<_> = candidates.iter().take(5).map(String::as_str).collect();
+                self.ed.commit_ink_candidates(&ids, &candidates);
+            } else {
+                self.ed.commit_ink(&ids, text);
+            }
         }
     }
 
@@ -2002,7 +2067,7 @@ impl App {
         };
         let mut nodes = self.nodes.iter().rev().filter(hit);
         let top = nodes.next()?.act.as_ref()?;
-        if *top == Act::Outside && matches!(self.overlay, Some(Overlay::Style | Overlay::Shapes)) {
+        if *top == Act::Outside && matches!(self.overlay, Some(Overlay::Style | Overlay::Shapes | Overlay::Insert { .. } | Overlay::GraphRange)) {
             let dock = scale_rect(self.board_chrome().dock, self.unit());
             if dock.contains(x, y) {
                 return nodes
@@ -2024,6 +2089,7 @@ impl App {
             Act::Tool(Tool::Text, _) => Some("Text"),
             Act::Highlighter => Some("Highlighter"),
             Act::Shapes => Some("Shapes"),
+            Act::Insert => Some("Insert"),
             Act::Shape(i) => Some(SHAPES[*i].2),
             Act::Style => Some("Colour and thickness"),
             Act::PageMenu => Some("Pages"),
@@ -2076,6 +2142,7 @@ impl App {
             size: s.size.max(0.0) as f64,
             stylus: s.stylus,
             eraser: s.eraser,
+            norm: s.norm.max(0.0) as f64,
         }
     }
 
@@ -2204,7 +2271,7 @@ impl App {
                 if !cancelled
                     && matches!(
                         self.overlay,
-                        Some(Overlay::Menu { .. } | Overlay::Style | Overlay::Shapes)
+                        Some(Overlay::Menu { .. } | Overlay::Style | Overlay::Shapes | Overlay::Insert { .. } | Overlay::GraphRange)
                     )
                     && matches!(self.hit(s.x, s.y), Some(Act::Outside) | None)
                 {
@@ -2464,6 +2531,16 @@ impl App {
             Act::Redo => self.ed.redo(),
             Act::Delete => self.ed.delete_selection(),
             Act::Convert => self.ed.convert_selection(),
+            Act::EditMath => self.edit_math(),
+            Act::Plot => self.ed.plot_selected_formula(),
+            Act::GraphRange => {
+                if matches!(self.overlay, Some(Overlay::GraphRange)) {
+                    self.dismiss();
+                } else {
+                    self.show_overlay(Overlay::GraphRange);
+                }
+            }
+            Act::GraphAdjust { pan, scale } => self.ed.change_graph_range(pan, scale),
             Act::Bigger => self.ed.scale_text(1.25),
             Act::Smaller => self.ed.scale_text(0.8),
             Act::Style => {
@@ -2547,6 +2624,38 @@ impl App {
                 self.dismiss();
                 self.choose_tool(tool, PenMode::Shape, false);
             }
+            Act::Insert => {
+                if matches!(self.overlay, Some(Overlay::Insert { .. })) {
+                    self.dismiss();
+                } else {
+                    self.show_overlay(Overlay::Insert { pdf: false });
+                }
+            }
+            Act::InsertItem(kind) => match kind {
+                InsertKind::File(FileKind::Pdf) if !self.joined() => self.show_overlay(Overlay::Insert { pdf: true }),
+                InsertKind::File(kind) => self.pick_file(kind, true),
+                InsertKind::Table => self.show_overlay(Overlay::TableSize {
+                    rows: table::DEFAULT_SIZE,
+                    columns: table::DEFAULT_SIZE,
+                }),
+                InsertKind::MindMap => {
+                    self.dismiss();
+                    self.choose_tool(Tool::Select, PenMode::Ink, false);
+                    self.ed.insert_mind_map();
+                }
+                InsertKind::Formula => self.ask_math(Tool::Formula, String::new(), ""),
+                InsertKind::Graph => self.ask_math(Tool::Graph, String::new(), ""),
+            },
+            Act::ImportPdf(current_page) => self.pick_file(FileKind::Pdf, current_page),
+            Act::TableDimensions(d_rows, d_columns) => {
+                if let Some(Overlay::TableSize { rows, columns }) = &mut self.overlay {
+                    *rows = rows.saturating_add_signed(d_rows).clamp(1, table::MAX_SIZE);
+                    *columns = columns.saturating_add_signed(d_columns).clamp(1, table::MAX_SIZE);
+                } else {
+                    self.ed.resize_table_grid(d_rows, d_columns);
+                }
+            }
+            Act::AddTopic { sibling } => self.ed.add_mind_topic(sibling),
             Act::PagePrev => self.change_page(PageChange::Open(self.page.saturating_sub(1))),
             Act::PageNext => self.change_page(PageChange::Open(self.page + 1)),
             Act::PageAdd => self.change_page(PageChange::Add),
@@ -2714,6 +2823,21 @@ impl App {
         };
         self.focus = None;
         match overlay {
+            Overlay::Ask { purpose: AskFor::Math { ref id, tool }, ref text, .. } => {
+                match self.ed.commit_math(id, tool, text) {
+                    Ok(()) => {
+                        if id.is_empty() {
+                            self.choose_tool(Tool::Select, PenMode::Ink, false);
+                        }
+                        self.platform.hide_keyboard();
+                        self.take_editor_events();
+                    }
+                    Err(error) => {
+                        self.overlay = Some(overlay);
+                        self.show_toast(error);
+                    }
+                }
+            }
             Overlay::Ask { text, purpose, .. } => {
                 self.platform.hide_keyboard();
                 let name = text.trim();
@@ -2752,6 +2876,11 @@ impl App {
                         self.ed.commit_text(&id, x, y, name);
                         self.take_editor_events();
                     }
+                    AskFor::Cell { id, cell } => {
+                        self.ed.commit_cell_text(&id, cell, &text);
+                        self.take_editor_events();
+                    }
+                    AskFor::Math { .. } => unreachable!("handled above"),
                     AskFor::Join => {
                         let input = name.to_string();
                         let relay = self.settings.relay_url.clone();
@@ -2778,7 +2907,12 @@ impl App {
                     self.platform.install_update(&url);
                 }
             },
-            Overlay::Menu { .. } | Overlay::Panel { .. } | Overlay::Style | Overlay::Shapes => {}
+            Overlay::TableSize { rows, columns } => {
+                self.choose_tool(Tool::Select, PenMode::Ink, false);
+                self.ed.insert_table(rows, columns);
+                self.take_editor_events();
+            }
+            Overlay::Menu { .. } | Overlay::Panel { .. } | Overlay::Style | Overlay::Shapes | Overlay::Insert { .. } | Overlay::GraphRange => {}
         }
     }
 
@@ -3153,6 +3287,30 @@ impl App {
         );
     }
 
+    fn object_actions(&self) -> Vec<(&'static str, f32, Act, bool)> {
+        let [id] = self.ed.doc.selected_ids() else { return Vec::new() };
+        let Some(shape) = self.ed.doc.get(id) else { return Vec::new() };
+        if let Some(table) = shape.table.as_deref() {
+            vec![
+                ("Add row", 126.0, Act::TableDimensions(1, 0), table.rows() < table::MAX_SIZE),
+                ("Remove row", 170.0, Act::TableDimensions(-1, 0), table.rows() > 1),
+                ("Add column", 164.0, Act::TableDimensions(0, 1), table.columns() < table::MAX_SIZE),
+                ("Remove column", 210.0, Act::TableDimensions(0, -1), table.columns() > 1),
+            ]
+        } else if shape.tool == Tool::MindNode {
+            let has_parent = shape.parent_id.as_deref().and_then(|parent| self.ed.doc.get(parent))
+                .is_some_and(|parent| parent.tool == Tool::MindNode);
+            vec![
+                ("Add child", 142.0, Act::AddTopic { sibling: false }, true),
+                ("Add sibling", 164.0, Act::AddTopic { sibling: true }, has_parent),
+            ]
+        } else if matches!(shape.tool, Tool::Formula | Tool::Graph) {
+            Self::math_actions(shape)
+        } else {
+            Vec::new()
+        }
+    }
+
     fn board_chrome(&self) -> BoardChrome {
         let (w, h) = self.extent();
         let dock_side = self.settings.dock;
@@ -3185,8 +3343,8 @@ impl App {
         } else {
             w - 2.0 * margin
         };
-        let k = (available / 676.0).min(compact).max(0.0);
-        let long = 676.0 * k;
+        let k = (available / 754.0).min(compact).max(0.0);
+        let long = 754.0 * k;
         let short = 96.0 * k;
         let dock = match dock_side {
             Dock::Left => Rf::new(margin, top + (available - long) / 2.0, short, long),
@@ -3229,9 +3387,9 @@ impl App {
                 )
             }
         };
-        let offsets = [12.0, 90.0, 184.0, 262.0, 340.0, 418.0, 496.0, 592.0];
+        let offsets = [12.0, 90.0, 184.0, 262.0, 340.0, 418.0, 496.0, 670.0, 574.0];
         let buttons = offsets.map(|offset| point(offset, 12.0, 72.0, 72.0));
-        let dividers = [point(172.0, 20.0, 2.0, 56.0), point(580.0, 20.0, 2.0, 56.0)];
+        let dividers = [point(172.0, 20.0, 2.0, 56.0), point(658.0, 20.0, 2.0, 56.0)];
 
         let centered =
             |width: f32, y: f32| Rf::new((w - width * compact) / 2.0, y, width * compact, bar_h);
@@ -3256,8 +3414,10 @@ impl App {
         let text = self.ed.selected_text_count() > 0;
         let inks = self.ed.selected_ink_count() > 0;
         let count = 2 + if text { 3 } else { 0 } + if inks { 1 } else { 0 };
-        let selection_scale = compact.min((w - 2.0 * margin) / (16.0 + 78.0 * count as f32));
-        let sw = (16.0 + 78.0 * count as f32) * selection_scale;
+        let actions_width: f32 = self.object_actions().iter().map(|(_, width, _, _)| width + 6.0).sum();
+        let selection_width = 16.0 + 78.0 * count as f32 + actions_width;
+        let selection_scale = compact.min((w - 2.0 * margin) / selection_width);
+        let sw = selection_width * selection_scale;
         let mut selection = Rf::new((w - sw) / 2.0, margin, sw, 88.0 * selection_scale);
         for top_control in [
             left,
@@ -3489,6 +3649,14 @@ impl App {
         for (r, (icon, active, act)) in c.buttons.iter().zip(tools) {
             ui.scaled_icon(*r, icon, c.dock_scale, active, true, act);
         }
+        ui.scaled_icon(
+            c.buttons[8],
+            Ico::Plus,
+            c.dock_scale,
+            matches!(self.overlay, Some(Overlay::Insert { .. })),
+            true,
+            Act::Insert,
+        );
         for r in c.dividers {
             ui.push(r, Look::Rule, None);
         }
@@ -3559,6 +3727,21 @@ impl App {
                 f,
             );
             x += 78.0;
+            for (label, width, act, enabled) in self.object_actions() {
+                ui.scaled(
+                    relative(r, x, 8.0, width, 72.0, f),
+                    Look::Button {
+                        icon: None,
+                        text: label.into(),
+                        kind: if enabled { ButtonKind::Secondary } else { ButtonKind::Disabled },
+                        pill: false,
+                        level: 0,
+                    },
+                    enabled.then_some(act),
+                    f,
+                );
+                x += width + 6.0;
+            }
             let mut items = Vec::with_capacity(5);
             if self.ed.selected_ink_count() > 0 {
                 items.push((Ico::Convert, Act::Convert));
@@ -3780,6 +3963,10 @@ impl App {
         let fade = self.fade_in(self.overlay_start);
         ui.opacity = (255.0 * fade).round() as u8;
         match overlay {
+            Overlay::TableSize { rows, columns } => {
+                ui.push(screen, Look::Scrim(SCRIM), Some(Act::Nothing));
+                self.layout_table_size(ui, *rows, *columns);
+            }
             Overlay::Style | Overlay::Shapes => {
                 ui.push(screen, Look::Scrim(0), Some(Act::Outside));
                 ui.offset_y = 8.0 * (1.0 - fade);
@@ -3789,6 +3976,19 @@ impl App {
                     } else {
                         self.layout_shapes(ui, chrome);
                     }
+                }
+            }
+            Overlay::Insert { pdf } => {
+                ui.push(screen, Look::Scrim(0), Some(Act::Outside));
+                ui.offset_y = 8.0 * (1.0 - fade);
+                if let Some(chrome) = chrome {
+                    self.layout_insert(ui, chrome, *pdf);
+                }
+            }
+            Overlay::GraphRange => {
+                ui.push(screen, Look::Scrim(0), Some(Act::Outside));
+                if let Some(chrome) = chrome {
+                    self.layout_graph_range(ui, chrome.selection);
                 }
             }
             Overlay::Menu { kind, anchor } => {
@@ -3840,7 +4040,7 @@ impl App {
                     AskFor::NewBoard => "Create",
                     AskFor::Rename(_) => "Save",
                     AskFor::Join => "Join",
-                    AskFor::Text { .. } => "Done",
+                    AskFor::Text { .. } | AskFor::Cell { .. } | AskFor::Math { .. } => "Done",
                 };
                 self.dialog_buttons(ui, r, inset, "Cancel", ok, ButtonKind::Primary);
             }
@@ -4494,6 +4694,15 @@ impl App {
             }
             "board" => {
                 let since = req.query.get("since").and_then(|s| s.parse::<u64>().ok());
+                if let Some(offset) = req.query.get("offset").and_then(|s| s.parse::<usize>().ok()) {
+                    if offset == 0 && since == Some(self.doc_gen) {
+                        return net::Resp::json(200, &json!({ "revision": self.doc_gen }));
+                    }
+                    if offset > 0 && since != Some(self.doc_gen) {
+                        return net::Resp::empty(409);
+                    }
+                    return net::snapshot(self.ed.doc.shapes(), self.doc_gen, offset);
+                }
                 let mut v = json!({ "revision": self.doc_gen });
                 if since != Some(self.doc_gen) {
                     v["shapes"] =
@@ -4898,6 +5107,7 @@ impl App {
                     ButtonKind::AccentTint => (ACCENT_TINT, ACCENT, 0xffd4ddff),
                     ButtonKind::Danger => (DANGER, SURFACE, 0xffa71e1e),
                     ButtonKind::DangerTint => (DANGER_TINT, DANGER, 0xfff8d8d8),
+                    ButtonKind::Disabled => (SURFACE2, DISABLED, SURFACE2),
                 };
                 draw_surface(
                     p,
@@ -5475,7 +5685,11 @@ impl net::Board for App {
 
     fn apply(&mut self, put: Vec<Shape>, remove: Vec<String>) -> u64 {
         if self.board.is_some() && (!put.is_empty() || !remove.is_empty()) {
-            self.ed.apply_remote(put, remove);
+            if put.is_empty() {
+                self.ed.delete_shapes(remove);
+            } else {
+                self.ed.apply_remote(put, remove);
+            }
             self.take_editor_events();
         }
         self.doc_gen
@@ -5529,6 +5743,7 @@ mod tests {
             size: 0.0,
             stylus: false,
             eraser: false,
+            norm: 0.0,
         };
         app.touch(Phase::Down, &[s]);
         app.touch(Phase::Up, &[s]);
@@ -5814,6 +6029,7 @@ mod tests {
             size: 0.0,
             stylus: true,
             eraser: false,
+            norm: 0.0,
         };
         app.touch(Phase::Down, &[s]);
         for i in 0..20 {
@@ -6065,6 +6281,146 @@ mod tests {
     }
 
     #[test]
+    fn math_inserts_edits_plots_and_changes_range_through_board_controls() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.0);
+        app.run(Act::NewBoard);
+        app.text_input("Math test", true);
+        settle(&mut app);
+        let tap_button = |app: &mut App, act: Act, time| {
+            let button = app.node_rect(&act);
+            assert!(button.w > 0.0, "missing button {act:?}");
+            tap(app, button.cx(), button.cy(), time);
+        };
+        tap_button(&mut app, Act::Insert, 1200);
+        tap_button(&mut app, Act::InsertItem(InsertKind::Formula), 1300);
+        app.text_input("x^2 +", false);
+        tap_button(&mut app, Act::Done, 1400);
+        assert!(matches!(app.overlay, Some(Overlay::Ask { purpose: AskFor::Math { tool: Tool::Formula, .. }, .. })));
+        assert!(app.ed.doc.shapes().is_empty());
+        app.text_input("y = x^2", false);
+        tap_button(&mut app, Act::Done, 1500);
+        let formula = app.ed.selected_math().unwrap().clone();
+        assert_eq!(formula.tool, Tool::Formula);
+        let point = formula.bounds().center();
+        tap(&mut app, point.x as f32, point.y as f32, 1600);
+        tap(&mut app, point.x as f32, point.y as f32, 1700);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Ask { ref text, purpose: AskFor::Math { tool: Tool::Formula, .. }, .. }) if text == "y = x^2"
+        ));
+        app.text_input("y = x^2 - 2", false);
+        tap_button(&mut app, Act::Done, 1800);
+        tap_button(&mut app, Act::Plot, 1900);
+        let graph = app.ed.selected_math().unwrap().clone();
+        assert_eq!(graph.text, "y = x^2 - 2");
+        tap_button(&mut app, Act::GraphRange, 2000);
+        tap_button(&mut app, Act::GraphAdjust { pan: Pt::ZERO, scale: Some(0.8) }, 2100);
+        assert_eq!(app.ed.doc.get(&graph.id).unwrap().graph_range.x(), [-8.0, 8.0]);
+        tap_button(&mut app, Act::GraphRange, 2200);
+        tap_button(&mut app, Act::EditMath, 2300);
+        app.text_input("y = sin(x)\ny = cos(x)", false);
+        tap_button(&mut app, Act::Done, 2400);
+        let edited = app.ed.doc.get(&graph.id).unwrap();
+        assert_eq!(edited.text, "y = sin(x)\ny = cos(x)");
+        assert_eq!(edited.graph_range.x(), [-8.0, 8.0]);
+        tap_button(&mut app, Act::Insert, 2500);
+        tap_button(&mut app, Act::InsertItem(InsertKind::Graph), 2600);
+        app.text_input("1/x; cos(x)", false);
+        tap_button(&mut app, Act::Done, 2700);
+        assert_eq!(app.ed.selected_math().unwrap().text, "1/x; cos(x)");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn insert_dock_imports_and_persists_rendered_pdf_pages() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.0);
+        app.run(Act::NewBoard);
+        app.text_input("PDF annotations", true);
+        settle(&mut app);
+        let id = app.board.as_ref().unwrap().id.clone();
+        let insert = app.node_rect(&Act::Insert);
+        tap(&mut app, insert.cx(), insert.cy(), 1100);
+        let pdf = app.node_rect(&Act::InsertItem(InsertKind::File(FileKind::Pdf)));
+        assert!(pdf.w > 0.0);
+        tap(&mut app, pdf.cx(), pdf.cy(), 1200);
+        let new_pages = app.node_rect(&Act::ImportPdf(false));
+        assert!(new_pages.w > 0.0);
+        tap(&mut app, new_pages.cx(), new_pages.cy(), 1300);
+        let mut pixmap = tiny_skia::Pixmap::new(8, 4).unwrap();
+        pixmap.fill(tiny_skia::Color::from_rgba8(255, 0, 0, 255));
+        let png = pixmap.encode_png().unwrap();
+        let token = app.file_token;
+        app.file_result(token, crate::import::PickerFile::Pdf(vec![png.clone(), png]));
+        settle(&mut app);
+        assert_eq!((app.pages.len(), app.page), (3, 1));
+        assert!(app.ed.doc.shapes()[0].page_background);
+        let background_id = app.ed.doc.shapes()[0].id.clone();
+        assert!(!app.ed.doc.select(Some(&background_id)));
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        app.pause(tx);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let saved = store::load(&dir.join("boards"), &id).unwrap();
+        assert_eq!(saved.extra["pages"].as_array().unwrap().len(), 2);
+        let exported = board_png(app.ed.doc.shapes(), 80).unwrap();
+        let exported = tiny_skia::Pixmap::decode_png(&exported).unwrap();
+        let pixel = exported.pixel(exported.width() / 2, exported.height() / 2).unwrap();
+        assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
+
+        let response = net::snapshot(app.ed.doc.shapes(), app.doc_gen, 0);
+        let page: Value = serde_json::from_slice(&response.body).unwrap();
+        let shared = Shape::from_json(&page["shapes"][0]).unwrap();
+        assert_eq!(&shared, app.ed.doc.shapes()[0].as_ref());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn table_picker_and_cell_editor_use_the_board_controls() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.0);
+        app.run(Act::NewBoard);
+        app.text_input("Table test", true);
+        settle(&mut app);
+        let tap_button = |app: &mut App, act: Act, time| {
+            let button = app.node_rect(&act);
+            assert!(button.w > 0.0, "missing button {act:?}");
+            tap(app, button.cx(), button.cy(), time);
+        };
+        tap_button(&mut app, Act::Insert, 1000);
+        tap_button(&mut app, Act::InsertItem(InsertKind::Table), 1100);
+        assert!(matches!(app.overlay, Some(Overlay::TableSize { rows: 3, columns: 3 })));
+        tap_button(&mut app, Act::TableDimensions(-1, 0), 1200);
+        tap_button(&mut app, Act::TableDimensions(0, 1), 1300);
+        tap_button(&mut app, Act::Done, 1400);
+        let table = app.ed.doc.shapes()[0].clone();
+        let grid = table.table.as_deref().unwrap();
+        assert_eq!((grid.rows(), grid.columns()), (2, 4));
+        assert_eq!(app.ed.tool(), Tool::Select);
+        assert!(app.ed.doc.is_selected(&table.id));
+
+        let cell = Cell { row: 0, column: 1 };
+        let point = grid.cell_bounds(table.bounds(), cell).center();
+        tap(&mut app, point.x as f32, point.y as f32, 1500);
+        tap(&mut app, point.x as f32, point.y as f32, 1600);
+        assert!(matches!(app.overlay, Some(Overlay::Ask { purpose: AskFor::Cell { cell: hit, .. }, .. }) if hit == cell));
+        app.text_input("Monday\n09:00", false);
+        tap_button(&mut app, Act::Done, 1700);
+        assert_eq!(
+            app.ed.doc.get(&table.id).unwrap().table.as_deref().unwrap().text(cell),
+            Some("Monday\n09:00")
+        );
+        tap_button(&mut app, Act::TableDimensions(1, 0), 1800);
+        tap_button(&mut app, Act::TableDimensions(0, -1), 1900);
+        let shape = app.ed.doc.get(&table.id).unwrap();
+        let adjusted = shape.table.as_deref().unwrap();
+        assert_eq!((adjusted.rows(), adjusted.columns()), (3, 3));
+        assert_eq!(adjusted.text(cell), Some("Monday\n09:00"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn library_scrolls_and_deletes() {
         let (mut app, dir) = app();
         app.resize(720, 1280, 2.0);
@@ -6090,6 +6446,7 @@ mod tests {
             size: 0.0,
             stylus: false,
             eraser: false,
+            norm: 0.0,
         };
         app.touch(Phase::Down, &[s]);
         app.touch(

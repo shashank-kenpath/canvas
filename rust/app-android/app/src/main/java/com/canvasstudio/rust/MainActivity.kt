@@ -248,10 +248,57 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    private var pickedFile: Pair<Int, Int>? = null
+
+    fun pickFile(token: Int, kind: Int) {
+        onMain {
+            val h = handle
+            if (h == 0L) return@onMain
+            if (pickedFile != null) {
+                RustApp.fileResult(h, token, "", "", null, "A file picker is already open")
+                return@onMain
+            }
+            pickedFile = token to kind
+            try {
+                @Suppress("DEPRECATION")
+                startActivityForResult(ContentImport.intent(kind), PICK_FILE)
+            } catch (e: Exception) {
+                pickedFile = null
+                RustApp.fileResult(h, token, "", "", null, "No file picker on this device")
+            }
+        }
+    }
+
+    private fun filePicked(uri: android.net.Uri?) {
+        val (token, kind) = pickedFile ?: return
+        pickedFile = null
+        val h = handle
+        if (h == 0L) return
+        if (uri == null) {
+            RustApp.fileResult(h, token, "", "", null, null)
+            return
+        }
+        Thread {
+            try {
+                val file = ContentImport.read(this, uri, kind)
+                onMain {
+                    if (handle == h) RustApp.fileResult(h, token, file.name, file.mime, file.bytes, null)
+                }
+            } catch (e: Exception) {
+                val error = if (e is java.io.IOException) e.message ?: "Could not read the file" else "Could not read the file"
+                onMain { if (handle == h) RustApp.fileResult(h, token, "", "", null, error) }
+            }
+        }.start()
+    }
+
     @Deprecated("Platform API")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == PICK_FILE) {
+            filePicked(if (resultCode == RESULT_OK) data?.data else null)
+            return
+        }
         if (requestCode != PICK_BOARDS || resultCode != RESULT_OK || data == null) return
         val uris = ArrayList<android.net.Uri>()
         data.clipData?.let { clip -> for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri) }
@@ -276,6 +323,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private companion object {
         const val PICK_BOARDS = 41
+        const val PICK_FILE = 42
         const val MAX_BOARD_BYTES = 32 * 1024 * 1024
     }
 }

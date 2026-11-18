@@ -13,13 +13,19 @@
 
 use crate::document::{scene_bounds, Applied, Document};
 use crate::geom::{IRect, Pt, Rect};
+use crate::math;
+use crate::mindmap;
 use crate::recognize::recognize_shape;
 use crate::render::{self, Layer, Target, View};
 use crate::shape::{Shape, Tool};
+use crate::table::{self, Cell};
 use crate::text;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 use tiny_skia::Transform;
+
+#[path = "math/editor.rs"]
+mod math_editor;
 
 pub const EV_STATE: u32 = 1; // tool, selection, undo/redo availability, style
 pub const EV_DOC: u32 = 2; // shapes changed: schedule a save
@@ -36,6 +42,25 @@ pub struct Contact {
     pub stylus: bool,
     /// The back (eraser end) of a stylus.
     pub eraser: bool,
+    /// Android's normalised size (`getSize`, raw width / panel range) from an
+    /// IR panel that reports real widths; 0 when unknown. Measured on the
+    /// Aaztec IR frame (raw units of 1/32767): finger ~15, pen tip ~35, pen
+    /// back nib ~70-190, palm 450-900.
+    pub norm: f64,
+}
+
+/// [`Contact::norm`] bands: above `NIB_NORM` is the pen's back nib (erases),
+/// above `PALM_NORM` a palm or fist (ignored).
+const NIB_NORM: f64 = 60.0 / 32767.0;
+const PALM_NORM: f64 = 300.0 / 32767.0;
+
+impl Contact {
+    fn nib(&self) -> bool {
+        self.eraser || (self.norm > NIB_NORM && self.norm < PALM_NORM)
+    }
+    fn big(&self) -> bool {
+        self.norm >= PALM_NORM
+    }
 }
 
 /// Adaptive low-pass filter (One-Euro) for live ink: strong smoothing when
@@ -118,6 +143,16 @@ enum Mode {
     Pinch,
     Text,
     Blocked,
+    /// Two contacts landed together while writing; see [`Pair`].
+    Pair,
+}
+
+/// Two contacts that came down together while writing: a two-finger pinch,
+/// or a pen and the palm that landed with it. Told apart by how they move.
+struct Pair {
+    since: u64,
+    /// Pointer, raw samples (logical pixels, time) and distance travelled.
+    tracks: [(i32, Vec<(Pt, u64)>, f64); 2],
 }
 
 /// The host should ask the user for text and call [`Editor::commit_text`].
@@ -128,6 +163,7 @@ pub struct TextRequest {
     pub x: f64,
     pub y: f64,
     pub text: String,
+    pub cell: Option<Cell>,
 }
 
 /// How long the pen rests before handwriting is read, in milliseconds.
@@ -140,6 +176,14 @@ const REST_TRAVEL: f64 = 12.0;
 /// A mark held still this long (milliseconds) without moving is a hand that
 /// rested and lifted, not a dot.
 const REST_DOT_MS: u64 = 800;
+/// A second contact this close (logical pixels; about 15 cm on a 4K board)
+/// to the writer may be the hand holding the pen.
+const PALM_REACH: f64 = 160.0;
+/// The writer sits above the palm by at least this much (logical pixels).
+const PALM_BELOW: f64 = 12.0;
+/// A pair that lands together is decided after this long (ms) or travel.
+const PAIR_MS: u64 = 120;
+const PAIR_TRAVEL: f64 = 24.0;
 
 const EMPTY: IRect = IRect { x0: 0, y0: 0, x1: 0, y1: 0 };
 
@@ -199,6 +243,9 @@ pub struct Editor {
     stylus: Option<i32>,
     stylus_lifted: Option<u64>,
     primary_size: f64,
+    /// Raw samples of the primary contact since it landed (bounded).
+    trail: Vec<(Pt, u64)>,
+    pair: Option<Pair>,
 
     // Handwriting waiting to become text.
     pending: Vec<String>,
@@ -232,7 +279,7 @@ pub struct Editor {
     marquee: Option<Rect>,
     hidden: HashSet<String>,
     last_erase: Pt,
-    last_tap_id: Option<String>,
+    last_text_tap: Option<(String, Option<Cell>)>,
     last_tap_time: u64,
 
     // Rendering.
@@ -284,7 +331,7 @@ fn scaled(s: &Shape, origin: Pt, sx: f64, sy: f64) -> Shape {
         .map(|p| Pt::new(origin.x + (p.x - origin.x) * sx, origin.y + (p.y - origin.y) * sy))
         .collect();
     let mut next = s.with_points(points);
-    if s.tool == Tool::Text {
+    if matches!(s.tool, Tool::Text | Tool::Formula) {
         let size = (s.font_size * sy).clamp(6.0, 2000.0);
         next = next.with_text(s.text.clone(), size);
     }
@@ -343,6 +390,8 @@ impl Editor {
             stylus: None,
             stylus_lifted: None,
             primary_size: 0.0,
+            trail: Vec::new(),
+            pair: None,
             pending: Vec::new(),
             pending_bounds: Rect::ZERO,
             ink_deadline: None,
@@ -368,7 +417,7 @@ impl Editor {
             marquee: None,
             hidden: HashSet::new(),
             last_erase: Pt::ZERO,
-            last_tap_id: None,
+            last_text_tap: None,
             last_tap_time: 0,
             scene: Layer::new(0, 0),
             frame: Layer::new(0, 0),
@@ -421,7 +470,7 @@ impl Editor {
         self.palm_rejection
     }
     pub fn selected_text_count(&self) -> usize {
-        self.doc.selected_shapes().iter().filter(|s| s.tool == Tool::Text).count()
+        self.doc.selected_shapes().iter().filter(|s| matches!(s.tool, Tool::Text | Tool::Formula)).count()
     }
     pub fn take_ink_request(&mut self) -> Option<InkRequest> {
         self.ink_requests.pop_front()
@@ -465,7 +514,7 @@ impl Editor {
     pub fn world(&self, screen: Pt) -> Pt {
         (screen - self.camera) / self.zoom
     }
-    fn next_id(&mut self) -> String {
+    pub(crate) fn next_id(&mut self) -> String {
         self.sequence += 1;
         format!("{}-{}-{}", self.client_id, base36(micros()), self.sequence - 1)
     }
@@ -637,7 +686,7 @@ impl Editor {
             .doc
             .selected_shapes()
             .iter()
-            .filter(|s| s.tool == Tool::Text && s.font != font)
+            .filter(|s| matches!(s.tool, Tool::Text | Tool::Formula) && s.font != font)
             .map(|s| (**s).clone().with_font(font))
             .collect();
         if !changed.is_empty() {
@@ -656,7 +705,7 @@ impl Editor {
             .doc
             .selected_shapes()
             .iter()
-            .filter(|s| s.tool == Tool::Text)
+            .filter(|s| matches!(s.tool, Tool::Text | Tool::Formula))
             .map(|s| (**s).clone().with_text(s.text.clone(), (s.font_size * factor).clamp(6.0, 2000.0)))
             .collect();
         if !changed.is_empty() {
@@ -685,7 +734,67 @@ impl Editor {
 
     pub fn delete_selection(&mut self) {
         let ids: Vec<String> = self.doc.selected_ids().to_vec();
+        self.delete_shapes(ids);
+    }
+
+    pub(crate) fn delete_shapes(&mut self, ids: Vec<String>) {
         let applied = self.doc.remove_many(ids);
+        self.on_applied(applied);
+    }
+
+    pub(crate) fn insert_table(&mut self, rows: usize, columns: usize) {
+        let (w, h) = self.viewport();
+        let center = self.world(Pt::new(w / 2.0, h / 2.0));
+        let shape = table::centered(self.next_id(), center, rows, columns).with_font(self.font);
+        self.insert_selected(shape);
+    }
+
+    pub(crate) fn resize_table_grid(&mut self, row_delta: isize, column_delta: isize) {
+        let [id] = self.doc.selected_ids() else { return };
+        let Some(shape) = self.doc.get(id) else { return };
+        let Some(table) = shape.table.as_deref() else { return };
+        let rows = table.rows().saturating_add_signed(row_delta).clamp(1, table::MAX_SIZE);
+        let columns = table.columns().saturating_add_signed(column_delta).clamp(1, table::MAX_SIZE);
+        if (rows, columns) == (table.rows(), table.columns()) {
+            return;
+        }
+        let bounds = shape.bounds();
+        let size = table.cell_size(bounds);
+        let start = bounds.top_left();
+        let end = start + Pt::new(size.x * columns as f64, size.y * rows as f64);
+        let next = shape.with_points(vec![start, end]).with_table(table.resized(rows, columns));
+        let applied = self.doc.replace(next);
+        self.on_applied(applied);
+    }
+
+    pub(crate) fn insert_mind_map(&mut self) {
+        let (w, h) = self.viewport();
+        let center = self.world(Pt::new(w / 2.0, h / 2.0));
+        let shape = mindmap::root(self.next_id(), center).with_font(self.font);
+        self.insert_selected(shape);
+    }
+
+    pub(crate) fn add_mind_topic(&mut self, sibling: bool) {
+        let [selected] = self.doc.selected_ids() else { return };
+        let Some(node) = self.doc.get(selected).filter(|s| s.tool == Tool::MindNode) else { return };
+        let parent = if sibling {
+            node.parent_id.as_deref().and_then(|id| self.doc.get(id)).filter(|s| s.tool == Tool::MindNode)
+        } else {
+            Some(node)
+        };
+        let Some(parent) = parent.cloned() else { return };
+        let id = self.next_id();
+        let shape = mindmap::child(self.doc.shapes(), &parent, id).with_font(parent.font);
+        self.insert_selected(shape);
+    }
+
+    fn insert_selected(&mut self, shape: Shape) {
+        if self.tool != Tool::Select {
+            self.set_tool(Tool::Select, PenMode::Ink);
+        }
+        let id = shape.id.clone();
+        let applied = self.doc.add(shape);
+        self.doc.select(Some(&id));
         self.on_applied(applied);
     }
 
@@ -721,29 +830,55 @@ impl Editor {
 
     /// Adds new text at world (`x`, `y`), or changes the text of shape `id`.
     pub fn commit_text(&mut self, id: &str, x: f64, y: f64, text: &str) {
-        if text.is_empty() {
+        if let Some(tool) = self.doc.get(id).map(|shape| shape.tool).filter(|t| matches!(t, Tool::Formula | Tool::Graph)) {
+            let _ = self.commit_math(id, tool, text);
             return;
         }
         if !id.is_empty() {
             if let Some(existing) = self.doc.get(id).cloned() {
-                let next = (*existing).clone().with_text(text, existing.font_size);
-                let applied = self.doc.replace(next);
-                self.on_applied(applied);
+                if let Some(table) = existing.table.as_deref() {
+                    if let Some(cell) = table.cell_at(existing.bounds(), Pt::new(x, y)) {
+                        self.commit_cell_text(id, cell, text);
+                    }
+                } else if (existing.tool == Tool::MindNode || !text.is_empty()) && existing.text != text {
+                    let mut next = (*existing).clone();
+                    let calculation = (existing.tool == Tool::Text).then(|| math::calculation_source(text)).flatten();
+                    if calculation.is_some() {
+                        next.tool = Tool::Formula;
+                    }
+                    let next = next.with_text(calculation.as_deref().unwrap_or(text), existing.font_size);
+                    let applied = self.doc.replace(next);
+                    self.on_applied(applied);
+                }
             }
+            return;
+        }
+        if text.is_empty() {
             return;
         }
         let id = self.next_id();
         let size = (28.0 / self.zoom).clamp(12.0, 400.0);
-        let shape = Shape::new(id.clone(), Tool::Text, vec![Pt::new(x, y)])
+        let calculation = math::calculation_source(text);
+        let tool = if calculation.is_some() { Tool::Formula } else { Tool::Text };
+        let shape = Shape::new(id.clone(), tool, vec![Pt::new(x, y)])
             .styled(self.color, 3.0, false)
             .with_font(self.font)
-            .with_text(text, size);
+            .with_text(calculation.as_deref().unwrap_or(text), size);
         let applied = self.doc.add(shape);
         self.on_applied(applied);
         self.tool = Tool::Select;
         self.doc.select(Some(&id));
         self.overlay_dirty = true;
         self.events |= EV_STATE;
+    }
+
+    pub(crate) fn commit_cell_text(&mut self, id: &str, cell: Cell, text: &str) {
+        let Some(shape) = self.doc.get(id) else { return };
+        let mut next = (**shape).clone();
+        if next.table.as_mut().is_some_and(|table| table.set_text(cell, text)) {
+            let applied = self.doc.replace(next);
+            self.on_applied(applied);
+        }
     }
 
     // -------------------------------------------------------------- pointers
@@ -754,7 +889,7 @@ impl Editor {
     }
 
     fn is_palm(&self, contact: Contact) -> bool {
-        self.palm_rejection && !contact.stylus && contact.size / self.dpr >= self.palm_size
+        self.palm_rejection && !contact.stylus && (contact.size / self.dpr >= self.palm_size || contact.big())
     }
 
     /// Stops whatever the touches on the panel were doing and ignores them
@@ -853,7 +988,10 @@ impl Editor {
             }
         }
         let fingers_pan = self.pen_priority && self.stylus_seen && !contact.stylus;
-        if self.multi_ink && self.mode == Mode::Draw && !fingers_pan && !contact.eraser && self.extras.len() < 9 {
+        if self.palm_rejection && !contact.stylus && self.writer_hand(id, pos, time) {
+            return;
+        }
+        if self.multi_ink && self.mode == Mode::Draw && !fingers_pan && !contact.nib() && self.extras.len() < 9 {
             // Another writer: start a stroke of its own.
             let w = self.world(pos);
             let shape_id = self.next_id();
@@ -899,8 +1037,10 @@ impl Editor {
         self.primary_size = contact.size / self.dpr;
         self.down_stamp = time;
         self.travel = 0.0;
+        self.trail.clear();
+        self.trail.push((pos, time));
         let draws = !matches!(self.tool, Tool::Select | Tool::Hand);
-        self.tool_override = if contact.eraser {
+        self.tool_override = if contact.nib() && draws {
             Some(Tool::Eraser)
         } else if fingers_pan && draws {
             Some(Tool::Hand)
@@ -910,6 +1050,126 @@ impl Editor {
         self.begin(pos, time);
     }
 
+    /// Palm rejection by position and motion, for touch panels that report
+    /// every contact at the same size. Returns true when the new contact has
+    /// been dealt with (ignored, or paired with the writer).
+    ///
+    /// - Landing together with the writer: wait and see which one writes.
+    /// - Landing later just below or beside the writer: the palm.
+    /// - Landing later just above the writer: the pen, and what was drawing
+    ///   is the hand that came down first.
+    fn writer_hand(&mut self, id: i32, pos: Pt, time: u64) -> bool {
+        if self.multi_ink && self.mode == Mode::Draw && self.extras.iter().any(|e| e.last_screen.dist(pos) < PALM_REACH) {
+            self.ignored.push(id);
+            return true;
+        }
+        if !matches!(self.mode, Mode::Draw | Mode::Shape) || self.pointers.len() != 1 {
+            return false;
+        }
+        let (first, first_pos) = self.pointers[0];
+        if first_pos.dist(pos) >= PALM_REACH {
+            return false;
+        }
+        let early = time.saturating_sub(self.down_stamp) < 220 && self.travel < 36.0;
+        if early {
+            let mut trail = std::mem::take(&mut self.trail);
+            if trail.is_empty() {
+                trail.push((first_pos, self.down_stamp));
+            }
+            let travelled = self.travel;
+            self.cancel_action();
+            self.mode = Mode::Pair;
+            self.pointers.push((id, pos));
+            self.pair = Some(Pair { since: time, tracks: [(first, trail, travelled), (id, vec![(pos, time)], 0.0)] });
+            return true;
+        }
+        if pos.y < first_pos.y - PALM_BELOW {
+            // The hand came down first and is dragging along: drop what it
+            // drew and let the newcomer write.
+            self.cancel_action();
+            self.ignored.push(first);
+            self.pointers.clear();
+            self.primary = None;
+            self.mode = Mode::None;
+            return false;
+        }
+        self.ignored.push(id);
+        true
+    }
+
+    fn pair_sample(&mut self, id: i32, pos: Pt, time: u64) {
+        if let Some(t) = self.pair.as_mut().and_then(|p| p.tracks.iter_mut().find(|t| t.0 == id)) {
+            if let Some(&(last, _)) = t.1.last() {
+                t.2 += pos.dist(last);
+            }
+            if t.1.len() < 256 {
+                t.1.push((pos, time));
+            }
+        }
+        if let Some(slot) = self.pointers.iter_mut().find(|(p, _)| *p == id) {
+            slot.1 = pos;
+        }
+    }
+
+    /// Settles a [`Pair`]: both moving is a pinch; otherwise the one that
+    /// moves (or, if neither has, the upper one) writes and the other is the
+    /// palm. The writer's samples so far are replayed so no ink is lost.
+    fn decide_pair(&mut self, time: u64, force: bool) {
+        let Some(pair) = &self.pair else { return };
+        let (ta, tb) = (pair.tracks[0].2, pair.tracks[1].2);
+        let (most, least) = (ta.max(tb), ta.min(tb));
+        let pinch = least >= 10.0 && least >= 0.4 * most;
+        // Fingers of a pinch rarely move in the same frame: only an obvious
+        // pinch, or one contact far ahead of the other, settles it early.
+        let settled = pinch && most >= PAIR_TRAVEL || most >= 3.0 * PAIR_TRAVEL && least < 10.0;
+        if !force && !settled && time.saturating_sub(pair.since) < PAIR_MS {
+            return;
+        }
+        let Some(Pair { since, tracks: [a, b] }) = self.pair.take() else { return };
+        if pinch && self.pointers.len() == 2 {
+            let at = |t: &(i32, Vec<(Pt, u64)>, f64)| {
+                t.1.iter().rev().find(|s| s.1 <= since).or(t.1.first()).map_or(Pt::ZERO, |s| s.0)
+            };
+            let (pa, pb) = (at(&a), at(&b));
+            self.pointers.sort_by_key(|(p, _)| if *p == a.0 { 0 } else { 1 });
+            self.pinch_distance = f64::max(24.0, pa.dist(pb));
+            self.anchor_world = self.world((pa + pb) / 2.0);
+            self.start_zoom = self.zoom;
+            self.start_camera = self.camera;
+            self.pinch_origin = [pa, pb];
+            self.mode = Mode::Pinch;
+            let (p, q) = (self.pointers[0].1, self.pointers[1].1);
+            self.zoom = (self.start_zoom * p.dist(q) / self.pinch_distance).clamp(0.1, 8.0);
+            self.camera = (p + q) / 2.0 - self.anchor_world * self.zoom;
+            self.view_changed();
+            return;
+        }
+        let last_y = |t: &(i32, Vec<(Pt, u64)>, f64)| t.1.last().map_or(0.0, |s| s.0.y);
+        let a_writes = if most < 10.0 { last_y(&a) <= last_y(&b) } else { ta >= tb };
+        let (writer, palm) = if a_writes { (a, b) } else { (b, a) };
+        self.ignored.push(palm.0);
+        self.pointers.retain(|(p, _)| *p == writer.0);
+        let Some(&(p0, t0)) = writer.1.first() else { return };
+        if !self.pointers.iter().any(|(p, _)| *p == writer.0) {
+            // The writer already lifted; its up will finish the stroke.
+            self.pointers.push((writer.0, writer.1.last().map_or(p0, |s| s.0)));
+        }
+        self.mode = Mode::None;
+        self.primary = Some(writer.0);
+        self.down_stamp = t0;
+        self.travel = 0.0;
+        self.begin(p0, t0);
+        let mut prev = p0;
+        for &(p, t) in &writer.1[1..] {
+            self.travel += p.dist(prev);
+            prev = p;
+            self.raw_screen = p;
+            let q = if self.smoothing && self.mode == Mode::Draw { self.smooth.filter(p, t) } else { p };
+            self.continue_(q, t);
+        }
+        self.trail = writer.1;
+    }
+
     pub fn pointer_move(&mut self, id: i32, pos: Pt, time: u64) {
         self.pointer_move_with(id, pos, time, Contact::default());
     }
@@ -917,6 +1177,11 @@ impl Editor {
     pub fn pointer_move_with(&mut self, id: i32, pos: Pt, time: u64, contact: Contact) {
         let pos = pos / self.dpr;
         if self.ignored.contains(&id) {
+            return;
+        }
+        if self.mode == Mode::Pair {
+            self.pair_sample(id, pos, time);
+            self.decide_pair(time, false);
             return;
         }
         if let Some(i) = self.extras.iter().position(|e| e.pointer == id) {
@@ -935,7 +1200,7 @@ impl Editor {
         // later, and one that rests may spread at any time: drop what it
         // started.
         if self.is_palm(contact)
-            && (time.saturating_sub(self.down_stamp) < 450 || self.travel < 2.0 * REST_TRAVEL)
+            && (contact.big() || time.saturating_sub(self.down_stamp) < 450 || self.travel < 2.0 * REST_TRAVEL)
             && self.pointers.iter().any(|(p, _)| *p == id)
         {
             if Some(id) == self.primary || self.mode == Mode::Pinch {
@@ -965,7 +1230,31 @@ impl Editor {
         if Some(id) != self.primary {
             return;
         }
+        // The back nib touches edge first and only shows its width a moment
+        // later: turn the young stroke into an erase along the same path.
+        if contact.nib() && self.mode == Mode::Draw && self.tool_override.is_none()
+            && time.saturating_sub(self.down_stamp) < 250
+        {
+            let mut trail = std::mem::take(&mut self.trail);
+            trail.push((pos, time));
+            self.cancel_action();
+            self.tool_override = Some(Tool::Eraser);
+            self.travel = 0.0;
+            self.begin(trail[0].0, trail[0].1);
+            let mut prev = trail[0].0;
+            for &(p, t) in &trail[1..] {
+                self.travel += p.dist(prev);
+                prev = p;
+                self.raw_screen = p;
+                self.continue_(p, t);
+            }
+            self.trail = trail;
+            return;
+        }
         self.travel += pos.dist(previous);
+        if self.trail.len() < 256 {
+            self.trail.push((pos, time));
+        }
         self.raw_screen = pos;
         let pos = if self.smoothing && self.mode == Mode::Draw { self.smooth.filter(pos, time) } else { pos };
         self.continue_(pos, time);
@@ -982,6 +1271,10 @@ impl Editor {
         let rested = |born: u64, travel: f64| {
             palm_rejection && !was_stylus && time.saturating_sub(born) >= REST_DOT_MS && travel < 3.0
         };
+        if self.mode == Mode::Pair && self.pair.as_ref().is_some_and(|p| p.tracks.iter().any(|t| t.0 == id)) {
+            self.pair_sample(id, pos, time);
+            self.decide_pair(time, true);
+        }
         if let Some(i) = self.ignored.iter().position(|p| *p == id) {
             self.ignored.remove(i);
             return;
@@ -1106,8 +1399,11 @@ impl Editor {
 
     /// Adds a finished ink stroke to the handwriting waiting to be read.
     fn note_ink(&mut self, id: &str, bounds: Rect, time: u64) {
-        if !self.pending.is_empty() && !self.continues(&bounds, &self.pending_bounds) {
-            self.flush_pending();
+        if !self.pending.is_empty() {
+            let cell = |bounds| table::containing_cell(self.doc.shapes(), bounds).map(|(s, cell)| (&s.id, cell));
+            if !self.continues(&bounds, &self.pending_bounds) || cell(bounds) != cell(self.pending_bounds) {
+                self.flush_pending();
+            }
         }
         self.pending_bounds = if self.pending.is_empty() { bounds } else { self.pending_bounds.union(&bounds) };
         self.pending.push(id.to_string());
@@ -1159,7 +1455,11 @@ impl Editor {
     /// Replaces the strokes of an [`InkRequest`] with typed `text`, as one
     /// undo step. Does nothing if any of the strokes has since changed.
     pub fn commit_ink(&mut self, ids: &[String], text: &str) {
-        let text = text.trim();
+        self.commit_ink_candidates(ids, &[text]);
+    }
+
+    pub(crate) fn commit_ink_candidates(&mut self, ids: &[String], candidates: &[&str]) {
+        let text = candidates.first().map_or("", |text| text.trim());
         if text.is_empty() || ids.is_empty() {
             return;
         }
@@ -1171,6 +1471,17 @@ impl Editor {
             }
         }
         let bounds = scene_bounds(&shapes).unwrap();
+        if let Some((shape, cell)) = table::containing_cell(self.doc.shapes(), bounds) {
+            let mut next = shape.clone();
+            let table = next.table.as_mut().unwrap();
+            let previous = table.text(cell).unwrap();
+            let combined = if previous.is_empty() { text.to_string() } else { format!("{previous} {text}") };
+            table.set_text(cell, &combined);
+            let applied = self.doc.swap(ids.to_vec(), vec![next]);
+            self.on_applied(applied);
+            return;
+        }
+        let formula = math::recognize(candidates, &shapes);
         let letters = text.chars().count().max(1) as f64;
         // Tall enough to match the handwriting; a lone dash or dot has no
         // height, so its width is used instead.
@@ -1178,9 +1489,15 @@ impl Editor {
         let by_width = bounds.width() / (letters * 0.55) * 0.8;
         let size = by_height.max(by_width.min(by_height * 3.0 + 14.0 / self.zoom)).clamp(8.0, 2000.0);
         let id = self.next_id();
-        let (_, h) = text::measure(text, size, self.font);
+        let (tool, text, size, h) = if let Some(source) = &formula {
+            let height = math::formula_layout(source, 24.0, self.font).height;
+            let size = (size * 24.0 * text::LINE_HEIGHT / height).clamp(8.0, 2000.0);
+            (Tool::Formula, source.as_str(), size, math::formula_layout(source, size, self.font).height)
+        } else {
+            (Tool::Text, text, size, text::measure(text, size, self.font).1)
+        };
         let origin = Pt::new(bounds.l, bounds.center().y - h / 2.0);
-        let typed = Shape::new(id, Tool::Text, vec![origin])
+        let typed = Shape::new(id, tool, vec![origin])
             .styled(shapes[0].color, 3.0, false)
             .with_font(self.font)
             .with_text(text, size);
@@ -1223,7 +1540,7 @@ impl Editor {
                 self.last_erase = w;
                 self.erase_at(w);
             }
-            Tool::Select => self.begin_select(position, w),
+            Tool::Select | Tool::Table | Tool::MindNode | Tool::Image | Tool::Formula | Tool::Graph => self.begin_select(position, w),
         }
     }
 
@@ -1254,10 +1571,10 @@ impl Editor {
                 self.doc.select(Some(&hit.id));
                 self.events |= EV_STATE;
             }
-            self.moving = self.doc.selected_shapes();
+            self.moving = self.move_selection(self.doc.selected_shapes());
             self.mode = Mode::Move;
         } else if bounds.is_some_and(|b| selected.len() > 1 && b.inflate(6.0 / self.zoom).contains(w)) {
-            self.moving = selected;
+            self.moving = self.move_selection(selected);
             self.mode = Mode::Move;
         } else {
             if self.doc.select(None) {
@@ -1266,6 +1583,15 @@ impl Editor {
             self.mode = Mode::Marquee;
             self.marquee = Some(Rect::from_points(w, w));
         }
+    }
+
+    fn move_selection(&self, selected: Vec<Arc<Shape>>) -> Vec<Arc<Shape>> {
+        if !selected.iter().any(|s| s.tool == Tool::MindNode) {
+            return selected;
+        }
+        let ids = selected.iter().map(|s| s.id.clone()).collect();
+        let ids = mindmap::subtree_ids(self.doc.shapes(), ids);
+        self.doc.shapes().iter().filter(|s| ids.contains(&s.id)).cloned().collect()
     }
 
     fn continue_(&mut self, position: Pt, time: u64) {
@@ -1327,7 +1653,7 @@ impl Editor {
                 self.camera = position - self.anchor_world * self.zoom;
                 self.view_changed();
             }
-            Mode::None | Mode::Pinch | Mode::Text | Mode::Blocked => {}
+            Mode::None | Mode::Pinch | Mode::Text | Mode::Blocked | Mode::Pair => {}
         }
     }
 
@@ -1391,12 +1717,34 @@ impl Editor {
             return;
         }
         self.dragging = true;
+        self.last_text_tap = None;
         let moving = std::mem::take(&mut self.moving);
-        for s in &moving {
-            self.hidden.insert(s.id.clone());
-            self.scene_damage.push(render::paint_bounds(s));
-        }
+        self.hide_shapes(&moving);
         self.moving = moving;
+    }
+
+    fn hide_shapes(&mut self, shapes: &[Arc<Shape>]) {
+        let mut nodes = HashSet::new();
+        for s in shapes {
+            if self.hidden.insert(s.id.clone()) {
+                self.scene_damage.push(render::paint_bounds(s));
+                if s.tool == Tool::MindNode {
+                    nodes.insert(s.id.clone());
+                }
+            }
+        }
+        self.damage_connections(&nodes);
+    }
+
+    fn damage_connections(&mut self, nodes: &HashSet<String>) {
+        if nodes.is_empty() {
+            return;
+        }
+        for (parent, child) in mindmap::connections(self.doc.shapes()) {
+            if nodes.contains(&parent.id) || nodes.contains(&child.id) {
+                self.scene_damage.push(mindmap::connection_bounds(parent.bounds(), child.bounds()));
+            }
+        }
     }
 
     fn finish(&mut self, position: Pt, time: u64) {
@@ -1468,7 +1816,9 @@ impl Editor {
             }
             Mode::Text => {
                 if self.travel < 16.0 {
-                    self.text_request = Some(TextRequest { id: String::new(), x: w.x, y: w.y, text: String::new() });
+                    self.text_request = Some(TextRequest {
+                        id: String::new(), x: w.x, y: w.y, text: String::new(), cell: None,
+                    });
                     self.events |= EV_TEXT;
                 }
             }
@@ -1489,23 +1839,7 @@ impl Editor {
                     let applied = self.doc.replace_many(moved);
                     self.on_applied(applied);
                 } else {
-                    let hit = self.doc.hit_test(w, 12.0 / self.zoom);
-                    if let Some(h) = &hit {
-                        if h.tool == Tool::Text
-                            && self.last_tap_id.as_deref() == Some(h.id.as_str())
-                            && time.saturating_sub(self.last_tap_time) < 450
-                        {
-                            self.text_request = Some(TextRequest {
-                                id: h.id.clone(),
-                                x: h.points[0].x,
-                                y: h.points[0].y,
-                                text: h.text.clone(),
-                            });
-                            self.events |= EV_TEXT;
-                        }
-                    }
-                    self.last_tap_id = hit.map(|h| h.id.clone());
-                    self.last_tap_time = time;
+                    self.tap_text(w, time);
                     self.clear_transform();
                 }
             }
@@ -1529,17 +1863,58 @@ impl Editor {
                 }
                 self.events |= EV_STATE;
             }
-            Mode::Pan | Mode::None | Mode::Pinch | Mode::Blocked => {}
+            Mode::Pan | Mode::None | Mode::Pinch | Mode::Blocked | Mode::Pair => {}
+        }
+    }
+
+    fn tap_text(&mut self, point: Pt, time: u64) {
+        let target = self.doc.hit_test(point, 12.0 / self.zoom).and_then(|shape| {
+            let cell = match shape.tool {
+                Tool::Text | Tool::MindNode | Tool::Formula | Tool::Graph => None,
+                Tool::Table => Some(shape.table.as_deref()?.cell_at(shape.bounds(), point)?),
+                _ => return None,
+            };
+            Some((shape, cell))
+        });
+        let Some((shape, cell)) = target else {
+            self.last_text_tap = None;
+            return;
+        };
+        if self.last_text_tap.as_ref().is_some_and(|(id, last_cell)| *id == shape.id && *last_cell == cell)
+            && time.saturating_sub(self.last_tap_time) < 450
+        {
+            let text = match cell {
+                Some(cell) => shape.table.as_deref().and_then(|table| table.text(cell)).unwrap_or(""),
+                None => &shape.text,
+            };
+            let anchor = if cell.is_some() { point } else { shape.points[0] };
+            self.text_request = Some(TextRequest {
+                id: shape.id.clone(),
+                x: anchor.x,
+                y: anchor.y,
+                text: text.to_string(),
+                cell,
+            });
+            self.events |= EV_TEXT;
+            self.last_text_tap = None;
+        } else {
+            self.last_text_tap = Some((shape.id.clone(), cell));
+            self.last_tap_time = time;
         }
     }
 
     fn unhide_all(&mut self) {
-        let ids: Vec<String> = self.hidden.drain().collect();
-        for id in ids {
+        let hidden = std::mem::take(&mut self.hidden);
+        let mut nodes = HashSet::new();
+        for id in hidden {
             if let Some(s) = self.doc.get(&id) {
                 self.scene_damage.push(render::paint_bounds(s));
+                if s.tool == Tool::MindNode {
+                    nodes.insert(id);
+                }
             }
         }
+        self.damage_connections(&nodes);
     }
 
     fn clear_transform(&mut self) {
@@ -1554,6 +1929,7 @@ impl Editor {
     /// Abandons the in-progress action without changing the document.
     fn cancel_action(&mut self) {
         self.snap_deadline = None;
+        self.pair = None;
         if self.draft.take().is_some() || self.snapped.is_some() {
             self.damage_world(&self.draft_bounds.clone(), self.width / 2.0);
         }
@@ -1569,12 +1945,15 @@ impl Editor {
 
     fn erase_at(&mut self, w: Pt) {
         let tolerance = 12.0 / self.zoom;
-        for shape in self.doc.shapes() {
-            if self.hidden.contains(&shape.id) || !shape.hits(w, tolerance) {
-                continue;
+        let hits: Vec<_> = self.doc.shapes().iter().filter(|s| {
+            !self.hidden.contains(&s.id) && match s.table.as_deref() {
+                Some(table) => table.hits_grid(s.bounds(), w, tolerance + s.width / 2.0),
+                None => s.hits(w, tolerance),
             }
-            self.hidden.insert(shape.id.clone());
-            self.scene_damage.push(render::paint_bounds(shape));
+        }).cloned().collect();
+        if !hits.is_empty() {
+            let shapes = self.move_selection(hits);
+            self.hide_shapes(&shapes);
             self.overlay_dirty = true;
         }
     }
@@ -1658,6 +2037,15 @@ impl Editor {
             let buf: &mut [u8] = if whole { &mut scene.data } else { &mut scratch };
             let Some(mut t) = Target::new(buf, r, view) else { return };
             render::draw_background(&mut t, grid);
+            for (parent, child) in mindmap::connections(doc.shapes()) {
+                if hidden.contains(&parent.id) || hidden.contains(&child.id) {
+                    continue;
+                }
+                let edge = mindmap::connection_bounds(parent.bounds(), child.bounds());
+                if IRect::covering(&view.rect_px(&edge), 2.0).intersects(&r) {
+                    render::draw_connection(&mut t, parent.bounds(), child.bounds(), child.color);
+                }
+            }
             for s in doc.shapes() {
                 if hidden.contains(&s.id) {
                     continue;
@@ -1721,10 +2109,24 @@ impl Editor {
             return Vec::new();
         }
         if self.dragging && matches!(self.mode, Mode::Move | Mode::Resize) {
-            self.moving.clone()
+            self.moving.iter().filter(|s| self.doc.is_selected(&s.id)).cloned().collect()
         } else {
             self.doc.selected_shapes()
         }
+    }
+
+    fn live_connections(&self) -> impl Iterator<Item = (Rect, Rect, u32)> + '_ {
+        let connected = self.dragging && self.moving.iter().any(|s| s.tool == Tool::MindNode);
+        connected.then(|| mindmap::connections(self.doc.shapes()))
+            .into_iter().flatten().filter_map(|(parent, child)| {
+                let parent_moves = self.hidden.contains(&parent.id);
+                let child_moves = self.hidden.contains(&child.id);
+                if !parent_moves && !child_moves {
+                    return None;
+                }
+                let bounds = |s: &Shape, moves| if moves { self.map_rect(&s.bounds()) } else { s.bounds() };
+                Some((bounds(parent, parent_moves), bounds(child, child_moves), child.color))
+            })
     }
 
     /// Screen pixels covered by live feedback other than the pen stroke.
@@ -1738,6 +2140,9 @@ impl Editor {
             }
         }
         if self.dragging {
+            for (parent, child, _) in self.live_connections() {
+                add(mindmap::connection_bounds(parent, child), 3.0);
+            }
             for s in &self.moving {
                 // Resizing also scales stroke widths and arrow heads.
                 let grow = self.scale_x.abs().max(self.scale_y.abs()).max(1.0);
@@ -1781,6 +2186,9 @@ impl Editor {
             }
         }
         if let Some(extra) = self.transform_extra() {
+            for (parent, child, color) in self.live_connections() {
+                render::draw_connection(t, parent, child, color);
+            }
             for s in &self.moving {
                 render::draw_shape(t, s, 1.0, Some(extra));
             }
@@ -1931,6 +2339,9 @@ impl Editor {
         Some(d)
     }
 }
+
+#[cfg(test)]
+mod board_objects_tests;
 
 #[cfg(test)]
 mod tests {
