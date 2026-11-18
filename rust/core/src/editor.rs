@@ -529,6 +529,10 @@ impl Editor {
         }
     }
 
+    /// How the board maps to screen pixels.
+    pub fn screen_view(&self) -> View {
+        self.view()
+    }
     fn view(&self) -> View {
         View { cam: self.camera, zoom: self.zoom, dpr: self.dpr }
     }

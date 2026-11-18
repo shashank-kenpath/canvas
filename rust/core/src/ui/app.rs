@@ -52,6 +52,8 @@ const PALETTE: [u32; 12] = [
     0xff1d1d1d, 0xff9fa8b2, 0xffe03131, 0xffe16919, 0xfff1ac4b, 0xff4cb05e, 0xff099268, 0xff4ba1f1,
     0xff4465e9, 0xffae3ec9, 0xffe085f4, 0xfff87777,
 ];
+/// How long the phone pad's box stays on the board after the phone last spoke.
+const PAD_TTL: u64 = 15_000;
 const PEN_WIDTHS: [f64; 4] = [2.0, 3.5, 5.0, 10.0];
 const HL_WIDTHS: [f64; 4] = [8.0, 14.0, 22.0, 32.0];
 const SHAPES: [(Tool, Ico, &str); 9] = [
@@ -559,6 +561,8 @@ enum Act {
     Claude,
     Remote,
     Export,
+    /// Ends the phone pad and makes its link stop working.
+    PadDisconnect,
     Copy(String),
     CopyCode(String),
     /// A surface that takes touches so they do not fall through.
@@ -1466,6 +1470,7 @@ impl App {
             self.tool_tip.as_ref().map(|t| t.2),
             self.hold_deadline(),
             self.animation_deadline(),
+            self.pad_seen.filter(|_| self.pad_shown()).map(|t| t + PAD_TTL),
         ]
         .into_iter()
         .flatten()
@@ -1489,6 +1494,9 @@ impl App {
             self.tool_tip = None;
         }
         self.take_holds();
+        if self.pad_seen.is_some() && !self.pad_shown() {
+            self.pad_seen = None;
+        }
         if self.save_due.is_some_and(|due| self.now >= due) {
             if self.ed.pointer_down_now() {
                 self.save_due = Some(self.now + 700);
@@ -2797,6 +2805,11 @@ impl App {
                 self.lan_ip = net::local_ip();
                 self.panel(PanelKind::Remote);
             }
+            Act::PadDisconnect => {
+                self.set(|s| s.remote_key = random_token(16));
+                self.pad_seen = None;
+                self.show_toast("Phone disconnected");
+            }
             Act::Export => {
                 self.dismiss();
                 let title = self
@@ -3493,11 +3506,21 @@ impl App {
         if self.pad_shown() {
             let [x, y, w, h] = self.pad_area;
             let (sw, sh) = (self.w as f32, self.h as f32);
-            ui.push(
-                scale_rect(Rf::new(x * sw, y * sh, w * sw, h * sh), 1.0 / ui.u),
-                Look::PadArea,
-                None,
-            );
+            let area = scale_rect(Rf::new(x * sw, y * sh, w * sw, h * sh), 1.0 / ui.u);
+            ui.push(area, Look::PadArea, None);
+            if area.w > 300.0 && area.h > 80.0 {
+                ui.push(
+                    Rf::new(area.x + 12.0, area.y + 12.0, 272.0, 52.0),
+                    Look::Button {
+                        icon: Some(Ico::Close),
+                        text: "Disconnect phone".into(),
+                        kind: ButtonKind::Secondary,
+                        pill: true,
+                        level: 1,
+                    },
+                    Some(Act::PadDisconnect),
+                );
+            }
         }
         let s = c.left.h / 88.0;
         let relative = |r: Rf, x: f32, y: f32, w: f32, h: f32, f: f32| {
@@ -4329,6 +4352,10 @@ impl App {
         let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64).map(|f| f as f32);
         match path {
             "/r/state" => {}
+            "/r/bye" => {
+                self.pad_seen = None;
+                return net::Resp::empty(204);
+            }
             "/r/area" if req.method == "POST" => {
                 // The phone sends the box's x, y and width; its height follows
                 // the pad's shape so writing is not stretched.
@@ -4356,11 +4383,42 @@ impl App {
                     Pt::new(fx as f64, fy as f64),
                 );
             }
-            "/r/cmd" if req.method == "POST" && board => match body.get("cmd").and_then(Value::as_str) {
-                Some("undo") => self.ed.undo(),
-                Some("redo") => self.ed.redo(),
-                _ => {}
-            },
+            "/r/cmd" if req.method == "POST" && board => {
+                match body.get("cmd").and_then(Value::as_str) {
+                    Some("undo") => self.ed.undo(),
+                    Some("redo") => self.ed.redo(),
+                    _ => {}
+                }
+                match body.get("tool").and_then(Value::as_str) {
+                    Some("pen") => self.choose_tool(Tool::Pen, PenMode::Ink, false),
+                    Some("highlighter") => self.choose_tool(Tool::Pen, PenMode::Ink, true),
+                    Some("shapes") => self.choose_tool(Tool::Pen, PenMode::Shape, false),
+                    Some("text") => self.choose_tool(Tool::Pen, PenMode::Write, false),
+                    _ => {}
+                }
+                if let Some(c) = body.get("color").and_then(Value::as_u64) {
+                    if let Some(&c) = PALETTE.iter().find(|p| **p == c as u32) {
+                        self.run(Act::Color(c));
+                    }
+                }
+                if let Some(i) = body.get("width").and_then(Value::as_u64) {
+                    if (i as usize) < PEN_WIDTHS.len() {
+                        self.run(Act::Width(i as usize));
+                    }
+                }
+                self.take_editor_events();
+            }
+            "/r/view" if board => {
+                let want = req.query.get("w").and_then(|s| s.parse::<u32>().ok()).unwrap_or(1000).clamp(200, 1600);
+                return match self.pad_view(want) {
+                    Some((w, h, jpg)) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(jpg);
+                        net::Resp::json(200, &json!({ "doc": self.doc_gen, "w": w, "h": h, "jpg": b64 }))
+                    }
+                    None => net::Resp::empty(503),
+                };
+            }
             "/r/input" if req.method == "POST" && board => {
                 let erase = body.get("erase").and_then(Value::as_bool).unwrap_or(false);
                 let events = body.get("events").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -4393,6 +4451,14 @@ impl App {
         if !was_shown {
             self.full = true;
         }
+        let v = self.ed.screen_view();
+        let (stroke, widths) = if self.highlighter {
+            (&self.hl_style, &HL_WIDTHS)
+        } else {
+            (&self.pen_style, &PEN_WIDTHS)
+        };
+        let width = widths.iter().position(|x| (*x - stroke.width).abs() < 1e-6);
+        let color = stroke.color;
         net::Resp::json(
             200,
             &json!({
@@ -4400,13 +4466,59 @@ impl App {
                 "area": self.pad_area,
                 "screen": [self.w, self.h],
                 "title": self.board.as_ref().map(|b| b.title.clone()),
+                "doc": self.doc_gen,
+                "view": [v.cam.x, v.cam.y, v.zoom, v.dpr],
+                "strokeWidth": self.ed.stroke_width(),
+                "tool": self.pad_tool(),
+                "color": color,
+                "width": width,
+                "palette": PALETTE,
             }),
         )
     }
 
+    /// The tool as the phone pad names it.
+    fn pad_tool(&self) -> &'static str {
+        match (self.ed.tool(), self.ed.pen_mode()) {
+            (Tool::Pen, _) if self.highlighter => "highlighter",
+            (Tool::Pen, PenMode::Ink) => "pen",
+            (Tool::Pen, PenMode::Shape) => "shapes",
+            (Tool::Pen, PenMode::Write) => "text",
+            (Tool::Eraser, _) => "eraser",
+            _ => "other",
+        }
+    }
+
+    /// The board under the phone pad's box, `want` pixels wide, as JPEG.
+    fn pad_view(&self, want: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let [ax, ay, aw, ah] = self.pad_area;
+        let (bw, bh) = (aw * self.w as f32, ah * self.h as f32);
+        if bw < 1.0 || bh < 1.0 {
+            return None;
+        }
+        let w = want;
+        let h = ((w as f32 * bh / bw).round() as u32).clamp(1, 4000);
+        let scale = (w as f32 / bw) as f64;
+        let v = self.ed.screen_view();
+        let origin = Pt::new((ax * self.w as f32) as f64, (ay * self.h as f32) as f64);
+        let view = render::View {
+            cam: (v.cam * v.dpr - origin) * scale,
+            zoom: v.zoom * v.dpr * scale,
+            dpr: 1.0,
+        };
+        let rgba = render::view_image(self.ed.doc.shapes(), w, h, view);
+        let img = image::RgbaImage::from_raw(w, h, rgba)?;
+        let rgb = image::DynamicImage::ImageRgba8(img).to_rgb8();
+        let mut jpg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 82)
+            .encode_image(&rgb)
+            .ok()?;
+        Some((w, h, jpg))
+    }
+
     /// The phone pad's box shows on the board while the pad is in use.
     fn pad_shown(&self) -> bool {
-        self.pad_seen.is_some_and(|t| self.now.saturating_sub(t) < 120_000)
+        self.pad_seen.is_some_and(|t| self.now.saturating_sub(t) < PAD_TTL)
     }
 
     fn lan_mcp(&self) -> Option<String> {
@@ -4504,10 +4616,23 @@ impl App {
                 content.y = text::FONT_NAMES.len().div_ceil(cols) as f32 * (80.0 + gap) - gap;
             }
             PanelKind::Remote => {
-                content.para("Scan with a phone on the same Wi-Fi to use it as a writing pad. What you write lands in the blue box on the board; move the box or the board from the phone.", TEXT2);
+                content.para("Scan with a phone on the same Wi-Fi to use it as a writing pad. The phone shows the part of the board inside the blue box, and what you write lands there. Pick the pen, colour and size, or move the box or the board, from the phone.", TEXT2);
                 if let Some(url) = self.remote_url() {
                     content.qr(&url);
                     content.copy_code(&url);
+                    content.push(
+                        64.0,
+                        Look::Button {
+                            icon: Some(Ico::Close),
+                            text: "Disconnect phone".into(),
+                            kind: ButtonKind::Secondary,
+                            pill: false,
+                            level: 0,
+                        },
+                        Some(Act::PadDisconnect),
+                    );
+                    content.y += 8.0;
+                    content.para("Disconnecting gives this board a new code, so the old link stops working.", TEXT2);
                 } else {
                     content.para("Connect to Wi-Fi or Ethernet to use the phone remote.", TEXT2);
                 }
@@ -5576,11 +5701,6 @@ impl App {
             Look::PadArea => {
                 p.rrect(r, 12.0 * u, 0x0f2563eb);
                 p.rrect_line(r, 12.0 * u, 0xcc2563eb, 3.0 * u);
-                let tag = Rf::new(r.x + 12.0 * u, r.y + 12.0 * u, 96.0 * u, 34.0 * u);
-                if r.w > 130.0 * u && r.h > 60.0 * u {
-                    p.rrect(tag, 17.0 * u, 0xff2563eb);
-                    line_text(p, tag, Face::Bold, 18.0 * u, "Phone", 0xffffffff, true);
-                }
             }
             Look::Notch(side) => {
                 let vertices = match side {
@@ -6120,6 +6240,34 @@ mod tests {
         req(&mut app, "POST", "/r/cmd", &[("k", &key)], json!({"cmd": "undo"}));
         settle(&mut app);
         assert_eq!(app.ed.doc.shapes().len(), 0);
+
+        // Tools, colour and size come from the phone too.
+        let (_, state) = req(&mut app, "POST", "/r/cmd", &[("k", &key)], json!({"tool": "highlighter", "color": PALETTE[2], "width": 1}));
+        assert_eq!(state["tool"], "highlighter");
+        assert_eq!(state["color"], PALETTE[2]);
+        assert_eq!(state["width"], 1);
+        let (_, state) = req(&mut app, "POST", "/r/cmd", &[("k", &key)], json!({"tool": "shapes"}));
+        assert_eq!(state["tool"], "shapes");
+        // The phone sees the board under its box.
+        let (status, view) = req(&mut app, "GET", "/r/view", &[("k", &key), ("w", "400")], Value::Null);
+        assert_eq!(status, 200);
+        assert_eq!(view["w"], 400);
+        assert_eq!(view["h"], 400);
+        assert_eq!(&net::unbase64(view["jpg"].as_str().unwrap())[..2], &[0xff, 0xd8]);
+
+        // Closing the page hides the box; it also goes on its own.
+        assert!(app.pad_shown());
+        assert_eq!(req(&mut app, "POST", "/r/bye", &[("k", &key)], Value::Null).0, 204);
+        assert!(!app.pad_shown());
+        req(&mut app, "GET", "/r/state", &[("k", &key)], Value::Null);
+        assert!(app.pad_shown());
+        app.now += PAD_TTL + 1;
+        settle(&mut app);
+        assert!(!app.pad_shown() && app.pad_seen.is_none());
+        // Disconnecting from the TV retires the link.
+        app.run(Act::PadDisconnect);
+        assert_ne!(app.settings.remote_key, key);
+        assert_eq!(req(&mut app, "GET", "/r/state", &[("k", &key)], Value::Null).0, 403);
         let _ = std::fs::remove_dir_all(dir);
     }
 

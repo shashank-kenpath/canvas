@@ -539,7 +539,19 @@ pub fn thumbnail(shapes: &[Arc<Shape>], w: u32, h: u32) -> Vec<u8> {
         let c = b.center();
         view = View { cam: Pt::new(w as f64 / 2.0 - c.x * zoom, h as f64 / 2.0 - c.y * zoom), zoom, dpr: 1.0 };
     }
-    if let Some(mut t) = Target::new(&mut buf, region, view) {
+    draw_view(shapes, &mut buf, region, view);
+    buf
+}
+
+/// Renders shapes as seen through `view` into a `w` x `h` RGBA image.
+pub fn view_image(shapes: &[Arc<Shape>], w: u32, h: u32, view: View) -> Vec<u8> {
+    let mut buf = vec![0u8; w as usize * h as usize * 4];
+    draw_view(shapes, &mut buf, IRect::new(0, 0, w as i32, h as i32), view);
+    buf
+}
+
+fn draw_view(shapes: &[Arc<Shape>], buf: &mut [u8], region: IRect, view: View) {
+    if let Some(mut t) = Target::new(buf, region, view) {
         draw_background(&mut t, false);
         for (parent, child) in mindmap::connections(shapes) {
             draw_connection(&mut t, parent.bounds(), child.bounds(), child.color);
@@ -548,5 +560,4 @@ pub fn thumbnail(shapes: &[Arc<Shape>], w: u32, h: u32) -> Vec<u8> {
             draw_shape(&mut t, s, 1.0, None);
         }
     }
-    buf
 }

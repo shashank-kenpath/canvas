@@ -3,77 +3,105 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
-<meta name="theme-color" content="#eef0f4">
+<meta name="theme-color" content="#ffffff">
 <title>Inkboard pad</title>
 <style>
-  :root { --accent: #2563eb; --ink: #1f2430; --muted: #6b7280; --bar: #ffffff; --bg: #eef0f4; }
+  :root { --accent: #2563eb; --ink: #1f2430; --muted: #6b7280; --bg: #eef0f4; --line: #dfe2e8; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); overflow: hidden;
-    overscroll-behavior: none; font: 15px system-ui, -apple-system, sans-serif;
+    overscroll-behavior: none; font: 14px system-ui, -apple-system, sans-serif;
     -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
   body { display: flex; flex-direction: column; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
-  #bar { display: flex; align-items: center; gap: 6px; padding: 8px; background: var(--bar);
-    box-shadow: 0 1px 0 #dfe2e8; flex-wrap: wrap; }
-  .seg { display: flex; background: var(--bg); border-radius: 12px; padding: 3px; gap: 2px; }
+  header { background: #fff; box-shadow: 0 1px 0 var(--line); }
+  .row { display: flex; align-items: center; gap: 6px; padding: 6px 8px; overflow-x: auto; scrollbar-width: none; }
+  .row::-webkit-scrollbar { display: none; }
+  .seg { display: flex; background: var(--bg); border-radius: 12px; padding: 3px; gap: 2px; flex: none; }
   button { border: 0; background: transparent; color: var(--ink); font: inherit; font-weight: 600;
-    padding: 9px 12px; border-radius: 10px; min-height: 40px; }
+    padding: 8px 11px; border-radius: 9px; min-height: 38px; white-space: nowrap; flex: none; }
   .seg button.on { background: var(--accent); color: #fff; }
   .act { background: var(--bg); }
   button:active { opacity: .7; }
+  .sep { width: 1px; align-self: stretch; background: var(--line); margin: 4px 2px; flex: none; }
+  .sw { width: 30px; height: 30px; min-height: 0; padding: 0; border-radius: 50%; border: 3px solid #fff;
+    box-shadow: 0 0 0 1px var(--line); }
+  .sw.on { box-shadow: 0 0 0 2px var(--accent); }
+  .wd { width: 38px; height: 38px; padding: 0; display: flex; align-items: center; justify-content: center; background: var(--bg); }
+  .wd.on { background: #dbe6fd; }
+  .wd i { display: block; border-radius: 50%; background: var(--ink); }
   #status { margin-left: auto; display: flex; align-items: center; gap: 6px; color: var(--muted);
-    font-size: 13px; max-width: 40%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    font-size: 13px; white-space: nowrap; flex: none; padding-left: 6px; }
   #dot { width: 8px; height: 8px; border-radius: 50%; background: #e5484d; flex: none; }
   #dot.on { background: #30a46c; }
   #wrap { flex: 1; position: relative; margin: 8px; }
   canvas { position: absolute; inset: 0; width: 100%; height: 100%; border-radius: 14px;
     background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.12); touch-action: none; }
-  #hint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-    text-align: center; padding: 24px; color: var(--muted); pointer-events: none; line-height: 1.5; }
+  #hint { position: absolute; left: 0; right: 0; bottom: 14px; text-align: center; padding: 0 24px;
+    color: var(--muted); pointer-events: none; line-height: 1.4; }
+  #gone { position: fixed; inset: 0; background: var(--bg); display: none; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; text-align: center; padding: 24px; z-index: 5; }
+  #gone button { background: var(--accent); color: #fff; padding: 10px 18px; }
 </style>
 </head>
 <body>
-<div id="bar">
-  <div class="seg" id="modes">
-    <button data-m="write" class="on">Write</button>
-    <button data-m="erase">Erase</button>
-    <button data-m="box">Move box</button>
-    <button data-m="board">Move board</button>
+<header>
+  <div class="row">
+    <div class="seg" id="tools">
+      <button data-t="pen">Pen</button>
+      <button data-t="highlighter">Marker</button>
+      <button data-t="shapes">Shapes</button>
+      <button data-t="text">To text</button>
+      <button data-t="eraser">Eraser</button>
+    </div>
+    <div class="seg" id="moves">
+      <button data-m="box">Move box</button>
+      <button data-m="board">Move board</button>
+    </div>
+    <button class="act" id="undo">Undo</button>
+    <button class="act" id="redo">Redo</button>
+    <div id="status"><span id="dot"></span><span id="title">Connecting…</span></div>
+    <button class="act" id="bye">Disconnect</button>
   </div>
-  <button class="act" id="undo">Undo</button>
-  <button class="act" id="redo">Redo</button>
-  <button class="act" id="clear">Clear pad</button>
-  <div id="status"><span id="dot"></span><span id="title">Connecting…</span></div>
-</div>
+  <div class="row" id="style"></div>
+</header>
 <div id="wrap"><canvas id="c"></canvas><div id="hint"></div></div>
+<div id="gone"><div id="goneText">Disconnected from the board.</div><button id="again">Connect again</button></div>
 <script>
 (() => {
-  const cv = document.getElementById('c'), g = cv.getContext('2d');
-  const hint = document.getElementById('hint'), dot = document.getElementById('dot'), title = document.getElementById('title');
+  const $ = id => document.getElementById(id);
+  const cv = $('c'), g = cv.getContext('2d');
   let key = new URLSearchParams(location.hash.slice(1)).get('k');
   try { if (key) localStorage.setItem('k', key); else key = localStorage.getItem('k'); } catch (e) {}
   const q = '?k=' + encodeURIComponent(key || '');
-  if (!key) { hint.textContent = 'Scan the QR code on the board again.'; return; }
 
-  let mode = 'write', dpr = 1, W = 1, H = 1;
-  let area = [0.25, 0.25, 0.5, 0.5], screenWH = [16, 9], board = false;
-  let strokes = [];              // local ink: {pts:[[x,y]], erase}
-  const live = new Map();        // pointerId -> {slot, stroke, last:[x,y]}
+  // What the TV tells us.
+  let st = { board: false, area: [0.25, 0.25, 0.5, 0.5], screen: [16, 9], doc: 0, view: [0, 0, 1, 1],
+             tool: 'pen', color: 0xff1d1d1d, width: 1, strokeWidth: 3.5, palette: [] };
+  let move = null;               // null, 'box' or 'board'
+  let W = 1, H = 1, dpr = 1, alive = true;
+  let strokes = [];              // local ink waiting for the board's own picture
+  const live = new Map();
+  let bg = null, bgKey = '', bgT = { s: 1, x: 0, y: 0 }, loading = false;
+
+  function gone(text) {
+    alive = false; $('goneText').textContent = text; $('gone').style.display = 'flex';
+  }
+  if (!key) { gone('Scan the QR code on the board to connect.'); $('again').style.display = 'none'; return; }
 
   // ---------- server
   async function call(path, body) {
+    if (!alive) return null;
     try {
       const r = await fetch('/r/' + path + q, body === undefined ? { cache: 'no-store' } :
         { method: 'POST', body: JSON.stringify(body) });
-      if (r.status === 403) { setStatus(false, 'Link out of date — scan the QR code again'); return null; }
+      if (r.status === 403) { gone('This board disconnected the phone. Scan its QR code again to reconnect.'); return null; }
       const j = await r.json();
-      area = j.area; screenWH = j.screen; board = j.board;
-      setStatus(true, board ? (j.title || 'Board') : 'Open a board on the screen');
+      st = j;
+      $('dot').className = 'on';
+      $('title').textContent = j.board ? (j.title || 'Board') : 'No board open';
+      paintBar(); maybeView(); showHint();
       return j;
-    } catch (e) { setStatus(false, 'Reconnecting…'); return null; }
+    } catch (e) { $('dot').className = ''; $('title').textContent = 'Reconnecting…'; return null; }
   }
-  function setStatus(on, text) { dot.className = on ? 'on' : ''; title.textContent = text; showHint(); }
-
-  // One request in flight per kind; later ones merge into the next.
   const lanes = {};
   function send(kind, make) {
     const l = lanes[kind] || (lanes[kind] = { busy: false, pending: null });
@@ -83,22 +111,73 @@
   async function pump(kind, l) {
     while (l.pending) {
       const body = l.pending; l.pending = null; l.busy = true;
-      await call(kind, body);
+      const j = await call(kind, body);
       l.busy = false;
+      if (j && body.done) for (const s of body.done) s.doc = j.doc;
     }
-    if (kind === 'area' || kind === 'pan') draw();
   }
 
-  // ---------- touches for writing: [phase, slot, x, y, ms]
-  let t0 = 0;
-  function ev(phase, slot, x, y) {
-    send('input', prev => {
-      const p = prev || { erase: mode === 'erase', events: [] };
-      if (!p.events.length) t0 = performance.now();
-      p.events.push([phase, slot, +(x / W).toFixed(5), +(y / H).toFixed(5), Math.round(performance.now() - t0)]);
-      return p;
+  // The board under the box, refreshed when anything there changes.
+  function viewKey() { return [st.doc, st.area.join(), st.view.join(), Math.round(W)].join('|'); }
+  async function maybeView() {
+    if (!st.board || loading || move === 'box' || live.size) return;
+    const k = viewKey(); if (k === bgKey) return;
+    loading = true;
+    try {
+      const r = await fetch('/r/view' + q + '&w=' + Math.min(1600, Math.round(W * dpr)), { cache: 'no-store' });
+      if (r.status === 200) {
+        const j = await r.json();
+        const im = new Image(); im.src = 'data:image/jpeg;base64,' + j.jpg; await im.decode();
+        bg = im; bgKey = k; bgT = { s: 1, x: 0, y: 0 };
+        strokes = strokes.filter(s => s.doc === undefined || j.doc < s.doc || s.live);
+        draw();
+      }
+    } catch (e) {}
+    loading = false;
+    if (viewKey() !== bgKey) setTimeout(maybeView, 50);
+  }
+
+  // ---------- toolbar
+  function hex(c) { return '#' + ((c >>> 0) & 0xffffff).toString(16).padStart(6, '0'); }
+  let barKey = '';
+  function paintBar() {
+    document.querySelectorAll('#tools button').forEach(b => b.classList.toggle('on', !move && b.dataset.t === st.tool));
+    document.querySelectorAll('#moves button').forEach(b => b.classList.toggle('on', move === b.dataset.m));
+    const k = [st.palette.join(), st.color, st.width, st.tool].join('|');
+    if (k === barKey) return; barKey = k;
+    const row = $('style'); row.innerHTML = '';
+    (st.palette || []).forEach(c => {
+      const b = document.createElement('button');
+      b.className = 'sw' + (c === st.color ? ' on' : ''); b.style.background = hex(c);
+      b.onclick = () => { st.color = c; paintBar(); send('cmd', p => Object.assign(p || {}, { color: c })); };
+      row.appendChild(b);
+    });
+    const sep = document.createElement('div'); sep.className = 'sep'; row.appendChild(sep);
+    [4, 7, 10, 16].forEach((d, i) => {
+      const b = document.createElement('button');
+      b.className = 'wd' + (i === st.width ? ' on' : '');
+      b.innerHTML = '<i style="width:' + d + 'px;height:' + d + 'px"></i>';
+      b.onclick = () => { st.width = i; paintBar(); send('cmd', p => Object.assign(p || {}, { width: i })); };
+      row.appendChild(b);
     });
   }
+  document.querySelectorAll('#tools button').forEach(b => b.onclick = () => {
+    move = null; st.tool = b.dataset.t;
+    if (b.dataset.t !== 'eraser') send('cmd', p => Object.assign(p || {}, { tool: b.dataset.t }));
+    paintBar(); showHint(); draw(); maybeView();
+  });
+  document.querySelectorAll('#moves button').forEach(b => b.onclick = () => {
+    move = move === b.dataset.m ? null : b.dataset.m; paintBar(); showHint(); draw(); maybeView();
+  });
+  $('undo').onclick = () => send('cmd', () => ({ cmd: 'undo' }));
+  $('redo').onclick = () => send('cmd', () => ({ cmd: 'redo' }));
+  function bye() { try { navigator.sendBeacon('/r/bye' + q, ''); } catch (e) {} }
+  $('bye').onclick = () => { bye(); gone('Disconnected from the board.'); };
+  $('again').onclick = () => { $('gone').style.display = 'none'; alive = true; call('state').then(size); };
+  addEventListener('pagehide', bye);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) bye(); else if (alive) call('state');
+  });
 
   // ---------- drawing
   function size() {
@@ -106,168 +185,159 @@
     const r = cv.getBoundingClientRect();
     W = r.width; H = r.height;
     cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
-    sendArea(area[0], area[1], area[2]);
+    sendArea(st.area[0], st.area[1], st.area[2]);
     draw();
   }
   function sendArea(x, y, w) { send('area', () => ({ x, y, w, aspect: W / H })); }
-
-  function frame() {   // the screen drawn inside the pad, for Move box
-    const a = screenWH[0] / screenWH[1], pad = 16;
+  function frameRect() {
+    const a = st.screen[0] / st.screen[1], pad = 16;
     let fw = W - 2 * pad, fh = fw / a;
     if (fh > H - 2 * pad) { fh = H - 2 * pad; fw = fh * a; }
     return { x: (W - fw) / 2, y: (H - fh) / 2, w: fw, h: fh };
   }
+  // Board units to pad pixels, so local ink matches the board's width.
+  function padScale() { return st.view[2] * st.view[3] * W / (st.area[2] * st.screen[0]); }
+
   function draw() {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.clearRect(0, 0, W, H);
-    if (mode === 'box') {
-      const f = frame();
+    if (move === 'box') {
+      const f = frameRect(), a = st.area;
       g.fillStyle = '#f3f4f7'; g.strokeStyle = '#c9cdd6'; g.lineWidth = 2;
-      roundRect(f.x, f.y, f.w, f.h, 10); g.fill(); g.stroke();
-      g.fillStyle = '#9aa1ad'; g.font = '13px system-ui'; g.fillText('Board screen', f.x + 10, f.y + 20);
-      const bx = f.x + area[0] * f.w, by = f.y + area[1] * f.h, bw = area[2] * f.w, bh = area[3] * f.h;
+      rr(f.x, f.y, f.w, f.h, 10); g.fill(); g.stroke();
+      g.fillStyle = '#9aa1ad'; g.font = '13px system-ui'; g.fillText('TV screen', f.x + 10, f.y + 20);
       g.fillStyle = 'rgba(37,99,235,.12)'; g.strokeStyle = '#2563eb'; g.lineWidth = 3;
-      roundRect(bx, by, bw, bh, 8); g.fill(); g.stroke();
+      rr(f.x + a[0] * f.w, f.y + a[1] * f.h, a[2] * f.w, a[3] * f.h, 8); g.fill(); g.stroke();
       return;
     }
-    // faint dots like paper
-    g.fillStyle = '#e3e6ec';
-    for (let x = 24; x < W; x += 32) for (let y = 24; y < H; y += 32) g.fillRect(x - 1, y - 1, 2, 2);
+    if (bg) {
+      g.save(); g.translate(bgT.x, bgT.y); g.scale(bgT.s, bgT.s);
+      g.drawImage(bg, 0, 0, W, H); g.restore();
+    }
     g.lineCap = g.lineJoin = 'round';
     for (const s of strokes) {
-      g.strokeStyle = s.erase ? 'rgba(229,72,77,.25)' : '#1f2430';
-      g.lineWidth = s.erase ? 22 : 3;
+      g.strokeStyle = s.erase ? 'rgba(229,72,77,.3)' : s.color;
+      g.lineWidth = s.width;
       g.beginPath();
       s.pts.forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1]));
       if (s.pts.length === 1) g.lineTo(s.pts[0][0] + .1, s.pts[0][1]);
       g.stroke();
     }
   }
-  function roundRect(x, y, w, h, r) {
+  function rr(x, y, w, h, r) {
     g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
     g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
   }
   function showHint() {
-    hint.textContent = !board ? 'Open a board on the screen to start.'
-      : mode === 'box' ? 'Drag the blue box to choose where you write. Pinch to make it bigger or smaller.'
-      : mode === 'board' ? 'Drag to move the board. Pinch to zoom.'
-      : strokes.length ? '' : 'Write here. It appears inside the blue box on the board. Two fingers move the board.';
-    hint.style.display = hint.textContent ? '' : 'none';
-    hint.style.top = mode === 'box' ? 'auto' : '0';
-  }
-  function eraseLocal(p) {
-    strokes = strokes.filter(s => s.erase || !s.pts.some(q => Math.hypot(q[0] - p[0], q[1] - p[1]) < 14));
+    const h = !st.board ? 'Open a board on the TV to start.'
+      : move === 'box' ? 'Drag the blue box to choose where you write. Pinch to resize it.'
+      : move === 'board' ? 'Drag to move the board. Pinch to zoom.'
+      : bg || strokes.length ? '' : 'Write here. It lands inside the blue box on the TV. Two fingers move the board.';
+    $('hint').textContent = h; $('hint').style.display = h ? '' : 'none';
   }
 
-  // ---------- gestures
+  // ---------- touches
+  let t0 = 0;
+  function ev(phase, slot, x, y, done) {
+    send('input', prev => {
+      const p = prev || { erase: st.tool === 'eraser', events: [], done: [] };
+      if (!p.events.length) t0 = performance.now();
+      p.events.push([phase, slot, +(x / W).toFixed(5), +(y / H).toFixed(5), Math.round(performance.now() - t0)]);
+      if (done) p.done.push(done);
+      return p;
+    });
+  }
   const pos = e => { const r = cv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
-  let gesture = null;   // two-finger or move state
-
+  let gesture = null;
   function pair() {
     const ps = [...live.values()].slice(0, 2).map(v => v.last);
     return { c: [(ps[0][0] + ps[1][0]) / 2, (ps[0][1] + ps[1][1]) / 2], d: Math.hypot(ps[0][0] - ps[1][0], ps[0][1] - ps[1][1]) || 1 };
   }
-  function panBoard(dx, dy, scale, c) {
-    // The pad shows the box, so moving a finger across the whole pad moves
-    // the board by the box's width.
-    send('pan', prev => {
-      const p = prev || { dx: 0, dy: 0, scale: 1 };
-      p.dx += dx / W * area[2]; p.dy += dy / H * area[3]; p.scale *= scale;
-      p.fx = area[0] + c[0] / W * area[2]; p.fy = area[1] + c[1] / H * area[3];
+  function panBoard(dx, dy, k, c) {
+    const a = st.area;
+    send('pan', p => {
+      p = p || { dx: 0, dy: 0, scale: 1 };
+      p.dx += dx / W * a[2]; p.dy += dy / H * a[3]; p.scale *= k;
+      p.fx = a[0] + c[0] / W * a[2]; p.fy = a[1] + c[1] / H * a[3];
       return p;
     });
-    if (strokes.length) { strokes = []; }
+    // move the old picture along until the new one comes
+    bgT = { s: bgT.s * k, x: k * (bgT.x - c[0]) + c[0] + dx, y: k * (bgT.y - c[1]) + c[1] + dy };
+    strokes = strokes.filter(s => s.live);
+    draw();
   }
-  function moveBox(dx, dy, scale) {
-    const f = frame();
-    let w = Math.min(1, Math.max(0.08, area[2] * scale));
-    let h = area[3] * (w / area[2]);
-    let x = area[0] + dx / f.w - (w - area[2]) / 2;
-    let y = area[1] + dy / f.h - (h - area[3]) / 2;
+  function moveBox(dx, dy, k) {
+    const f = frameRect(), a = st.area;
+    const w = Math.min(1, Math.max(0.08, a[2] * k)), h = a[3] * (w / a[2]);
+    let x = a[0] + dx / f.w - (w - a[2]) / 2, y = a[1] + dy / f.h - (h - a[3]) / 2;
     x = Math.min(Math.max(0, x), 1 - w); y = Math.min(Math.max(0, y), 1 - Math.min(1, h));
-    area = [x, y, w, h];
-    sendArea(x, y, w);
-    if (strokes.length) strokes = [];
+    st.area = [x, y, w, h]; sendArea(x, y, w);
+    bg = null; strokes = [];
     draw();
   }
 
   cv.addEventListener('pointerdown', e => {
+    if (!alive) return;
     cv.setPointerCapture(e.pointerId);
     const p = pos(e);
     let slot = 0; while ([...live.values()].some(v => v.slot === slot)) slot++;
     const v = { slot, last: p, stroke: null };
     live.set(e.pointerId, v);
-    if (!board) return;
+    if (!st.board) return;
     if (live.size === 2) {
-      // a second finger turns any stroke in progress into a gesture
       for (const o of live.values()) if (o.stroke) {
         ev(3, o.slot, ...o.last); strokes.splice(strokes.indexOf(o.stroke), 1); o.stroke = null;
       }
       gesture = pair(); draw(); return;
     }
-    if (live.size > 2) return;
-    if (mode === 'write' || mode === 'erase') {
-      v.stroke = { pts: [p], erase: mode === 'erase' };
-      strokes.push(v.stroke);
-      if (mode === 'erase') eraseLocal(p);
-      ev(0, slot, ...p); showHint(); draw();
-    }
+    if (live.size > 2 || move) return;
+    const erase = st.tool === 'eraser', hl = st.tool === 'highlighter';
+    const sc = padScale();
+    v.stroke = { pts: [p], erase, live: true,
+      color: hl ? hex(st.color) + '73' : hex(st.color),
+      width: erase ? 22 : Math.max(1.5, st.strokeWidth * sc) };
+    strokes.push(v.stroke);
+    ev(0, slot, ...p); showHint(); draw();
   });
   cv.addEventListener('pointermove', e => {
-    const v = live.get(e.pointerId); if (!v || !board) return;
+    const v = live.get(e.pointerId); if (!v || !st.board) return;
     const list = (e.getCoalescedEvents && e.getCoalescedEvents().length) ? e.getCoalescedEvents() : [e];
-    if (live.size >= 2) {
+    if (live.size >= 2 && gesture) {
       v.last = pos(list[list.length - 1]);
-      const now = pair(), scale = now.d / gesture.d;
-      const dx = now.c[0] - gesture.c[0], dy = now.c[1] - gesture.c[1];
-      if (mode === 'box') moveBox(dx, dy, scale); else panBoard(dx, dy, scale, now.c);
-      gesture = now; draw(); return;
+      const now = pair(), k = now.d / gesture.d, dx = now.c[0] - gesture.c[0], dy = now.c[1] - gesture.c[1];
+      if (move === 'box') moveBox(dx, dy, k); else panBoard(dx, dy, k, now.c);
+      gesture = now; return;
     }
     if (v.stroke) {
-      for (const c of list) {
-        const p = pos(c); v.stroke.pts.push(p); v.last = p; ev(1, v.slot, ...p);
-        if (v.stroke.erase) eraseLocal(p);
-      }
+      for (const c of list) { const p = pos(c); v.stroke.pts.push(p); v.last = p; ev(1, v.slot, ...p); }
       draw(); return;
     }
-    const p = pos(list[list.length - 1]);
-    const dx = p[0] - v.last[0], dy = p[1] - v.last[1]; v.last = p;
-    if (mode === 'box') moveBox(dx, dy, 1);
-    else if (mode === 'board') { panBoard(dx, dy, 1, p); draw(); }
+    const p = pos(list[list.length - 1]), dx = p[0] - v.last[0], dy = p[1] - v.last[1]; v.last = p;
+    if (move === 'box') moveBox(dx, dy, 1);
+    else if (move === 'board') panBoard(dx, dy, 1, p);
   });
   function end(cancel) {
     return e => {
       const v = live.get(e.pointerId); if (!v) return;
       live.delete(e.pointerId);
       if (v.stroke) {
-        ev(cancel ? 3 : 2, v.slot, ...pos(e));
-        if (v.stroke.erase) { strokes.splice(strokes.indexOf(v.stroke), 1); }
+        v.stroke.live = false;
+        if (cancel) strokes.splice(strokes.indexOf(v.stroke), 1);
+        ev(cancel ? 3 : 2, v.slot, ...pos(e), cancel ? null : v.stroke);
         draw();
       }
       if (live.size < 2) gesture = null;
       showHint();
+      if (!live.size) setTimeout(maybeView, 30);
     };
   }
   cv.addEventListener('pointerup', end(false));
   cv.addEventListener('pointercancel', end(true));
   cv.addEventListener('contextmenu', e => e.preventDefault());
 
-  // ---------- buttons
-  document.querySelectorAll('#modes button').forEach(b => b.onclick = () => {
-    mode = b.dataset.m;
-    document.querySelectorAll('#modes button').forEach(o => o.classList.toggle('on', o === b));
-    showHint(); draw();
-  });
-  document.getElementById('undo').onclick = () => {
-    for (let i = strokes.length - 1; i >= 0; i--) if (!strokes[i].erase) { strokes.splice(i, 1); break; }
-    send('cmd', () => ({ cmd: 'undo' })); draw(); showHint();
-  };
-  document.getElementById('redo').onclick = () => send('cmd', () => ({ cmd: 'redo' }));
-  document.getElementById('clear').onclick = () => { strokes = []; draw(); showHint(); };
-
   addEventListener('resize', () => setTimeout(size, 50));
   call('state').then(() => { size(); showHint(); });
-  setInterval(() => { if (!live.size) call('state').then(() => { if (mode === 'box') draw(); }); }, 4000);
+  setInterval(() => { if (alive && !document.hidden && !live.size) call('state'); }, 2000);
 })();
 </script>
 </body>
