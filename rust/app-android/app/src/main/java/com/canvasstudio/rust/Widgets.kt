@@ -28,7 +28,7 @@ class BoardSurface(context: Context) : SurfaceView(context) {
         samples[o + 2] = y * scale
         samples[o + 3] = (time - e.downTime).toFloat()
         samples[o + 4] = major * scale
-        samples[o + 5] = if (e.getToolType(p) == MotionEvent.TOOL_TYPE_STYLUS || e.getToolType(p) == MotionEvent.TOOL_TYPE_ERASER) 1f else 0f
+        samples[o + 5] = when (e.getToolType(p)) { MotionEvent.TOOL_TYPE_ERASER -> 2f; MotionEvent.TOOL_TYPE_STYLUS -> 1f; else -> 0f }
     }
     private fun one(action: Int, e: MotionEvent, p: Int) {
         put(0, e, p, e.getX(p), e.getY(p), e.eventTime, e.getTouchMajor(p))

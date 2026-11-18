@@ -111,6 +111,8 @@ pub trait Platform: Send {
     fn install_update(&mut self, _url: &str) {}
     /// Draw at the panel's full resolution instead of a capped one.
     fn set_full_resolution(&mut self, _on: bool) {}
+    /// Show live ink through a dedicated low-latency layer.
+    fn set_fast_ink(&mut self, _on: bool) {}
     /// Puts `text` on the clipboard.
     fn copy_text(&mut self, _text: &str) {}
     /// Saves a PNG picture to the device's Pictures.
@@ -128,6 +130,8 @@ pub struct Sample {
     pub time: u64,
     pub size: f32,
     pub stylus: bool,
+    /// The eraser end of a stylus.
+    pub eraser: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +269,9 @@ fn disk_worker(
 
 // ------------------------------------------------------------ settings
 
+/// How far ahead the live stroke is drawn for each prediction level, in ms.
+const PREDICT_MS: [f64; 4] = [0.0, 12.0, 24.0, 36.0];
+
 #[derive(Clone, PartialEq, Debug)]
 struct Settings {
     tidy: bool,
@@ -274,6 +281,14 @@ struct Settings {
     snap: bool,
     font: u8,
     full_res: bool,
+    /// Low-latency ink layer.
+    fast_ink: bool,
+    /// Ink prediction level, 0 (off) to 3.
+    predict: u8,
+    /// With a stylus, fingers pan instead of drawing.
+    pen_priority: bool,
+    /// Several fingers can write at once.
+    multi_ink: bool,
     lang: String,
     /// Secret part of the Claude (MCP) address.
     mcp_key: String,
@@ -346,6 +361,10 @@ impl Settings {
                 .unwrap_or(0)
                 .min(text::FONT_NAMES.len() as u64 - 1) as u8,
             full_res: v.get("fullRes").and_then(Value::as_bool).unwrap_or(false),
+            fast_ink: flag("fastInk"),
+            predict: v.get("predict").and_then(Value::as_u64).unwrap_or(1).min(3) as u8,
+            pen_priority: v.get("penPriority").and_then(Value::as_bool).unwrap_or(false),
+            multi_ink: v.get("multiInk").and_then(Value::as_bool).unwrap_or(false),
             lang: v
                 .get("lang")
                 .and_then(Value::as_str)
@@ -367,6 +386,8 @@ impl Settings {
         let v = serde_json::json!({
             "tidy": self.tidy, "typed": self.typed, "palm": self.palm, "grid": self.grid,
             "snap": self.snap, "font": self.font, "fullRes": self.full_res, "lang": self.lang,
+            "fastInk": self.fast_ink, "predict": self.predict, "penPriority": self.pen_priority,
+            "multiInk": self.multi_ink,
             "mcpKey": self.mcp_key, "relayId": self.relay_id, "relaySecret": self.relay_secret,
             "relayUrl": self.relay_url,
         });
@@ -386,6 +407,9 @@ enum Opt {
     Tidy,
     Typed,
     Palm,
+    FastInk,
+    PenPriority,
+    MultiInk,
 }
 
 /// What a control does.
@@ -419,6 +443,7 @@ enum Act {
     FontPanel,
     Font(u8),
     FullRes,
+    Predict(u8),
     Rename(String),
     AskDelete(String),
     Field,
@@ -952,6 +977,7 @@ impl App {
             app.platform.prepare_handwriting(&lang);
         }
         app.platform.set_full_resolution(app.settings.full_res);
+        app.platform.set_fast_ink(app.settings.fast_ink);
         app.platform.check_updates(false);
         app.send(Job::List);
         app
@@ -966,6 +992,9 @@ impl App {
         self.ed.set_auto_convert(s.tidy);
         self.ed.set_auto_text(s.typed);
         self.ed.set_palm_rejection(s.palm, None);
+        self.ed.set_pen_priority(s.pen_priority);
+        self.ed.set_multi_ink(s.multi_ink);
+        self.ed.set_prediction(PREDICT_MS[s.predict.min(3) as usize]);
         self.ed.set_grid(s.grid);
         self.ed.set_snap_shapes(s.snap);
         self.ed.set_font(s.font);
@@ -1450,6 +1479,7 @@ impl App {
         Contact {
             size: s.size.max(0.0) as f64,
             stylus: s.stylus,
+            eraser: s.eraser,
         }
     }
 
@@ -1712,6 +1742,9 @@ impl App {
                 let lang = self.settings.lang.clone();
                 self.platform.prepare_handwriting(&lang);
             }
+            if self.settings.fast_ink != before.fast_ink {
+                self.platform.set_fast_ink(self.settings.fast_ink);
+            }
             if self.settings.full_res != before.full_res {
                 self.platform.set_full_resolution(self.settings.full_res);
             }
@@ -1792,6 +1825,9 @@ impl App {
                     Opt::Tidy => s.tidy = !s.tidy,
                     Opt::Typed => s.typed = !s.typed,
                     Opt::Palm => s.palm = !s.palm,
+                    Opt::FastInk => s.fast_ink = !s.fast_ink,
+                    Opt::PenPriority => s.pen_priority = !s.pen_priority,
+                    Opt::MultiInk => s.multi_ink = !s.multi_ink,
                 });
                 self.dismiss();
             }
@@ -1802,6 +1838,10 @@ impl App {
             Act::FontPanel => self.panel(PanelKind::Fonts),
             Act::Font(f) => {
                 self.set(|s| s.font = f);
+                self.dismiss();
+            }
+            Act::Predict(level) => {
+                self.set(|s| s.predict = level.min(3));
                 self.dismiss();
             }
             Act::FullRes => {
@@ -2555,15 +2595,34 @@ impl App {
                     Some(s.palm),
                     Act::Toggle(Opt::Palm),
                 ));
+                v.push(item(
+                    "Pen draws, fingers move the board",
+                    Some(s.pen_priority),
+                    Act::Toggle(Opt::PenPriority),
+                ));
+                v.push(item(
+                    "Several fingers can write at once",
+                    Some(s.multi_ink),
+                    Act::Toggle(Opt::MultiInk),
+                ));
                 v.push(item("Text font…", None, Act::FontPanel));
                 v.push(item("Display and speed…", None, Act::Display));
                 v
             }
-            MenuKind::Display => vec![item(
-                "Full panel resolution (slower on 4K)",
-                Some(s.full_res),
-                Act::FullRes,
-            )],
+            MenuKind::Display => {
+                let mut v = vec![
+                    item("Full panel resolution (slower on 4K)", Some(s.full_res), Act::FullRes),
+                    item("Low-latency ink", Some(s.fast_ink), Act::Toggle(Opt::FastInk)),
+                    Entry::Rule,
+                ];
+                for (i, name) in ["Ink prediction: off", "Ink prediction: low", "Ink prediction: medium", "Ink prediction: high"]
+                    .iter()
+                    .enumerate()
+                {
+                    v.push(item(name, Some(s.predict as usize == i), Act::Predict(i as u8)));
+                }
+                v
+            }
             MenuKind::Card(id) => vec![
                 item("Rename", None, Act::Rename(id.clone())),
                 item("Delete", None, Act::AskDelete(id.clone())),
@@ -3659,6 +3718,7 @@ mod tests {
             time: t,
             size: 0.0,
             stylus: false,
+            eraser: false,
         };
         app.touch(Phase::Down, &[s]);
         app.touch(Phase::Up, &[s]);
@@ -3686,6 +3746,7 @@ mod tests {
             y: 400.0,
             time: 5000,
             stylus: true,
+            eraser: false,
             ..Sample::default()
         };
         app.touch(Phase::Down, &[sample]);
@@ -3714,6 +3775,7 @@ mod tests {
             y: 400.0,
             time: 5000,
             stylus: true,
+            eraser: false,
             ..Sample::default()
         };
         app.touch(Phase::Down, &[sample]);
@@ -3861,6 +3923,7 @@ mod tests {
             time: 2000,
             size: 0.0,
             stylus: true,
+            eraser: false,
         };
         app.touch(Phase::Down, &[s]);
         for i in 0..20 {
@@ -3937,6 +4000,7 @@ mod tests {
             time: 5000,
             size: 0.0,
             stylus: false,
+            eraser: false,
         };
         app.touch(Phase::Down, &[s]);
         app.touch(

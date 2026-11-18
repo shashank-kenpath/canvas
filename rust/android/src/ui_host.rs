@@ -98,6 +98,9 @@ impl Platform for AndroidUi {
     fn install_update(&mut self, url: &str) {
         self.text_call("installUpdate", "(Ljava/lang/String;)V", url, false, false);
     }
+    fn set_fast_ink(&mut self, on: bool) {
+        crate::fastpresent::set_enabled(on);
+    }
     fn set_full_resolution(&mut self, on: bool) {
         self.call("setFullResolution", "(Z)V", &[JValue::Bool(on as u8)]);
     }
@@ -352,6 +355,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_RustApp_touch(
             time: (base as f64 + s[3] as f64).max(0.0) as u64,
             size: s[4].max(0.0),
             stylus: s[5] != 0.0,
+            eraser: s[5] > 1.5,
         })
         .collect();
     let phase = match action {

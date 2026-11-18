@@ -14,6 +14,7 @@
 #![cfg(target_os = "android")]
 #![allow(non_snake_case)]
 
+mod fastpresent;
 mod ui_host;
 
 use canvas_core::editor::{Contact, Editor, PenMode};
@@ -98,6 +99,7 @@ struct Window(*mut ANativeWindow);
 unsafe impl Send for Window {}
 impl Drop for Window {
     fn drop(&mut self) {
+        fastpresent::forget(self.0);
         unsafe { ANativeWindow_release(self.0) };
     }
 }
@@ -105,6 +107,10 @@ impl Drop for Window {
 /// Copies `dirty` (or the larger area the system says must be redrawn) from
 /// `frame` into the window and shows it.
 fn present(window: &Window, frame: &Layer, dirty: IRect) -> bool {
+    if let Some(ok) = fastpresent::present(window.0, frame, dirty) {
+        return ok;
+    }
+    let dirty = if fastpresent::take_full_redraw() { IRect { x0: 0, y0: 0, x1: frame.w as i32, y1: frame.h as i32 } } else { dirty };
     let mut buffer = ANativeWindowBuffer { width: 0, height: 0, stride: 0, format: 0, bits: std::ptr::null_mut(), reserved: [0; 6] };
     let mut rect = ARect { left: dirty.x0, top: dirty.y0, right: dirty.x1, bottom: dirty.y1 };
     if unsafe { ANativeWindow_lock(window.0, &mut buffer, &mut rect) } != 0 {
@@ -149,7 +155,7 @@ const SAMPLE: usize = 6;
 
 enum Msg {
     /// `data` holds samples of (pointer id, x, y, milliseconds after `base`,
-    /// touch size in pixels, 1 for a stylus).
+    /// touch size in pixels, 1 for a stylus, 2 for its eraser end).
     Touch { action: i32, base: i64, data: Vec<f32> },
     Surface { window: Option<Window>, w: u32, h: u32, dpr: f64, done: SyncSender<()> },
     Wake,
@@ -226,7 +232,7 @@ fn render_loop(vm: JavaVM, listener: GlobalRef, editor: Arc<Mutex<Editor>>, rx: 
                             let id = s[0] as i32;
                             let pos = Pt::new(s[1] as f64, s[2] as f64);
                             let time = (base as f64 + s[3] as f64).max(0.0);
-                            let contact = Contact { size: s[4].max(0.0) as f64, stylus: s[5] != 0.0 };
+                            let contact = Contact { size: s[4].max(0.0) as f64, stylus: s[5] != 0.0, eraser: s[5] > 1.5 };
                             newest_sample = Some(time);
                             stats.samples += 1;
                             match action {
@@ -475,7 +481,7 @@ pub extern "system" fn Java_com_canvasstudio_rust_Native_surface<'l>(
 
 /// `action`: 0 down, 1 move, 2 up, 3 cancel. `data` holds `count` samples of
 /// (pointer id, x, y, milliseconds after `base`, touch size in pixels,
-/// 1 for a stylus), oldest first.
+/// 1 for a stylus, 2 for its eraser end), oldest first.
 #[no_mangle]
 pub extern "system" fn Java_com_canvasstudio_rust_Native_touch<'l>(
     env: JNIEnv<'l>,

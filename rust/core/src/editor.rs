@@ -34,6 +34,17 @@ pub struct Contact {
     /// Longest side of the touched area in buffer pixels; 0 when unknown.
     pub size: f64,
     pub stylus: bool,
+    /// The back (eraser end) of a stylus.
+    pub eraser: bool,
+}
+
+/// A second stroke being written at the same time as the main one.
+struct Extra {
+    pointer: i32,
+    id: String,
+    points: Vec<Pt>,
+    bounds: Rect,
+    last_screen: Pt,
 }
 
 /// Handwriting the host should read and answer with [`Editor::commit_ink`].
@@ -100,6 +111,19 @@ pub struct Editor {
     palm_rejection: bool,
     /// Contacts at least this big (logical pixels) are a palm.
     palm_size: f64,
+    /// Once a stylus has been used, fingers pan instead of drawing.
+    pen_priority: bool,
+    /// Several fingers can write at once.
+    multi_ink: bool,
+    /// How far ahead (milliseconds) the live stroke is drawn.
+    predict_ms: f64,
+    stylus_seen: bool,
+    tool_override: Option<Tool>,
+    extras: Vec<Extra>,
+    /// Predicted continuation of the live stroke, in world units.
+    prediction: Vec<Pt>,
+    /// Recent stroke samples (logical screen pixels, time) for prediction.
+    recent: VecDeque<(Pt, u64)>,
 
     // Camera, in logical pixels (buffer pixels / dpr).
     zoom: f64,
@@ -235,6 +259,14 @@ impl Editor {
             font: 0,
             palm_rejection: true,
             palm_size: 52.0,
+            pen_priority: false,
+            multi_ink: false,
+            predict_ms: 0.0,
+            stylus_seen: false,
+            tool_override: None,
+            extras: Vec::new(),
+            prediction: Vec::new(),
+            recent: VecDeque::new(),
             zoom: 1.0,
             camera: Pt::ZERO,
             dpr: 1.0,
@@ -338,7 +370,7 @@ impl Editor {
         self.camera
     }
     pub fn pointer_down_now(&self) -> bool {
-        !self.pointers.is_empty() || !self.ignored.is_empty()
+        !self.pointers.is_empty() || !self.ignored.is_empty() || !self.extras.is_empty()
     }
     pub fn frame(&self) -> &Layer {
         &self.frame
@@ -506,6 +538,21 @@ impl Editor {
     }
 
     /// Chooses the font for new text and for the selected text.
+    /// With a stylus in use, fingers pan and zoom instead of drawing.
+    pub fn set_pen_priority(&mut self, on: bool) {
+        self.pen_priority = on;
+    }
+
+    /// Lets several fingers write separate strokes at the same time.
+    pub fn set_multi_ink(&mut self, on: bool) {
+        self.multi_ink = on;
+    }
+
+    /// Draws the live stroke `ms` milliseconds ahead of the pen (0 = off).
+    pub fn set_prediction(&mut self, ms: f64) {
+        self.predict_ms = ms.clamp(0.0, 60.0);
+    }
+
     pub fn set_font(&mut self, font: u8) {
         if font as usize >= text::FONTS.len() {
             return;
@@ -641,12 +688,19 @@ impl Editor {
         self.cancel_action();
         let ids: Vec<i32> = self.pointers.drain(..).map(|(id, _)| id).collect();
         self.ignored.extend(ids);
+        for e in std::mem::take(&mut self.extras) {
+            self.ignored.push(e.pointer);
+            self.damage_world(&e.bounds, self.width / 2.0);
+        }
         self.mode = Mode::None;
         self.primary = None;
     }
 
     pub fn pointer_down_with(&mut self, id: i32, pos: Pt, time: u64, contact: Contact) {
         let pos = pos / self.dpr;
+        if contact.stylus {
+            self.stylus_seen = true;
+        }
         if self.palm_rejection {
             if contact.stylus {
                 // The pen always wins: anything already touching is the hand
@@ -676,6 +730,15 @@ impl Editor {
                 self.mode = Mode::None;
             }
         }
+        let fingers_pan = self.pen_priority && self.stylus_seen && !contact.stylus;
+        if self.multi_ink && self.mode == Mode::Draw && !fingers_pan && !contact.eraser && self.extras.len() < 9 {
+            // Another writer: start a stroke of its own.
+            let w = self.world(pos);
+            let shape_id = self.next_id();
+            self.extras.push(Extra { pointer: id, id: shape_id, points: vec![w], bounds: Rect::from_points(w, w), last_screen: pos });
+            self.damage_world(&Rect::from_points(w, w), self.width / 2.0);
+            return;
+        }
         if self.mode == Mode::Blocked || self.pointers.len() >= 2 {
             self.ignored.push(id);
             return;
@@ -704,6 +767,14 @@ impl Editor {
         self.primary_size = contact.size / self.dpr;
         self.down_stamp = time;
         self.travel = 0.0;
+        let draws = matches!(self.tool, Tool::Pen | Tool::Eraser | Tool::Rectangle | Tool::Ellipse | Tool::Arrow | Tool::Text);
+        self.tool_override = if contact.eraser {
+            Some(Tool::Eraser)
+        } else if fingers_pan && draws {
+            Some(Tool::Hand)
+        } else {
+            None
+        };
         self.begin(pos, time);
     }
 
@@ -714,6 +785,10 @@ impl Editor {
     pub fn pointer_move_with(&mut self, id: i32, pos: Pt, time: u64, contact: Contact) {
         let pos = pos / self.dpr;
         if self.ignored.contains(&id) {
+            return;
+        }
+        if let Some(i) = self.extras.iter().position(|e| e.pointer == id) {
+            self.extend_extra(i, pos);
             return;
         }
         // A hand that lands edge first only reports its full size a moment
@@ -763,6 +838,18 @@ impl Editor {
             self.ignored.remove(i);
             return;
         }
+        if let Some(i) = self.extras.iter().position(|e| e.pointer == id) {
+            self.extend_extra(i, pos);
+            let e = self.extras.remove(i);
+            self.damage_world(&e.bounds, self.width / 2.0);
+            if !cancelled {
+                let shape = Shape::new(e.id, Tool::Pen, e.points).styled(self.color, self.width, false);
+                let applied = self.doc.add(shape);
+                self.on_applied(applied);
+            }
+            self.overlay_dirty = true;
+            return;
+        }
         let Some(i) = self.pointers.iter().position(|(p, _)| *p == id) else {
             return;
         };
@@ -793,6 +880,10 @@ impl Editor {
 
     /// Preserve the last sample when Android backgrounds the app mid-stroke.
     pub fn finish_input(&mut self, now: u64) {
+        let extras: Vec<(i32, Pt)> = self.extras.iter().map(|e| (e.pointer, e.last_screen)).collect();
+        for (id, pos) in extras {
+            self.pointer_up(id, pos * self.dpr, now, false);
+        }
         let pointers = self.pointers.clone();
         for (id, pos) in pointers {
             self.pointer_up(id, pos * self.dpr, now, false);
@@ -945,7 +1036,10 @@ impl Editor {
     fn begin(&mut self, position: Pt, time: u64) {
         let w = self.world(position);
         self.start_world = w;
-        match self.tool {
+        self.prediction.clear();
+        self.recent.clear();
+        self.recent.push_back((position, time));
+        match self.tool_override.unwrap_or(self.tool) {
             Tool::Hand => {
                 self.mode = Mode::Pan;
                 self.anchor_world = w;
@@ -1038,6 +1132,7 @@ impl Editor {
                 if position.dist(self.still_anchor) > 16.0 {
                     self.reset_still(position, time);
                 }
+                self.predict(position, time);
             }
             Mode::Shape => {
                 self.draft_end = w;
@@ -1078,6 +1173,54 @@ impl Editor {
         }
     }
 
+    /// Extends the live stroke ahead of the pen along its recent velocity, so
+    /// the ink appears to keep up with the hand.
+    fn predict(&mut self, position: Pt, time: u64) {
+        self.recent.push_back((position, time));
+        while self.recent.len() > 6 || (self.recent.len() > 3 && time.saturating_sub(self.recent[0].1) > 40) {
+            self.recent.pop_front();
+        }
+        let had = !self.prediction.is_empty();
+        self.prediction.clear();
+        if self.predict_ms > 0.0 && self.recent.len() >= 3 {
+            let (p0, t0) = self.recent[0];
+            let dt = time.saturating_sub(t0) as f64;
+            if dt >= 4.0 {
+                let v = (position - p0) / dt;
+                // Ignore slow, careful movement where a guess would show.
+                if v.len() > 0.08 {
+                    let mut ahead = v * self.predict_ms;
+                    let cap = 48.0;
+                    if ahead.len() > cap {
+                        ahead = ahead * (cap / ahead.len());
+                    }
+                    self.prediction.push(self.world(position + ahead * 0.5));
+                    self.prediction.push(self.world(position + ahead));
+                }
+            }
+        }
+        if had || !self.prediction.is_empty() {
+            self.overlay_dirty = true;
+        }
+    }
+
+    fn extend_extra(&mut self, i: usize, pos: Pt) {
+        let w = self.world(pos);
+        let e = &mut self.extras[i];
+        if (pos - e.last_screen).len2() < 1.0 {
+            return;
+        }
+        e.points.push(w);
+        e.last_screen = pos;
+        e.bounds = e.bounds.union(&Rect::from_points(w, w));
+        let n = e.points.len();
+        let mut area = Rect::from_points(e.points[n - 2], w);
+        if n >= 3 {
+            area = area.union(&Rect::from_points(e.points[n - 3], e.points[n - 3]));
+        }
+        self.damage_world(&area, self.width / 2.0);
+    }
+
     fn start_dragging(&mut self) {
         if self.dragging || self.travel < 4.0 {
             return;
@@ -1094,6 +1237,7 @@ impl Editor {
     fn finish(&mut self, position: Pt, time: u64) {
         let w = self.world(position);
         self.overlay_dirty = true;
+        self.prediction.clear();
         match self.mode {
             Mode::Draw => {
                 self.snap_deadline = None;
@@ -1249,6 +1393,7 @@ impl Editor {
             self.damage_world(&self.draft_bounds.clone(), self.width / 2.0);
         }
         self.snapped = None;
+        self.prediction.clear();
         self.marquee = None;
         self.clear_transform();
         if self.mode != Mode::Pinch && self.mode != Mode::Blocked {
@@ -1284,6 +1429,7 @@ impl Editor {
         let raw = Shape::new(self.draft_id.clone(), Tool::Pen, draft.clone()).styled(self.color, self.width, false);
         if let Some(shape) = recognize_shape(&raw) {
             self.damage_world(&self.draft_bounds.clone(), self.width / 2.0);
+            self.prediction.clear();
             self.snapped = Some(shape);
             self.overlay_dirty = true;
             self.events |= EV_HAPTIC;
@@ -1437,6 +1583,14 @@ impl Editor {
         if let Some(s) = &self.snapped {
             add(render::paint_bounds(s), 2.0);
         }
+        if let (Some(draft), false) = (&self.draft, self.prediction.is_empty()) {
+            // The guessed tail and the real tail it reshapes.
+            let mut r = Rect::from_points(self.prediction[0], self.prediction[0]);
+            for p in self.prediction.iter().chain(draft.iter().rev().take(3)) {
+                r = r.union(&Rect::from_points(*p, *p));
+            }
+            add(r.inflate(self.width / 2.0), 3.0);
+        }
         if let Some(s) = self.draft_shape() {
             add(render::paint_bounds(&s), 2.0);
         }
@@ -1469,7 +1623,17 @@ impl Editor {
         if let Some(s) = &self.snapped {
             render::draw_shape(t, s, 1.0, None);
         } else if let Some(draft) = &self.draft {
-            render::draw_draft(t, draft, self.color, self.width);
+            if self.prediction.is_empty() {
+                render::draw_draft(t, draft, self.color, self.width);
+            } else {
+                let mut ahead = Vec::with_capacity(draft.len() + self.prediction.len());
+                ahead.extend_from_slice(draft);
+                ahead.extend_from_slice(&self.prediction);
+                render::draw_draft(t, &ahead, self.color, self.width);
+            }
+        }
+        for e in &self.extras {
+            render::draw_draft(t, &e.points, self.color, self.width);
         }
         if let Some(s) = self.draft_shape() {
             render::draw_shape(t, &s, 1.0, None);
@@ -1500,6 +1664,7 @@ impl Editor {
 
     fn has_live(&self) -> bool {
         self.draft.is_some()
+            || !self.extras.is_empty()
             || self.snapped.is_some()
             || self.marquee.is_some()
             || self.dragging

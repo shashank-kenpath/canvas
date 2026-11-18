@@ -721,8 +721,8 @@ fn a_shape_followed_by_writing_goes_back_to_ink() {
 
 #[test]
 fn palms_are_ignored() {
-    let big = Contact { size: 90.0, stylus: false };
-    let finger = Contact { size: 14.0, stylus: false };
+    let big = Contact { size: 90.0, stylus: false, eraser: false };
+    let finger = Contact { size: 14.0, stylus: false, eraser: false };
     // A palm resting before and during a stroke changes nothing.
     let mut e = editor();
     e.pointer_down_with(5, p(300., 250.), 0, big);
@@ -751,7 +751,7 @@ fn palms_are_ignored() {
     assert_matches_full_repaint(&mut e);
 
     // With a pen, the hand holding it never draws or zooms.
-    let pen = Contact { size: 4.0, stylus: true };
+    let pen = Contact { size: 4.0, stylus: true, eraser: false };
     let mut e = editor();
     e.pointer_down_with(7, p(250., 220.), 0, finger); // hand touches first
     e.pointer_move_with(7, p(256., 226.), 20, finger);
@@ -804,4 +804,91 @@ fn fonts_are_saved_and_applied_to_selected_text() {
     e.undo();
     e.undo();
     assert_eq!(e.doc.shapes()[0].font, 1);
+}
+
+#[test]
+fn the_pen_tail_erases_whatever_tool_is_chosen() {
+    let mut e = editor();
+    drag(&mut e, &line(p(40., 100.), p(240., 100.), 20), 0);
+    assert_eq!(e.doc.shapes().len(), 1);
+    let tail = Contact { size: 8.0, stylus: true, eraser: true };
+    e.pointer_down_with(3, p(140., 60.), 3000, tail);
+    for i in 1..=10 {
+        e.pointer_move_with(3, p(140., 60.0 + i as f64 * 8.0), 3000 + i * 8, tail);
+    }
+    e.pointer_up(3, p(140., 140.), 3100, false);
+    assert_eq!(e.doc.shapes().len(), 0);
+    assert_eq!(e.tool(), Tool::Pen, "the chosen tool stays");
+}
+
+#[test]
+fn with_pen_priority_fingers_pan_once_a_stylus_is_used() {
+    let pen = Contact { size: 4.0, stylus: true, eraser: false };
+    let finger = Contact { size: 14.0, stylus: false, eraser: false };
+    let mut e = editor();
+    e.set_pen_priority(true);
+    // No stylus seen yet: a finger still writes (IR panels report fingers).
+    e.pointer_down_with(1, p(50., 50.), 0, finger);
+    e.pointer_move_with(1, p(150., 50.), 40, finger);
+    e.pointer_up(1, p(150., 50.), 80, false);
+    assert_eq!(e.doc.shapes().len(), 1);
+    e.pointer_down_with(2, p(50., 120.), 1000, pen);
+    e.pointer_move_with(2, p(150., 120.), 1040, pen);
+    e.pointer_up(2, p(150., 120.), 1080, false);
+    assert_eq!(e.doc.shapes().len(), 2);
+    // Now a finger pans the board instead of drawing.
+    let before = e.camera();
+    e.pointer_down_with(3, p(300., 300.), 3000, finger);
+    e.pointer_move_with(3, p(340., 320.), 3040, finger);
+    e.pointer_up(3, p(340., 320.), 3080, false);
+    assert_eq!(e.doc.shapes().len(), 2);
+    assert!((e.camera() - before).len() > 30.0);
+}
+
+#[test]
+fn several_fingers_write_at_once_in_multi_finger_mode() {
+    let mut e = editor();
+    e.set_multi_ink(true);
+    e.pointer_down(0, p(40., 40.), 0);
+    e.pointer_move(0, p(60., 40.), 8);
+    e.pointer_down(1, p(40., 200.), 400);
+    e.pointer_down(2, p(300., 200.), 410);
+    for i in 1..=10 {
+        let t = 410 + i * 8;
+        let d = i as f64 * 10.0;
+        e.pointer_move(0, p(60. + d, 40.), t);
+        e.pointer_move(1, p(40. + d, 200.), t);
+        e.pointer_move(2, p(300., 200. + d), t);
+        e.render();
+    }
+    e.pointer_up(1, p(140., 200.), 600, false);
+    e.pointer_up(0, p(160., 40.), 610, false);
+    e.pointer_up(2, p(300., 300.), 620, false);
+    e.render();
+    assert_eq!(e.doc.shapes().len(), 3);
+    assert_eq!(e.zoom(), 1.0);
+    assert!(!e.pointer_down_now());
+    assert_matches_full_repaint(&mut e);
+}
+
+#[test]
+fn prediction_runs_ahead_while_writing_and_leaves_no_trace() {
+    let mut e = editor();
+    e.set_prediction(24.0);
+    e.pointer_down(0, p(40., 100.), 0);
+    for i in 1..=30 {
+        e.pointer_move(0, p(40. + i as f64 * 6.0, 100.), i * 8);
+        e.render();
+    }
+    // Ink is visible beyond the last real sample (x = 220).
+    let f = e.frame();
+    let ahead = (226..250).any(|x| {
+        let o = (100 * f.w as usize + x) * 4;
+        f.data[o] < 128
+    });
+    assert!(ahead, "the stroke should be drawn ahead of the pen");
+    e.pointer_up(0, p(220., 100.), 31 * 8, false);
+    e.render();
+    assert!(e.doc.shapes()[0].bounds().r <= 221.0);
+    assert_matches_full_repaint(&mut e);
 }
