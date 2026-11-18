@@ -319,3 +319,32 @@ pub fn decode_shapes(v: &Value) -> Result<Vec<Shape>, String> {
     }
     Ok(shapes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shape::Tool;
+
+    #[test]
+    fn filled_star_hits_its_interior_and_misses_its_notches() {
+        let mut doc = Document::new();
+        doc.add(
+            Shape::new("star", Tool::Star, vec![Pt::ZERO, Pt::new(100.0, 100.0)])
+                .styled(0xff123456, 3.0, true),
+        );
+
+        assert_eq!(doc.hit_test(Pt::new(50.0, 50.0), 0.0).unwrap().id, "star");
+        assert!(doc.hit_test(Pt::new(50.0, 94.0), 0.0).is_none());
+        assert!(doc.hit_test(Pt::new(110.0, 50.0), 0.0).is_none());
+    }
+
+    #[test]
+    fn outline_triangle_hits_only_near_its_edges() {
+        let mut doc = Document::new();
+        doc.add(Shape::new("triangle", Tool::Triangle, vec![Pt::ZERO, Pt::new(100.0, 100.0)]));
+
+        assert_eq!(doc.hit_test(Pt::new(24.0, 50.0), 0.0).unwrap().id, "triangle");
+        assert!(doc.hit_test(Pt::new(50.0, 50.0), 0.0).is_none());
+        assert!(doc.hit_test(Pt::new(5.0, 5.0), 0.0).is_none());
+    }
+}

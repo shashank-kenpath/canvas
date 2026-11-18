@@ -429,6 +429,12 @@ impl Editor {
     pub fn camera(&self) -> Pt {
         self.camera
     }
+    /// Shows the board from `camera` at `zoom`, as saved with a page.
+    pub fn set_view(&mut self, camera: Pt, zoom: f64) {
+        self.camera = camera;
+        self.zoom = zoom.clamp(0.1, 8.0);
+        self.view_changed();
+    }
     pub fn pointer_down_now(&self) -> bool {
         !self.pointers.is_empty() || !self.ignored.is_empty() || !self.extras.is_empty()
     }
@@ -893,7 +899,7 @@ impl Editor {
         self.primary_size = contact.size / self.dpr;
         self.down_stamp = time;
         self.travel = 0.0;
-        let draws = matches!(self.tool, Tool::Pen | Tool::Eraser | Tool::Rectangle | Tool::Ellipse | Tool::Arrow | Tool::Text);
+        let draws = !matches!(self.tool, Tool::Select | Tool::Hand);
         self.tool_override = if contact.eraser {
             Some(Tool::Eraser)
         } else if fingers_pan && draws {
@@ -1206,7 +1212,8 @@ impl Editor {
                 self.reset_still(position, time);
                 self.damage_world(&Rect::from_points(w, w), self.width / 2.0);
             }
-            Tool::Rectangle | Tool::Ellipse | Tool::Arrow => {
+            Tool::Rectangle | Tool::Ellipse | Tool::Arrow | Tool::Line
+            | Tool::Triangle | Tool::Diamond | Tool::Star | Tool::Hexagon => {
                 self.mode = Mode::Shape;
                 self.draft_end = w;
             }
@@ -1447,9 +1454,9 @@ impl Editor {
                 self.on_applied(applied);
             }
             Mode::Shape => {
-                if self.draft_end.dist(self.start_world) * self.zoom > 6.0 {
+                if w.dist(self.start_world) * self.zoom > 6.0 {
                     let id = self.next_id();
-                    let shape = Shape::new(id.clone(), self.tool, vec![self.start_world, self.draft_end])
+                    let shape = Shape::new(id.clone(), self.tool, vec![self.start_world, w])
                         .styled(self.color, self.width, self.filled);
                     let applied = self.doc.add(shape);
                     self.on_applied(applied);
@@ -1922,5 +1929,32 @@ impl Editor {
             self.frame.copy_from(&self.scene, d);
         }
         Some(d)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dragging_the_diamond_tool_creates_one_styled_shape() {
+        let mut editor = Editor::new();
+        let start = Pt::new(140.0, 120.0);
+        let end = Pt::new(30.0, 50.0);
+        editor.set_tool(Tool::Diamond, PenMode::Ink);
+        editor.apply_style(Some(0xff123456), Some(6.0), Some(true));
+
+        editor.pointer_down(0, start, 0);
+        editor.pointer_move(0, Pt::new(40.0, 60.0), 20);
+        editor.pointer_up(0, end, 30, false);
+
+        let [shape] = editor.doc.shapes() else {
+            panic!("expected one diamond");
+        };
+        assert_eq!(shape.tool, Tool::Diamond);
+        assert_eq!(shape.bounds(), Rect::from_points(start, end));
+        assert_eq!((shape.color, shape.width, shape.filled), (0xff123456, 6.0, true));
+        assert_eq!(editor.tool(), Tool::Select);
+        assert!(editor.doc.is_selected(&shape.id));
     }
 }

@@ -177,6 +177,19 @@ fn ellipse_path(r: &Rect) -> Option<Path> {
     PathBuilder::from_oval(rect)
 }
 
+fn polygon_path(s: &Shape) -> Option<Path> {
+    let mut vertices = s.polygon_vertices();
+    let mut pb = PathBuilder::new();
+    let (x, y) = f(vertices.next()?);
+    pb.move_to(x, y);
+    for p in vertices {
+        let (x, y) = f(p);
+        pb.line_to(x, y);
+    }
+    pb.close();
+    pb.finish()
+}
+
 /// The smoothed freehand outline: quadratic curves through segment midpoints.
 pub fn pen_path(points: &[Pt]) -> Option<Path> {
     let mut pb = PathBuilder::new();
@@ -271,14 +284,20 @@ pub fn draw_shape(t: &mut Target, s: &Shape, alpha: f32, extra: Option<Transform
     let stroke = round_stroke(s.width);
     let (a, b) = (s.points[0], *s.points.last().unwrap());
     match s.tool {
-        Tool::Rectangle | Tool::Ellipse => {
-            let rect = Rect::from_points(a, b);
+        Tool::Rectangle | Tool::Ellipse | Tool::Triangle | Tool::Diamond | Tool::Star | Tool::Hexagon => {
+            let rect = if matches!(s.tool, Tool::Rectangle | Tool::Ellipse) {
+                Rect::from_points(a, b)
+            } else {
+                s.bounds()
+            };
             let path = if rect.width() < 1e-6 || rect.height() < 1e-6 {
                 line_path(rect.top_left(), rect.bottom_right())
-            } else if s.tool == Tool::Rectangle {
-                round_rect_path(&rect, f64::min(6.0, rect.shortest_side() / 4.0))
             } else {
-                ellipse_path(&rect)
+                match s.tool {
+                    Tool::Rectangle => round_rect_path(&rect, f64::min(6.0, rect.shortest_side() / 4.0)),
+                    Tool::Ellipse => ellipse_path(&rect),
+                    _ => polygon_path(s),
+                }
             };
             let Some(path) = path else { return };
             if s.filled {
@@ -286,6 +305,11 @@ pub fn draw_shape(t: &mut Target, s: &Shape, alpha: f32, extra: Option<Transform
                 t.pm.fill_path(&path, &fill, FillRule::Winding, ts, None);
             }
             t.pm.stroke_path(&path, &paint, &stroke, ts, None);
+        }
+        Tool::Line => {
+            if let Some(path) = line_path(a, b) {
+                t.pm.stroke_path(&path, &paint, &stroke, ts, None);
+            }
         }
         Tool::Arrow => {
             let angle = (b.y - a.y).atan2(b.x - a.x);

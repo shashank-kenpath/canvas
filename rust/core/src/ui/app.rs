@@ -1,12 +1,11 @@
-//! The whole app as the person sees it: the board library, the board editor
-//! with its floating toolbars, menus, dialogs and messages. It mirrors the
-//! Flutter Canvas Studio layout and draws everything itself, so the host only
-//! supplies a window, touches and a few system services ([`Platform`]).
+//! Inkboard's board library, canvas controls and overlays. The host supplies
+//! a window, input and system services through [`Platform`].
 
 use super::font::{self, Face};
+use super::icons::Ico;
 use super::net;
 use super::paint::{self, Painter, Rf};
-use crate::editor::{Contact, Editor, PenMode, EV_DOC, EV_HAPTIC, EV_INK, EV_TEXT};
+use crate::editor::{Contact, Editor, PenMode, EV_DOC, EV_HAPTIC, EV_INK, EV_TEXT, EV_VIEW};
 use crate::geom::{IRect, Pt};
 use crate::render::{self, Layer};
 use crate::shape::{Shape, Tool};
@@ -22,74 +21,45 @@ use tiny_skia::PixmapMut;
 
 // ------------------------------------------------------------------ colours
 
-const PURPLE: u32 = 0xff6750d8;
-const INK: u32 = 0xff272536;
-const PAGE: u32 = 0xfff6f5fa;
-const BLUE: u32 = 0xff2f80ed;
-const BORDER: u32 = 0xffe8e8ec;
-const ICON: u32 = 0xff1d1d1d;
-const DISABLED: u32 = 0xffc2c5cb;
-const STATUS: u32 = 0xff8b9098;
-const CHOSEN: u32 = 0xffeceef1;
-const HINT: u32 = 0xff5f6570;
-const GREY: u32 = 0xff9e9e9e;
-const WHITE: u32 = 0xffffffff;
-const PRIMARY: u32 = 0xff644ac9;
-const FAB_BG: u32 = 0xffe7deff;
-const FAB_FG: u32 = 0xff21005e;
-const DIALOG: u32 = 0xffefe9f8;
-const MENU: u32 = 0xfff3edf7;
-const ON_SURFACE: u32 = 0xff1d1b20;
-const ON_VARIANT: u32 = 0xff49454f;
-const ERROR: u32 = 0xffb3261e;
-const TOAST_BG: u32 = 0xff322f35;
-const TOAST_FG: u32 = 0xfff5eff7;
+const ACCENT: u32 = 0xff2748e8;
+const ACCENT_PRESSED: u32 = 0xff1b35b8;
+const ACCENT_TINT: u32 = 0xffe7ecff;
+const SURFACE: u32 = 0xffffffff;
+const SURFACE2: u32 = 0xfff1f2f6;
+const BORDER: u32 = 0xffe1e4ea;
+const TEXT1: u32 = 0xff14161c;
+const TEXT2: u32 = 0xff4a5160;
+const TEXT3: u32 = 0xff6b7280;
+const PAGE: u32 = 0xfff4f5f8;
+const DANGER: u32 = 0xffc62828;
+const DANGER_TINT: u32 = 0xfffdecec;
+const OK: u32 = 0xff1e8e5a;
+const DISABLED: u32 = 0xffb4bac6;
+const TOGGLE_OFF: u32 = 0xffc4cad6;
+const SCRIM: u32 = 0x8014161c;
+const SCRIM_LIGHT: u32 = 0x1f14161c;
+const TOAST_BG: u32 = 0xff1b1e26;
+const TOAST_ACTION: u32 = 0xffa9b8ff;
 
 const PALETTE: [u32; 12] = [
-    0xff1d1d1d, 0xff9fa8b2, 0xffe085f4, 0xffae3ec9, 0xff4465e9, 0xff4ba1f1, 0xfff1ac4b, 0xffe16919,
-    0xff099268, 0xff4cb05e, 0xfff87777, 0xffe03131,
+    0xff1d1d1d, 0xff9fa8b2, 0xffe03131, 0xffe16919, 0xfff1ac4b, 0xff4cb05e, 0xff099268, 0xff4ba1f1,
+    0xff4465e9, 0xffae3ec9, 0xffe085f4, 0xfff87777,
 ];
-const SIZES: [(&str, f64); 4] = [("S", 2.0), ("M", 3.5), ("L", 5.0), ("XL", 10.0)];
-/// Where the panel is reached from other networks (see server/relay.mjs).
+const PEN_WIDTHS: [f64; 4] = [2.0, 3.5, 5.0, 10.0];
+const HL_WIDTHS: [f64; 4] = [8.0, 14.0, 22.0, 32.0];
+const SHAPES: [(Tool, Ico, &str); 9] = [
+    (Tool::Rectangle, Ico::Rect, "Rectangle"),
+    (Tool::Ellipse, Ico::Ellipse, "Ellipse"),
+    (Tool::Arrow, Ico::Arrow, "Arrow"),
+    (Tool::Line, Ico::Line, "Line"),
+    (Tool::Triangle, Ico::Triangle, "Triangle"),
+    (Tool::Diamond, Ico::Diamond, "Diamond"),
+    (Tool::Star, Ico::Star, "Star"),
+    (Tool::Hexagon, Ico::Hexagon, "Hexagon"),
+    (Tool::Pen, Ico::Smart, "Smart shapes"),
+];
 const RELAY: &str = "https://inkboard.taila6db10.ts.net";
 const LANGS: [(&str, &str); 2] = [("en", "English"), ("hi", "हिन्दी")];
-
-// -------------------------------------------------------- Material icons
-
-mod icon {
-    pub const SELECT: u32 = 0xf206;
-    pub const HAND: u32 = 0xf250;
-    pub const PEN: u32 = 0xf00d;
-    /// Drawn by hand: Material has no eraser glyph in this font.
-    pub const ERASER: u32 = u32::MAX;
-    pub const WRITE: u32 = 0xe5e1;
-    pub const SMART: u32 = 0xeea9;
-    pub const SHARE: u32 = 0xf378;
-    pub const JOIN: u32 = 0xf0d8;
-    pub const CLAUDE: u32 = 0xf3a8;
-    pub const FONT: u32 = 0xf096;
-    pub const ARROW: u32 = 0xe443;
-    pub const RECTANGLE: u32 = 0xe1ae;
-    pub const ELLIPSE: u32 = 0xef53;
-    pub const BACK: u32 = 0xe092;
-    pub const MENU: u32 = 0xe3dc;
-    pub const UNDO: u32 = 0xe68c;
-    pub const REDO: u32 = 0xe512;
-    pub const DELETE: u32 = 0xe1bb;
-    pub const REMOVE: u32 = 0xe516;
-    pub const ADD: u32 = 0xe047;
-    pub const FIT: u32 = 0xf079;
-    pub const NO_FILL: u32 = 0xe1ae;
-    pub const FILL: u32 = 0xf0385;
-    pub const UPDATE: u32 = 0xf41a;
-    pub const DRAW: u32 = 0xf05ed;
-    pub const MORE: u32 = 0xe404;
-    pub const BIGGER: u32 = 0xf058b;
-    pub const SMALLER: u32 = 0xf058a;
-    pub const SPEED: u32 = 0xf3c3;
-    pub const CHECK: u32 = 0xe156;
-    pub const TO_TEXT: u32 = 0xe649;
-}
 
 // ----------------------------------------------------------- host side
 
@@ -257,7 +227,12 @@ fn disk_worker(
                 }
                 Done::Saved { seq, ok }
             }
-            Job::Create { id, title, updated, extra } => {
+            Job::Create {
+                id,
+                title,
+                updated,
+                extra,
+            } => {
                 let contents = store::encode(&id, &title, &updated, &[], &extra);
                 let ok = store::save_atomic(&dir, &id, &contents).is_ok();
                 Done::Created(id, ok)
@@ -310,6 +285,8 @@ struct Settings {
     full_res: bool,
     /// Low-latency ink layer.
     fast_ink: bool,
+    smooth: bool,
+    dock: Dock,
     /// Ink prediction level, 0 (off) to 3.
     predict: u8,
     /// With a stylus, fingers pan instead of drawing.
@@ -371,7 +348,8 @@ impl Settings {
                 .filter(|t| {
                     t.len() >= min
                         && t.len() <= 32
-                        && t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                        && t.chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
                 })
                 .map(str::to_string)
                 .unwrap_or_else(|| random_token(len))
@@ -389,8 +367,17 @@ impl Settings {
                 .min(text::FONT_NAMES.len() as u64 - 1) as u8,
             full_res: v.get("fullRes").and_then(Value::as_bool).unwrap_or(false),
             fast_ink: flag("fastInk"),
+            smooth: flag("smooth"),
+            dock: v
+                .get("dock")
+                .and_then(Value::as_u64)
+                .and_then(|i| Dock::ALL.get(i as usize).copied())
+                .unwrap_or(Dock::Left),
             predict: v.get("predict").and_then(Value::as_u64).unwrap_or(1).min(3) as u8,
-            pen_priority: v.get("penPriority").and_then(Value::as_bool).unwrap_or(false),
+            pen_priority: v
+                .get("penPriority")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             multi_ink: v.get("multiInk").and_then(Value::as_bool).unwrap_or(false),
             lang: v
                 .get("lang")
@@ -414,7 +401,7 @@ impl Settings {
             "tidy": self.tidy, "typed": self.typed, "palm": self.palm, "grid": self.grid,
             "snap": self.snap, "font": self.font, "fullRes": self.full_res, "lang": self.lang,
             "fastInk": self.fast_ink, "predict": self.predict, "penPriority": self.pen_priority,
-            "multiInk": self.multi_ink,
+            "multiInk": self.multi_ink, "smooth": self.smooth, "dock": self.dock as u8,
             "mcpKey": self.mcp_key, "relayId": self.relay_id, "relaySecret": self.relay_secret,
             "relayUrl": self.relay_url,
         });
@@ -437,6 +424,29 @@ enum Opt {
     FastInk,
     PenPriority,
     MultiInk,
+    Smooth,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Dock {
+    Left,
+    Right,
+    Bottom,
+    Top,
+}
+
+impl Dock {
+    const ALL: [Self; 4] = [Self::Left, Self::Right, Self::Bottom, Self::Top];
+
+    fn vertical(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InkStyle {
+    color: u32,
+    width: f64,
 }
 
 /// What a control does.
@@ -445,7 +455,7 @@ enum Act {
     Open(String),
     CardMenu(String),
     NewBoard,
-    Display,
+    Settings,
     Import,
     Updates,
     Back,
@@ -464,7 +474,15 @@ enum Act {
     ZoomIn,
     Zoom100,
     Fit,
-    Tool(usize, PenMode),
+    Tool(Tool, PenMode),
+    Highlighter,
+    Shapes,
+    Shape(usize),
+    PagePrev,
+    PageNext,
+    PageAdd,
+    PageMenu,
+    AskDeletePage,
     Retry,
     Toggle(Opt),
     Lang(usize),
@@ -472,6 +490,7 @@ enum Act {
     Font(u8),
     FullRes,
     Predict(u8),
+    Dock(Dock),
     Rename(String),
     AskDelete(String),
     Field,
@@ -479,14 +498,25 @@ enum Act {
     Done,
     Share,
     StopShare,
+    Leave,
     Join,
     Claude,
     Export,
     Copy(String),
+    CopyCode(String),
     /// A surface that takes touches so they do not fall through.
     Nothing,
-    /// The empty area around a menu or dialog.
     Outside,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ButtonKind {
+    Primary,
+    Secondary,
+    White,
+    AccentTint,
+    Danger,
+    DangerTint,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -494,18 +524,18 @@ enum Look {
     Surface {
         color: u32,
         radius: f32,
-        elev: f32,
+        level: u8,
         border: bool,
     },
-    Btn {
-        icon: u32,
-        isz: f32,
-        active: bool,
+    IconBtn {
+        ico: Ico,
+        size: f32,
+        selected: bool,
         enabled: bool,
     },
-    AppIcon {
-        icon: u32,
-        badge: bool,
+    ColorChip {
+        color: u32,
+        open: bool,
     },
     Label {
         text: String,
@@ -520,59 +550,75 @@ enum Look {
         size: f32,
         line: f32,
         color: u32,
-        center: bool,
     },
-    Glyph {
-        icon: u32,
-        size: f32,
-        color: u32,
-    },
+    Overline(String),
     Swatch {
         color: u32,
         chosen: bool,
     },
-    Chip {
+    Thick {
+        width: f32,
+        chosen: bool,
+    },
+    SegOpt {
         text: String,
         chosen: bool,
     },
-    StyleDot {
-        color: u32,
-        open: bool,
+    Toggle {
+        on: bool,
+        label: String,
+        helper: Option<&'static str>,
     },
-    Rule,
+    Row {
+        icon: Option<Ico>,
+        text: String,
+        value: String,
+        chevron: bool,
+        danger: bool,
+    },
     Logo,
+    EmptyLogo,
     Thumb {
         id: String,
         gen: u64,
     },
-    Fab,
-    DlgBtn {
+    Button {
+        icon: Option<Ico>,
         text: String,
-        filled: bool,
+        kind: ButtonKind,
+        pill: bool,
+        level: u8,
     },
     Field {
         text: String,
         hint: String,
         multiline: bool,
     },
-    Item {
+    Code(String),
+    ShareCode(String),
+    StatusDot {
         text: String,
-        check: Option<bool>,
+        online: bool,
+        chip: bool,
+    },
+    FontTile {
+        font: u8,
+        chosen: bool,
     },
     TitleBlock {
         title: String,
         status: String,
         failed: bool,
     },
-    Toast(String),
-    Scrim(u32),
-    /// An address or command, wrapped anywhere, on a tinted box.
-    Code(String),
-    /// A font's name written in that font.
-    FontTile {
-        font: u8,
-        chosen: bool,
+    Toast {
+        text: String,
+        error: bool,
+        compact: bool,
+        action_width: f32,
     },
+    Rule,
+    Notch(Dock),
+    Scrim(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -588,103 +634,208 @@ struct Node {
     look: Look,
     act: Option<Act>,
     hl: Hl,
+    u: f32,
+    clip: Option<IRect>,
+    overlay: bool,
+    opacity: u8,
 }
 
 impl Node {
-    /// Pixels the node may paint, shadows and focus rings included.
-    fn paint_bounds(&self, d: f32) -> IRect {
-        let pad = match &self.look {
-            Look::Surface { elev, .. } => 2.0 + 10.0 * d * elev.max(0.0),
-            Look::Fab => 2.0 + 10.0 * d * 3.0,
-            Look::Toast(_) => 2.0 + 10.0 * d * 2.0,
-            _ => 2.0,
-        } + if self.hl == Hl::Focused { 4.0 * d } else { 0.0 };
-        self.rect.covering(pad)
+    fn paint_bounds(&self) -> IRect {
+        if self.look == Look::Scrim(0) && self.hl == Hl::None {
+            return IRect::new(0, 0, 0, 0);
+        }
+        let level = match &self.look {
+            Look::Surface { level, .. } | Look::Button { level, .. } => *level,
+            Look::Toast { .. } => 2,
+            _ => 0,
+        };
+        let bounds = self.rect.covering(2.0 + paint::elev_pad(self.u, level));
+        self.clip.map_or(bounds, |clip| bounds.intersect(&clip))
     }
 
-    fn radius(&self, d: f32) -> f32 {
-        d * match &self.look {
-            Look::Btn { .. } | Look::Swatch { .. } | Look::Chip { .. } | Look::StyleDot { .. } => {
-                8.0
+    fn radius(&self) -> f32 {
+        match &self.look {
+            Look::Surface { radius, .. } => radius * self.u,
+            Look::Button { pill: true, .. } | Look::StatusDot { chip: true, .. } => {
+                self.rect.h / 2.0
             }
-            Look::AppIcon { .. } => 24.0,
-            Look::Surface { radius, .. } => *radius,
-            Look::Fab => 16.0,
-            Look::DlgBtn { .. } => 20.0,
-            Look::Item { .. } => 0.0,
-            Look::Thumb { .. } => 8.0,
-            Look::FontTile { .. } => 10.0,
-            _ => 8.0,
+            Look::Button { .. } | Look::Field { .. } => 24.0 * self.u,
+            _ => 20.0 * self.u,
         }
     }
 }
 
-/// Collects the nodes of one layout.
-struct Ui<'a> {
-    nodes: Vec<Node>,
-    d: f32,
-    pressed: Option<&'a Act>,
-    focus: Option<&'a Act>,
+struct BoardChrome {
+    left: Rf,
+    right: Rf,
+    history: Rf,
+    zoom: Rf,
+    dock: Rf,
+    dock_scale: f32,
+    buttons: [Rf; 9],
+    dividers: [Rf; 2],
+    pages: Rf,
+    selection: Rf,
 }
 
-impl<'a> Ui<'a> {
+#[derive(Clone, Copy)]
+struct LibraryGrid {
+    margin: f32,
+    header: f32,
+    columns: usize,
+    card_width: f32,
+    card_height: f32,
+    top: f32,
+    content: f32,
+}
+
+fn square(x: f32, y: f32, size: f32) -> Rf {
+    Rf::new(x, y, size, size)
+}
+
+fn overlaps(a: Rf, b: Rf) -> bool {
+    a.x < b.right() && a.right() > b.x && a.y < b.bottom() && a.bottom() > b.y
+}
+
+fn place_in(value: f32, min: f32, max: f32) -> f32 {
+    value.clamp(min, max.max(min))
+}
+
+/// Collects interactive and decorative nodes from logical coordinates.
+struct Ui<'a> {
+    nodes: Vec<Node>,
+    u: f32,
+    pressed: Option<&'a Act>,
+    focus: Option<&'a Act>,
+    clip: Option<IRect>,
+    overlay: bool,
+    opacity: u8,
+    offset_y: f32,
+}
+
+impl Ui<'_> {
     fn push(&mut self, rect: Rf, look: Look, act: Option<Act>) {
-        let hl = match &act {
+        self.scaled(rect, look, act, 1.0);
+    }
+
+    fn scaled(&mut self, rect: Rf, look: Look, act: Option<Act>, scale: f32) {
+        if rect.w <= 0.0 || rect.h <= 0.0 {
+            return;
+        }
+        let hl = match act.as_ref() {
+            Some(Act::Nothing | Act::Outside) => Hl::None,
             Some(a) if Some(a) == self.pressed => Hl::Pressed,
             Some(a) if Some(a) == self.focus => Hl::Focused,
             _ => Hl::None,
         };
+        let mut rect = scale_rect(rect, self.u);
+        rect.y += self.offset_y * self.u;
         self.nodes.push(Node {
             rect,
             look,
             act,
             hl,
+            u: self.u * scale,
+            clip: self.clip,
+            overlay: self.overlay,
+            opacity: self.opacity,
         });
     }
 
-    /// A floating toolbar panel.
-    fn panel(&mut self, r: Rf) {
+    fn surface(&mut self, r: Rf, radius: f32, level: u8, act: Option<Act>) {
         self.push(
             r,
             Look::Surface {
-                color: WHITE,
-                radius: 11.0,
-                elev: 3.0,
+                color: SURFACE,
+                radius,
+                level,
                 border: true,
+            },
+            act,
+        );
+    }
+
+    fn icon(&mut self, r: Rf, ico: Ico, selected: bool, enabled: bool, act: Act) {
+        self.scaled_icon(r, ico, 1.0, selected, enabled, act);
+    }
+
+    fn scaled_icon(
+        &mut self,
+        r: Rf,
+        ico: Ico,
+        scale: f32,
+        selected: bool,
+        enabled: bool,
+        act: Act,
+    ) {
+        self.scaled(
+            r,
+            Look::IconBtn {
+                ico,
+                size: 40.0,
+                selected,
+                enabled,
+            },
+            enabled.then_some(act),
+            scale,
+        );
+    }
+
+    fn label(
+        &mut self,
+        r: Rf,
+        text: impl Into<String>,
+        face: Face,
+        size: f32,
+        color: u32,
+        center: bool,
+    ) {
+        self.push(
+            r,
+            Look::Label {
+                text: text.into(),
+                face,
+                size,
+                color,
+                center,
             },
             None,
         );
     }
 
-    /// A toolbar button of `size` (margin included) with its top left at (x, y).
-    fn btn(&mut self, x: f32, y: f32, size: f32, icon: u32, active: bool, enabled: bool, act: Act) {
-        let d = self.d;
-        let r = Rf::new(x + d, y + d, size - 2.0 * d, size - 2.0 * d);
+    fn button(
+        &mut self,
+        r: Rf,
+        icon: Option<Ico>,
+        text: impl Into<String>,
+        kind: ButtonKind,
+        pill: bool,
+        act: Act,
+    ) {
         self.push(
             r,
-            Look::Btn {
+            Look::Button {
                 icon,
-                isz: (size - 2.0 * d) * 0.5,
-                active,
-                enabled,
+                text: text.into(),
+                kind,
+                pill,
+                level: 0,
             },
-            if enabled { Some(act) } else { None },
+            Some(act),
         );
     }
 }
 
-// -------------------------------------------------------------- overlays
-
-#[derive(Clone, PartialEq, Debug)]
-enum MenuKind {
-    Main,
-    Display,
-    Card(String),
+fn scale_rect(r: Rf, scale: f32) -> Rf {
+    Rf::new(r.x * scale, r.y * scale, r.w * scale, r.h * scale)
 }
 
-enum Entry {
-    Item(String, Option<bool>, Act),
-    Rule,
+#[derive(Clone, Debug)]
+enum MenuKind {
+    Main,
+    Card(String),
+    Pages,
 }
 
 #[derive(Clone, Debug)]
@@ -692,6 +843,7 @@ enum AskFor {
     NewBoard,
     Rename(String),
     Join,
+    Text { id: String, x: f64, y: f64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -699,11 +851,13 @@ enum PanelKind {
     Share,
     Claude,
     Fonts,
+    Settings,
 }
 
 #[derive(Clone, Debug)]
 enum ConfirmFor {
     Delete(String),
+    DeletePage,
     Install(String),
 }
 
@@ -711,8 +865,9 @@ enum Overlay {
     Menu {
         kind: MenuKind,
         anchor: Rf,
-        right: bool,
     },
+    Style,
+    Shapes,
     Ask {
         title: String,
         text: String,
@@ -727,11 +882,66 @@ enum Overlay {
         ok: String,
         purpose: ConfirmFor,
     },
-    /// A larger sheet with scrolling content.
     Panel {
         kind: PanelKind,
         scroll: f32,
     },
+}
+
+enum PageChange {
+    Open(usize),
+    Add,
+    Delete,
+}
+
+#[derive(Default)]
+struct Page {
+    shapes: Vec<Arc<Shape>>,
+    view: Option<(Pt, f64)>,
+}
+
+impl Page {
+    fn decode(value: &Value) -> Result<Self, String> {
+        let shapes = value["shapes"]
+            .as_array()
+            .ok_or("Page has no shapes list.")?;
+        let mut ids = HashSet::new();
+        let shapes = shapes
+            .iter()
+            .map(|value| {
+                let shape = Shape::from_json(value)?;
+                if !ids.insert(shape.id.clone()) {
+                    return Err("Duplicate shape IDs on a page.".into());
+                }
+                Ok(Arc::new(shape))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self {
+            shapes,
+            view: Self::decode_view(value),
+        })
+    }
+
+    fn decode_view(value: &Value) -> Option<(Pt, f64)> {
+        let camera = value["camera"].as_array()?;
+        let point = Pt::new(camera.first()?.as_f64()?, camera.get(1)?.as_f64()?);
+        let zoom = value["zoom"].as_f64()?;
+        (point.is_finite() && zoom.is_finite()).then_some((point, zoom))
+    }
+
+    fn encode(&self) -> Value {
+        let (camera, zoom) = self.view.unwrap_or((Pt::ZERO, 1.0));
+        let shapes: Vec<_> = self.shapes.iter().map(|shape| shape.to_json()).collect();
+        json!({ "shapes": shapes, "camera": [camera.x, camera.y], "zoom": zoom })
+    }
+}
+
+struct Toast {
+    text: String,
+    error: bool,
+    action: Option<(&'static str, Act)>,
+    start: u64,
+    end: u64,
 }
 
 // ----------------------------------------------------------------- board
@@ -765,6 +975,8 @@ enum Capture {
         start: (f32, f32),
         last_y: f32,
         scrolling: bool,
+        held: bool,
+        hold_at: Option<u64>,
     },
     Scroll {
         last_y: f32,
@@ -808,17 +1020,27 @@ pub struct App {
 
     board: Option<OpenBoard>,
     opening: Option<String>,
+    open_after_save: Option<String>,
     save_state: SaveState,
     unsaved: bool,
     save_due: Option<u64>,
     save_seq: u64,
     close_after_save: bool,
-    style_open: bool,
+    pages: Vec<Page>,
+    page: usize,
+    pen_style: InkStyle,
+    hl_style: InkStyle,
+    highlighter: bool,
+    last_shape: Option<usize>,
+    shape_fill: bool,
 
     overlay: Option<Overlay>,
-    toast: Option<(String, u64)>,
+    overlay_start: u64,
+    toast: Option<Toast>,
+    tool_tip: Option<(&'static str, Rf, u64)>,
     update: Option<(String, String)>,
     update_offered: bool,
+    updates_current: bool,
 
     captures: HashMap<i32, Capture>,
     pressed: Option<Act>,
@@ -970,16 +1192,32 @@ impl App {
             thumb_gen: 0,
             board: None,
             opening: None,
+            open_after_save: None,
             save_state: SaveState::Saved,
             unsaved: false,
             save_due: None,
             save_seq: 0,
             close_after_save: false,
-            style_open: false,
+            pages: Vec::new(),
+            page: 0,
+            pen_style: InkStyle {
+                color: PALETTE[0],
+                width: PEN_WIDTHS[1],
+            },
+            hl_style: InkStyle {
+                color: PALETTE[4],
+                width: HL_WIDTHS[1],
+            },
+            highlighter: false,
+            last_shape: None,
+            shape_fill: false,
             overlay: None,
+            overlay_start: 0,
             toast: None,
+            tool_tip: None,
             update: None,
             update_offered: false,
+            updates_current: false,
             captures: HashMap::new(),
             pressed: None,
             focus: None,
@@ -999,7 +1237,8 @@ impl App {
             font_tiles: RefCell::new(HashMap::new()),
         };
         app.apply_settings();
-        app.ed.set_tool(Tool::Pen, PenMode::Ink);
+        app.ed.set_font(app.settings.font);
+        app.choose_tool(Tool::Pen, PenMode::Ink, false);
         if app.settings.typed {
             let lang = app.settings.lang.clone();
             app.platform.prepare_handwriting(&lang);
@@ -1017,15 +1256,23 @@ impl App {
 
     fn apply_settings(&mut self) {
         let s = self.settings.clone();
-        self.ed.set_auto_convert(s.tidy);
-        self.ed.set_auto_text(s.typed);
+        self.apply_ink_settings();
+        self.ed.set_smoothing(s.smooth);
         self.ed.set_palm_rejection(s.palm, None);
         self.ed.set_pen_priority(s.pen_priority);
         self.ed.set_multi_ink(s.multi_ink);
-        self.ed.set_prediction(PREDICT_MS[s.predict.min(3) as usize]);
+        self.ed
+            .set_prediction(PREDICT_MS[s.predict.min(3) as usize]);
         self.ed.set_grid(s.grid);
-        self.ed.set_snap_shapes(s.snap);
-        self.ed.set_font(s.font);
+    }
+
+    fn apply_ink_settings(&mut self) {
+        self.ed
+            .set_auto_convert(self.settings.tidy && !self.highlighter);
+        self.ed
+            .set_auto_text(self.settings.typed && !self.highlighter);
+        self.ed
+            .set_snap_shapes(self.settings.snap && !self.highlighter);
     }
 
     fn timestamp(&self) -> String {
@@ -1043,7 +1290,22 @@ impl App {
     }
 
     fn show_toast(&mut self, text: &str) {
-        self.toast = Some((text.to_string(), self.now + 2800));
+        self.set_toast(text, false, None);
+    }
+
+    fn error_toast(&mut self, text: &str) {
+        self.set_toast(text, true, None);
+    }
+
+    fn set_toast(&mut self, text: &str, error: bool, action: Option<(&'static str, Act)>) {
+        let duration = if action.is_some() { 5000 } else { 3000 };
+        self.toast = Some(Toast {
+            text: text.into(),
+            error,
+            action,
+            start: self.now,
+            end: self.now + duration,
+        });
     }
 
     /// A message from the host, shown like the app's own.
@@ -1088,12 +1350,34 @@ impl App {
         self.now = self.now.max(now);
     }
 
+    fn animation_deadline(&self) -> Option<u64> {
+        if self.settings.fast_ink {
+            return None;
+        }
+        let next = |start| (self.now < start + 120).then_some((self.now + 16).min(start + 120));
+        let overlay = self.overlay.as_ref().and_then(|_| next(self.overlay_start));
+        let toast = self.toast.as_ref().and_then(|t| {
+            next(t.start).or_else(|| {
+                let fade = t.end - 150;
+                (self.now < t.end).then_some(if self.now < fade {
+                    fade
+                } else {
+                    (self.now + 20).min(t.end)
+                })
+            })
+        });
+        overlay.into_iter().chain(toast).min()
+    }
+
     /// When [`App::frame`] next needs to run even without input.
     pub fn next_deadline(&self) -> Option<u64> {
         [
             self.ed.next_deadline(),
             self.save_due,
-            self.toast.as_ref().map(|t| t.1),
+            self.toast.as_ref().map(|t| t.end),
+            self.tool_tip.as_ref().map(|t| t.2),
+            self.hold_deadline(),
+            self.animation_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1110,9 +1394,13 @@ impl App {
         self.take_join();
         self.ed.tick(self.now);
         self.take_editor_events();
-        if self.toast.as_ref().is_some_and(|t| self.now >= t.1) {
+        if self.toast.as_ref().is_some_and(|t| self.now >= t.end) {
             self.toast = None;
         }
+        if self.tool_tip.is_some_and(|t| self.now >= t.2) {
+            self.tool_tip = None;
+        }
+        self.take_holds();
         if self.save_due.is_some_and(|due| self.now >= due) {
             if self.ed.pointer_down_now() {
                 self.save_due = Some(self.now + 700);
@@ -1161,19 +1449,22 @@ impl App {
 
     /// Area covered by nodes that differ between the shown tree and `fresh`.
     fn diff(&self, fresh: &[Node]) -> Option<IRect> {
-        let d = self.d;
         let mut dirty: Option<IRect> = None;
-        let mut add = |r: IRect| dirty = Some(dirty.map_or(r, |t: IRect| t.union(&r)));
+        let mut add = |r: IRect| {
+            if !r.is_empty() {
+                dirty = Some(dirty.map_or(r, |t: IRect| t.union(&r)));
+            }
+        };
         let n = self.nodes.len().max(fresh.len());
         for i in 0..n {
             match (self.nodes.get(i), fresh.get(i)) {
                 (Some(a), Some(b)) if a == b => {}
                 (a, b) => {
                     if let Some(a) = a {
-                        add(a.paint_bounds(d));
+                        add(a.paint_bounds());
                     }
                     if let Some(b) = b {
-                        add(b.paint_bounds(d));
+                        add(b.paint_bounds());
                     }
                 }
             }
@@ -1191,19 +1482,59 @@ impl App {
                 let px = [(PAGE >> 16) as u8, (PAGE >> 8) as u8, PAGE as u8, 0xff];
                 px.repeat(w as usize * h as usize)
             };
-        if let Some(pm) = PixmapMut::from_bytes(&mut buf, w, h) {
-            let mut p = Painter {
-                pm,
-                ox: r.x0 as f32,
-                oy: r.y0 as f32,
-            };
-            for node in &self.nodes {
-                if node.paint_bounds(self.d).intersects(&r) {
-                    self.draw(&mut p, node);
+        if let Some(mut target) = PixmapMut::from_bytes(&mut buf, w, h) {
+            let mut rest = self.nodes.as_slice();
+            while let Some(first) = rest.first() {
+                let count = rest
+                    .iter()
+                    .take_while(|n| n.clip == first.clip && n.opacity == first.opacity)
+                    .count();
+                let (group, tail) = rest.split_at(count);
+                rest = tail;
+                let area = first.clip.map_or(r, |clip| r.intersect(&clip));
+                if first.opacity == 0
+                    || area.is_empty()
+                    || !group.iter().any(|n| n.paint_bounds().intersects(&area))
+                {
+                    continue;
+                }
+                if area == r && first.opacity == 255 {
+                    if let Some(pm) = PixmapMut::from_bytes(target.data_mut(), w, h) {
+                        self.draw_nodes(pm, area, group);
+                    }
+                } else if let Some(mut layer) =
+                    tiny_skia::Pixmap::new(area.width() as u32, area.height() as u32)
+                {
+                    self.draw_nodes(layer.as_mut(), area, group);
+                    let paint = tiny_skia::PixmapPaint {
+                        opacity: f32::from(first.opacity) / 255.0,
+                        ..Default::default()
+                    };
+                    target.draw_pixmap(
+                        area.x0 - r.x0,
+                        area.y0 - r.y0,
+                        layer.as_ref(),
+                        &paint,
+                        tiny_skia::Transform::identity(),
+                        None,
+                    );
                 }
             }
         }
         self.out.write(r, &buf);
+    }
+
+    fn draw_nodes(&self, pm: PixmapMut<'_>, area: IRect, nodes: &[Node]) {
+        let mut painter = Painter {
+            pm,
+            ox: area.x0 as f32,
+            oy: area.y0 as f32,
+        };
+        for node in nodes {
+            if node.paint_bounds().intersects(&area) {
+                self.draw(&mut painter, node);
+            }
+        }
     }
 
     // ------------------------------------------------------------- disk
@@ -1260,14 +1591,28 @@ impl App {
                         continue;
                     }
                     self.opening = None;
-                    match result.map_err(|e| e).and_then(|board| {
-                        let title = board.title.clone();
-                        let extra = board.extra.clone();
-                        self.ed.load(board.shapes).map(|_| (title, extra))
+                    match result.and_then(|mut board| {
+                        let mut pages = vec![Page {
+                            shapes: Vec::new(),
+                            view: board
+                                .extra
+                                .remove("pageView")
+                                .as_ref()
+                                .and_then(Page::decode_view),
+                        }];
+                        if let Some(Value::Array(values)) = board.extra.remove("pages") {
+                            for value in &values {
+                                pages.push(Page::decode(value)?);
+                            }
+                        }
+                        self.ed.load(board.shapes)?;
+                        Ok((board.title, board.extra, pages))
                     }) {
-                        Ok((title, extra)) => {
+                        Ok((title, extra, pages)) => {
                             self.ink.clear();
-                            self.ed.fit();
+                            self.pages = pages;
+                            self.page = 0;
+                            self.restore_view();
                             self.ed.take_events();
                             self.ed.invalidate_all();
                             self.board = Some(OpenBoard { id, title, extra });
@@ -1275,14 +1620,14 @@ impl App {
                             self.save_state = SaveState::Saved;
                             self.unsaved = false;
                             self.save_due = None;
-                            self.style_open = false;
+                            self.dismiss();
                             self.focus = None;
                             self.full = true;
                             self.doc_gen += 1;
                             self.start_link();
                             self.sync_relay_codes();
                         }
-                        Err(_) => self.show_toast("This board could not be opened"),
+                        Err(_) => self.error_toast("This board could not be opened"),
                     }
                 }
                 Done::Saved { seq, ok } => {
@@ -1295,23 +1640,32 @@ impl App {
                         if !ok {
                             self.unsaved = true;
                         }
-                        if self.close_after_save {
+                        if self.close_after_save && ok && self.unsaved {
+                            self.save_due = None;
+                            self.queue_save(None);
+                        } else if self.close_after_save {
                             self.close_after_save = false;
                             if ok {
                                 self.return_to_library();
                             } else {
-                                self.show_toast("Could not save. Your board is still open; tap the save status to retry.");
+                                self.open_after_save = None;
+                                self.set_toast(
+                                    "Could not save your board.",
+                                    true,
+                                    Some(("Retry", Act::Retry)),
+                                );
                             }
                         }
-                    } else if !ok {
-                        self.save_state = SaveState::Failed;
                     }
                 }
                 Done::Created(id, ok) => {
-                    if ok {
+                    if ok && self.board.is_some() {
+                        self.open_after_save = Some(id);
+                        self.close_board();
+                    } else if ok {
                         self.open(id);
                     } else {
-                        self.show_toast("Could not create the board");
+                        self.error_toast("Could not create the board");
                     }
                 }
             }
@@ -1324,12 +1678,27 @@ impl App {
     }
 
     fn queue_save(&mut self, ack: Option<SyncSender<()>>) {
-        let Some(board) = &self.board else {
+        if self.board.is_none() {
             if let Some(ack) = ack {
                 let _ = ack.send(());
             }
             return;
         };
+        self.store_page();
+        let board = self.board.as_ref().unwrap();
+        let mut extra = board.extra.clone();
+        if let Some((camera, zoom)) = self.pages[0].view {
+            extra.insert(
+                "pageView".into(),
+                json!({ "camera": [camera.x, camera.y], "zoom": zoom }),
+            );
+        }
+        if self.pages.len() > 1 {
+            extra.insert(
+                "pages".into(),
+                Value::Array(self.pages[1..].iter().map(Page::encode).collect()),
+            );
+        }
         self.save_seq += 1;
         self.unsaved = false;
         self.save_state = SaveState::Saving;
@@ -1337,12 +1706,79 @@ impl App {
             id: board.id.clone(),
             title: board.title.clone(),
             updated: self.timestamp(),
-            shapes: self.ed.doc.shapes().to_vec(),
-            extra: board.extra.clone(),
+            shapes: self.pages[0].shapes.clone(),
+            extra,
             seq: self.save_seq,
             ack,
         };
         self.send(job);
+    }
+
+    fn store_page(&mut self) {
+        if let Some(page) = self.pages.get_mut(self.page) {
+            page.shapes = self.ed.doc.shapes().to_vec();
+            page.view = Some((self.ed.camera(), self.ed.zoom()));
+        }
+    }
+
+    fn restore_view(&mut self) {
+        if let Some((camera, zoom)) = self.pages[self.page].view {
+            self.ed.set_view(camera, zoom);
+        } else {
+            self.ed.fit();
+        }
+    }
+
+    fn mark_unsaved(&mut self) {
+        self.unsaved = true;
+        self.save_due = Some(self.now + 1200);
+    }
+
+    fn joined(&self) -> bool {
+        self.board
+            .as_ref()
+            .is_some_and(|b| b.extra.contains_key("lanShare"))
+    }
+
+    fn change_page(&mut self, change: PageChange) {
+        if self.board.is_none() || self.joined() {
+            return;
+        }
+        let len = self.pages.len();
+        let target = match change {
+            PageChange::Open(page) if page != self.page && page < len => page,
+            PageChange::Add => len,
+            PageChange::Delete if len > 1 => self.page.min(len - 2),
+            _ => return,
+        };
+        self.ed.finish_input(self.now);
+        self.take_editor_events();
+        self.captures.clear();
+        self.pressed = None;
+        self.ink.clear();
+        self.dismiss();
+        self.store_page();
+        match change {
+            PageChange::Add => self.pages.push(Page {
+                shapes: Vec::new(),
+                view: Some((Pt::ZERO, 1.0)),
+            }),
+            PageChange::Delete => {
+                self.pages.remove(self.page);
+            }
+            PageChange::Open(_) => {}
+        }
+        self.page = target;
+        let shapes = self.pages[self.page]
+            .shapes
+            .iter()
+            .map(|shape| (**shape).clone())
+            .collect();
+        // Both saved and in-memory pages have already passed duplicate-ID checks.
+        self.ed.load(shapes).expect("valid page");
+        self.restore_view();
+        self.doc_gen += 1;
+        self.mark_unsaved();
     }
 
     /// The host is going to the background. `ack` is answered once the open
@@ -1380,21 +1816,30 @@ impl App {
 
     fn return_to_library(&mut self) {
         self.board = None;
+        self.pages.clear();
+        self.page = 0;
+        self.ink.clear();
+        self.tool_tip = None;
         self.link = None;
         self.known.clear();
         self.link_online = None;
         self.sync_relay_codes();
         self.screen = Screen::Library;
-        self.overlay = None;
-        self.focus = None;
+        self.dismiss();
         self.full = true;
         self.send(Job::List);
+        if let Some(id) = self.open_after_save.take() {
+            self.open(id);
+        }
     }
 
     fn want_thumbs(&mut self) {
         let mut wanted = Vec::new();
         for node in &self.nodes {
             if let Look::Thumb { id, .. } = &node.look {
+                if node.paint_bounds().is_empty() {
+                    continue;
+                }
                 let (w, h) = (node.rect.w.round() as u32, node.rect.h.round() as u32);
                 if w == 0 || h == 0 || w > 2048 || h > 2048 || self.thumbs_wanted.contains(id) {
                     continue;
@@ -1424,9 +1869,10 @@ impl App {
         if events & EV_HAPTIC != 0 {
             self.platform.haptic();
         }
+        if events & (EV_DOC | EV_VIEW) != 0 && self.board.is_some() {
+            self.mark_unsaved();
+        }
         if events & EV_DOC != 0 && self.board.is_some() {
-            self.unsaved = true;
-            self.save_due = Some(self.now + 1200);
             self.doc_gen += 1;
             if self.link.is_some() {
                 let now = self.shape_map();
@@ -1441,8 +1887,26 @@ impl App {
             }
         }
         if events & EV_TEXT != 0 {
-            // Text comes from handwriting; there is no typing on the board.
-            let _ = self.ed.take_text_request();
+            if let Some(request) = self.ed.take_text_request() {
+                if self.board.is_some() && self.overlay.is_none() && !self.close_after_save {
+                    let title = if request.id.is_empty() {
+                        "Add text"
+                    } else {
+                        "Edit text"
+                    };
+                    self.ask(
+                        title,
+                        &request.text,
+                        "Type here",
+                        true,
+                        AskFor::Text {
+                            id: request.id,
+                            x: request.x,
+                            y: request.y,
+                        },
+                    );
+                }
+            }
         }
         if events & EV_INK != 0 {
             while let Some(request) = self.ed.take_ink_request() {
@@ -1475,18 +1939,21 @@ impl App {
             Some((version, url)) if newer(&version, &self.version) => {
                 let offer = manual || !self.update_offered;
                 self.update = Some((version, url));
+                self.updates_current = false;
                 if offer {
                     self.offer_update();
                 }
             }
-            _ => {
+            _ if failed => {
                 if manual {
-                    let text = if failed {
-                        "Could not check for updates".to_string()
-                    } else {
-                        format!("You have the latest version ({})", self.version)
-                    };
-                    self.show_toast(&text);
+                    self.error_toast("Could not check for updates");
+                }
+            }
+            _ => {
+                self.update = None;
+                self.updates_current = true;
+                if manual {
+                    self.show_toast(&format!("You have the latest version ({})", self.version));
                 }
             }
         }
@@ -1500,11 +1967,11 @@ impl App {
             return;
         }
         self.update_offered = true;
-        self.overlay = Some(Overlay::Confirm {
-            title: "Update available".into(),
-            body: format!("Version {version} is ready. You have {}.", self.version),
+        self.show_overlay(Overlay::Confirm {
+            title: format!("Install {version}?"),
+            body: "Inkboard will restart.".into(),
             cancel: "Later".into(),
-            ok: "Update".into(),
+            ok: "Install".into(),
             purpose: ConfirmFor::Install(url),
         });
     }
@@ -1524,11 +1991,85 @@ impl App {
     }
 
     fn hit(&self, x: f32, y: f32) -> Option<Act> {
-        self.nodes
-            .iter()
-            .rev()
-            .find(|n| n.act.is_some() && n.rect.contains(x, y))
-            .and_then(|n| n.act.clone())
+        let hit = |n: &&Node| {
+            n.act.is_some()
+                && n.rect.contains(x, y)
+                && n.clip.is_none_or(|clip| {
+                    clip.x0 as f32 <= x
+                        && x < clip.x1 as f32
+                        && clip.y0 as f32 <= y
+                        && y < clip.y1 as f32
+                })
+        };
+        let mut nodes = self.nodes.iter().rev().filter(hit);
+        let top = nodes.next()?.act.as_ref()?;
+        if *top == Act::Outside && matches!(self.overlay, Some(Overlay::Style | Overlay::Shapes)) {
+            let dock = scale_rect(self.board_chrome().dock, self.unit());
+            if dock.contains(x, y) {
+                return nodes
+                    .find_map(|n| n.act.as_ref().filter(|act| Self::hold_label(act).is_some()))
+                    .cloned()
+                    .or(Some(Act::Outside));
+            }
+        }
+        Some(top.clone())
+    }
+
+    fn hold_label(act: &Act) -> Option<&'static str> {
+        match act {
+            Act::Tool(Tool::Select, _) => Some("Select"),
+            Act::Tool(Tool::Hand, _) => Some("Pan"),
+            Act::Tool(Tool::Pen, PenMode::Ink) => Some("Pen"),
+            Act::Tool(Tool::Pen, PenMode::Write) => Some("Convert handwriting to text"),
+            Act::Tool(Tool::Eraser, _) => Some("Eraser"),
+            Act::Tool(Tool::Text, _) => Some("Text"),
+            Act::Highlighter => Some("Highlighter"),
+            Act::Shapes => Some("Shapes"),
+            Act::Shape(i) => Some(SHAPES[*i].2),
+            Act::Style => Some("Colour and thickness"),
+            Act::PageMenu => Some("Pages"),
+            _ => None,
+        }
+    }
+
+    fn hold_deadline(&self) -> Option<u64> {
+        self.captures
+            .values()
+            .filter_map(|capture| match capture {
+                Capture::Control { hold_at, .. } => *hold_at,
+                _ => None,
+            })
+            .min()
+    }
+
+    fn take_holds(&mut self) {
+        let mut held = None;
+        for capture in self.captures.values_mut() {
+            if let Capture::Control {
+                act,
+                hold_at,
+                held: fired,
+                ..
+            } = capture
+            {
+                if hold_at.is_some_and(|at| self.now >= at) {
+                    *hold_at = None;
+                    if self.pressed.as_ref() == Some(act) {
+                        *fired = true;
+                        held = Some(act.clone());
+                    }
+                }
+            }
+        }
+        if let Some(act) = held {
+            if act == Act::PageMenu {
+                self.pressed = None;
+                self.run(act);
+            } else if let Some(label) = Self::hold_label(&act) {
+                let anchor = self.node_rect(&act);
+                self.tool_tip = Some((label, anchor, self.now + 1500));
+            }
+        }
     }
 
     fn contact(s: &Sample) -> Contact {
@@ -1546,10 +2087,13 @@ impl App {
         self.focus = None;
         let hit = self.hit(s.x, s.y);
         let capture = match hit {
-            Some(Act::Outside) | None if self.overlay.is_some() => Capture::Outside,
+            Some(Act::Outside) => Capture::Outside,
+            None if self.overlay.is_some() => Capture::Outside,
             Some(act) => {
                 self.pressed = Some(act.clone());
                 Capture::Control {
+                    hold_at: Self::hold_label(&act).map(|_| s.time + 400),
+                    held: false,
                     act,
                     start: (s.x, s.y),
                     last_y: s.y,
@@ -1571,7 +2115,7 @@ impl App {
     }
 
     fn moved(&mut self, s: &Sample) {
-        let d = self.d;
+        let d = self.unit();
         let panel = matches!(self.overlay, Some(Overlay::Panel { .. }));
         let library = (self.screen == Screen::Library && self.overlay.is_none()) || panel;
         let mut scroll_by = 0.0;
@@ -1593,9 +2137,13 @@ impl App {
                 start,
                 last_y,
                 scrolling,
+                hold_at,
                 ..
             }) => {
                 let far = (s.x - start.0).hypot(s.y - start.1) > 10.0 * d;
+                if far {
+                    *hold_at = None;
+                }
                 if library && (far || *scrolling) {
                     *scrolling = true;
                     scroll_by = *last_y - s.y;
@@ -1625,6 +2173,9 @@ impl App {
     }
 
     fn up(&mut self, s: &Sample, cancelled: bool) {
+        if !cancelled {
+            self.take_holds();
+        }
         let Some(capture) = self.captures.remove(&s.id) else {
             return;
         };
@@ -1633,15 +2184,31 @@ impl App {
                 self.ed
                     .pointer_up(s.id, Pt::new(s.x as f64, s.y as f64), s.time, cancelled)
             }
-            Capture::Control { act, scrolling, .. } => {
+            Capture::Control {
+                act,
+                scrolling,
+                held,
+                ..
+            } => {
                 let still = self.pressed.as_ref() == Some(&act);
                 self.pressed = None;
-                if !cancelled && !scrolling && still && self.hit(s.x, s.y).as_ref() == Some(&act) {
+                if !cancelled
+                    && !scrolling
+                    && !held
+                    && still
+                    && self.hit(s.x, s.y).as_ref() == Some(&act)
+                {
                     self.run(act);
                 }
             }
             Capture::Outside => {
-                if !cancelled && matches!(self.hit(s.x, s.y), Some(Act::Outside) | None) {
+                if !cancelled
+                    && matches!(
+                        self.overlay,
+                        Some(Overlay::Menu { .. } | Overlay::Style | Overlay::Shapes)
+                    )
+                    && matches!(self.hit(s.x, s.y), Some(Act::Outside) | None)
+                {
                     self.dismiss();
                 }
             }
@@ -1687,7 +2254,12 @@ impl App {
         let candidates: Vec<&Node> = self
             .nodes
             .iter()
-            .filter(|n| n.act.is_some() && n.act != Some(Act::Outside) && n.act != Some(Act::Nothing))
+            .filter(|n| {
+                n.overlay == self.overlay.is_some()
+                    && n.act.is_some()
+                    && n.act != Some(Act::Outside)
+                    && n.act != Some(Act::Nothing)
+            })
             .collect();
         if candidates.is_empty() {
             return false;
@@ -1697,7 +2269,14 @@ impl App {
             .as_ref()
             .and_then(|f| candidates.iter().find(|n| n.act.as_ref() == Some(f)));
         let next = match current {
-            None => candidates.first().map(|n| (n.act.clone(), n.rect)),
+            None => candidates
+                .iter()
+                .filter(|n| !n.paint_bounds().is_empty())
+                .min_by(|a, b| {
+                    let along = |n: &Node| n.rect.cx() * dir.0 + n.rect.cy() * dir.1;
+                    along(a).total_cmp(&along(b))
+                })
+                .map(|n| (n.act.clone(), n.rect, n.clip)),
             Some(cur) => {
                 let (cx, cy) = (cur.rect.cx(), cur.rect.cy());
                 candidates
@@ -1714,20 +2293,28 @@ impl App {
                         }
                     })
                     .min_by(|a, b| a.0.total_cmp(&b.0))
-                    .map(|(_, n)| (n.act.clone(), n.rect))
+                    .map(|(_, n)| (n.act.clone(), n.rect, n.clip))
             }
         };
-        if let Some((act, rect)) = next {
+        if let Some((act, rect, clip)) = next {
             self.focus = act;
-            if self.screen == Screen::Library && self.overlay.is_none() {
-                // Keep the focused card on screen.
-                let top = 64.0 * self.d;
-                if rect.y < top {
-                    self.scroll -= top - rect.y + 16.0 * self.d;
-                } else if rect.bottom() > self.h as f32 {
-                    self.scroll += rect.bottom() - self.h as f32 + 16.0 * self.d;
+            if let Some(clip) = clip {
+                let top = clip.y0 as f32;
+                let bottom = clip.y1 as f32;
+                let delta = if rect.y < top {
+                    rect.y - top
+                } else if rect.bottom() > bottom {
+                    rect.bottom() - bottom
+                } else {
+                    0.0
+                };
+                let max = self.panel_max_scroll();
+                if let Some(Overlay::Panel { scroll, .. }) = &mut self.overlay {
+                    *scroll = (*scroll + delta).clamp(0.0, max);
+                } else if self.screen == Screen::Library && self.overlay.is_none() {
+                    self.scroll += delta;
+                    self.clamp_scroll();
                 }
-                self.clamp_scroll();
             }
         }
         true
@@ -1752,14 +2339,13 @@ impl App {
     // ------------------------------------------------------------ actions
 
     fn ask(&mut self, title: &str, text: &str, hint: &str, multiline: bool, purpose: AskFor) {
-        self.overlay = Some(Overlay::Ask {
+        self.show_overlay(Overlay::Ask {
             title: title.into(),
             text: text.into(),
             hint: hint.into(),
             multiline,
             purpose,
         });
-        self.focus = None;
         self.platform.show_keyboard(text, multiline);
     }
 
@@ -1771,13 +2357,16 @@ impl App {
         self.focus = None;
     }
 
-    fn menu(&mut self, kind: MenuKind, anchor: Rf, right: bool) {
-        self.overlay = Some(Overlay::Menu {
-            kind,
-            anchor,
-            right,
-        });
+    fn show_overlay(&mut self, overlay: Overlay) {
+        self.overlay = Some(overlay);
+        self.overlay_start = self.now;
+        self.tool_tip = None;
         self.focus = None;
+    }
+
+    fn menu(&mut self, kind: MenuKind, act: &Act) {
+        let anchor = scale_rect(self.node_rect(act), 1.0 / self.unit());
+        self.show_overlay(Overlay::Menu { kind, anchor });
     }
 
     fn node_rect(&self, act: &Act) -> Rf {
@@ -1807,32 +2396,62 @@ impl App {
         }
     }
 
+    fn choose_tool(&mut self, tool: Tool, mode: PenMode, highlighter: bool) {
+        self.ed.set_tool(tool, mode);
+        if self.highlighter != highlighter {
+            self.highlighter = highlighter;
+            self.apply_ink_settings();
+        }
+        let style = if highlighter {
+            InkStyle {
+                color: (self.hl_style.color & 0x00ff_ffff) | 0x7300_0000,
+                ..self.hl_style
+            }
+        } else {
+            self.pen_style
+        };
+        // Select can retain an existing selection. Choosing it should not restyle it.
+        if self.ed.doc.selected_ids().is_empty() {
+            self.ed
+                .apply_style(Some(style.color), Some(style.width), Some(self.shape_fill));
+        }
+        if tool == Tool::Pen && mode == PenMode::Write {
+            let lang = self.settings.lang.clone();
+            self.platform.prepare_handwriting(&lang);
+        }
+    }
+
+    fn shape_tool_active(&self) -> bool {
+        let tool = self.ed.tool();
+        if tool == Tool::Pen {
+            self.ed.pen_mode() == PenMode::Shape
+        } else {
+            SHAPES.iter().any(|(shape, _, _)| *shape == tool)
+        }
+    }
+
+    fn style_color(&self) -> u32 {
+        let color = self
+            .ed
+            .doc
+            .selected_shapes()
+            .first()
+            .map_or(self.ed.color(), |s| s.color);
+        color | 0xff00_0000
+    }
+
     fn run(&mut self, act: Act) {
-        let in_menu = matches!(self.overlay, Some(Overlay::Menu { .. }));
         match act {
             Act::Open(id) => self.open(id),
-            Act::CardMenu(id) => {
-                let r = self.node_rect(&Act::CardMenu(id.clone()));
-                self.menu(MenuKind::Card(id), r, true);
-            }
-            Act::NewBoard => self.ask(
-                "A new space for ideas",
-                "",
-                "Give it a name",
-                false,
-                AskFor::NewBoard,
-            ),
-            Act::Display => {
-                let r = self.node_rect(&Act::Display);
-                self.menu(MenuKind::Display, r, true);
-            }
+            Act::CardMenu(id) => self.menu(MenuKind::Card(id.clone()), &Act::CardMenu(id)),
+            Act::NewBoard => self.ask("New board", "", "Board name", false, AskFor::NewBoard),
+            Act::Settings => self.panel(PanelKind::Settings),
             Act::Import => {
-                if in_menu {
-                    self.dismiss();
-                }
+                self.dismiss();
                 self.platform.pick_boards();
             }
             Act::Updates => {
+                self.dismiss();
                 if self.update.is_some() {
                     self.offer_update();
                 } else {
@@ -1841,87 +2460,156 @@ impl App {
                 }
             }
             Act::Back => self.close_board(),
-            Act::Menu => {
-                let r = self.node_rect(&Act::Menu);
-                self.menu(MenuKind::Main, r, false);
-            }
+            Act::Menu => self.menu(MenuKind::Main, &Act::Menu),
             Act::Undo => self.ed.undo(),
             Act::Redo => self.ed.redo(),
             Act::Delete => self.ed.delete_selection(),
             Act::Convert => self.ed.convert_selection(),
             Act::Bigger => self.ed.scale_text(1.25),
             Act::Smaller => self.ed.scale_text(0.8),
-            Act::Style => self.style_open = !self.style_open,
-            Act::Color(c) => self.ed.apply_style(Some(c), None, None),
-            Act::Width(i) => self.ed.apply_style(None, Some(SIZES[i].1), None),
-            Act::Fill(f) => self.ed.apply_style(None, None, Some(f)),
-            Act::ZoomOut => {
-                let z = self.ed.zoom() / 1.25;
-                self.ed.zoom_to(z, None);
-            }
-            Act::ZoomIn => {
-                let z = self.ed.zoom() * 1.25;
-                self.ed.zoom_to(z, None);
-            }
-            Act::Zoom100 => self.ed.zoom_to(1.0, None),
-            Act::Fit => {
-                self.ed.fit();
-                if in_menu {
+            Act::Style => {
+                if matches!(self.overlay, Some(Overlay::Style)) {
                     self.dismiss();
+                } else {
+                    self.show_overlay(Overlay::Style);
                 }
             }
-            Act::Tool(i, mode) => {
-                if let Some(tool) = Tool::from_index(i as i32) {
-                    self.ed.set_tool(tool, mode);
-                    if tool == Tool::Pen && mode == PenMode::Write {
-                        let lang = self.settings.lang.clone();
-                        self.platform.prepare_handwriting(&lang);
-                    }
+            Act::Color(color) => {
+                let selected_color = if self.highlighter {
+                    self.hl_style.color = color;
+                    (color & 0x00ff_ffff) | 0x7300_0000
+                } else {
+                    self.pen_style.color = color;
+                    color
+                };
+                self.ed.apply_style(Some(selected_color), None, None);
+            }
+            Act::Width(i) => {
+                let style = if self.highlighter {
+                    &mut self.hl_style
+                } else {
+                    &mut self.pen_style
+                };
+                style.width = if self.highlighter {
+                    HL_WIDTHS[i]
+                } else {
+                    PEN_WIDTHS[i]
+                };
+                self.ed.apply_style(None, Some(style.width), None);
+            }
+            Act::Fill(fill) => {
+                self.shape_fill = fill;
+                self.ed.apply_style(None, None, Some(fill));
+            }
+            Act::ZoomOut => self.ed.zoom_to(self.ed.zoom() / 1.25, None),
+            Act::ZoomIn => self.ed.zoom_to(self.ed.zoom() * 1.25, None),
+            Act::Zoom100 => self.ed.zoom_to(1.0, None),
+            Act::Fit => self.ed.fit(),
+            Act::Tool(tool, mode) => {
+                if tool == Tool::Pen
+                    && mode == PenMode::Ink
+                    && !self.highlighter
+                    && self.ed.tool() == tool
+                    && self.ed.pen_mode() == mode
+                {
+                    self.run(Act::Style);
+                } else {
+                    self.dismiss();
+                    let mode = if tool == Tool::Pen
+                        && self.ed.tool() == tool
+                        && mode == PenMode::Write
+                        && self.ed.pen_mode() == PenMode::Write
+                    {
+                        PenMode::Ink
+                    } else {
+                        mode
+                    };
+                    self.choose_tool(tool, mode, false);
                 }
             }
-            Act::Retry => self.queue_save(None),
-            Act::Toggle(opt) => {
-                self.set(|s| match opt {
-                    Opt::Grid => s.grid = !s.grid,
-                    Opt::Snap => s.snap = !s.snap,
-                    Opt::Tidy => s.tidy = !s.tidy,
-                    Opt::Typed => s.typed = !s.typed,
-                    Opt::Palm => s.palm = !s.palm,
-                    Opt::FastInk => s.fast_ink = !s.fast_ink,
-                    Opt::PenPriority => s.pen_priority = !s.pen_priority,
-                    Opt::MultiInk => s.multi_ink = !s.multi_ink,
-                });
-                self.dismiss();
+            Act::Highlighter => {
+                if self.highlighter {
+                    self.run(Act::Style);
+                } else {
+                    self.dismiss();
+                    self.choose_tool(Tool::Pen, PenMode::Ink, true);
+                }
             }
-            Act::Lang(i) => {
-                self.set(|s| s.lang = LANGS[i].0.to_string());
-                self.dismiss();
+            Act::Shapes => {
+                if matches!(self.overlay, Some(Overlay::Shapes)) {
+                    self.dismiss();
+                } else if self.shape_tool_active() && !matches!(self.overlay, Some(Overlay::Style))
+                {
+                    self.show_overlay(Overlay::Style);
+                } else {
+                    self.show_overlay(Overlay::Shapes);
+                }
             }
+            Act::Shape(index) => {
+                let (tool, _, _) = SHAPES[index];
+                self.last_shape = Some(index);
+                self.dismiss();
+                self.choose_tool(tool, PenMode::Shape, false);
+            }
+            Act::PagePrev => self.change_page(PageChange::Open(self.page.saturating_sub(1))),
+            Act::PageNext => self.change_page(PageChange::Open(self.page + 1)),
+            Act::PageAdd => self.change_page(PageChange::Add),
+            Act::PageMenu if self.pages.len() > 1 && !self.joined() => {
+                self.menu(MenuKind::Pages, &Act::PageMenu)
+            }
+            Act::AskDeletePage => self.show_overlay(Overlay::Confirm {
+                title: format!("Delete page {}?", self.page + 1),
+                body: "This page and everything on it will be removed from the board.".into(),
+                cancel: "Cancel".into(),
+                ok: "Delete".into(),
+                purpose: ConfirmFor::DeletePage,
+            }),
+            Act::PageMenu => {}
+            Act::Retry => {
+                self.toast = None;
+                self.ed.finish_input(self.now);
+                self.take_editor_events();
+                self.save_due = None;
+                self.queue_save(None);
+            }
+            Act::Toggle(opt) => self.set(|s| match opt {
+                Opt::Grid => s.grid = !s.grid,
+                Opt::Snap => s.snap = !s.snap,
+                Opt::Tidy => s.tidy = !s.tidy,
+                Opt::Typed => s.typed = !s.typed,
+                Opt::Palm => s.palm = !s.palm,
+                Opt::FastInk => s.fast_ink = !s.fast_ink,
+                Opt::PenPriority => s.pen_priority = !s.pen_priority,
+                Opt::MultiInk => s.multi_ink = !s.multi_ink,
+                Opt::Smooth => s.smooth = !s.smooth,
+            }),
+            Act::Lang(i) => self.set(|s| s.lang = LANGS[i].0.to_string()),
             Act::FontPanel => self.panel(PanelKind::Fonts),
             Act::Font(f) => {
                 self.set(|s| s.font = f);
+                self.ed.set_font(f);
                 self.dismiss();
             }
-            Act::Predict(level) => {
-                self.set(|s| s.predict = level.min(3));
-                self.dismiss();
-            }
-            Act::FullRes => {
-                self.set(|s| s.full_res = !s.full_res);
-                self.dismiss();
-            }
+            Act::Predict(level) => self.set(|s| s.predict = level.min(3)),
+            Act::FullRes => self.set(|s| s.full_res = !s.full_res),
+            Act::Dock(dock) => self.set(|s| s.dock = dock),
             Act::Rename(id) => {
-                self.overlay = None;
                 let title = self
-                    .boards
-                    .iter()
-                    .find(|b| b.id == id)
+                    .board
+                    .as_ref()
+                    .filter(|b| b.id == id)
                     .map(|b| b.title.clone())
+                    .or_else(|| {
+                        self.boards
+                            .iter()
+                            .find(|b| b.id == id)
+                            .map(|b| b.title.clone())
+                    })
                     .unwrap_or_default();
                 self.ask(
                     "Rename board",
                     &title,
-                    "Give it a name",
+                    "Board name",
                     false,
                     AskFor::Rename(id),
                 );
@@ -1931,12 +2619,12 @@ impl App {
                     .boards
                     .iter()
                     .find(|b| b.id == id)
-                    .map(|b| b.title.clone())
+                    .map(|b| b.title.as_str())
                     .unwrap_or_default();
-                self.overlay = Some(Overlay::Confirm {
-                    title: "Delete this board?".into(),
-                    body: format!("“{title}” will be removed from this device."),
-                    cancel: "Keep".into(),
+                self.show_overlay(Overlay::Confirm {
+                    title: format!("Delete “{title}”?"),
+                    body: "This board and everything on it will be removed from this panel. This cannot be undone.".into(),
+                    cancel: "Cancel".into(),
                     ok: "Delete".into(),
                     purpose: ConfirmFor::Delete(id),
                 });
@@ -1946,8 +2634,7 @@ impl App {
                     text, multiline, ..
                 }) = &self.overlay
                 {
-                    let (text, multiline) = (text.clone(), *multiline);
-                    self.platform.show_keyboard(&text, multiline);
+                    self.platform.show_keyboard(text, *multiline);
                 }
             }
             Act::Cancel | Act::Outside => self.dismiss(),
@@ -1963,38 +2650,41 @@ impl App {
                 self.dismiss();
                 self.show_toast("Sharing stopped");
             }
-            Act::Join => self.ask(
-                "Join a shared board",
-                "",
-                "Board code, like 123456",
-                false,
-                AskFor::Join,
-            ),
+            Act::Leave => {
+                self.dismiss();
+                self.close_board();
+            }
+            Act::Join => self.ask("Join a board", "", "6-digit code", false, AskFor::Join),
             Act::Claude => {
                 self.lan_ip = net::local_ip();
                 self.panel(PanelKind::Claude);
             }
             Act::Export => {
-                if in_menu {
-                    self.dismiss();
-                }
-                let title = self.board.as_ref().map(|b| b.title.clone()).unwrap_or_default();
+                self.dismiss();
+                let title = self
+                    .board
+                    .as_ref()
+                    .map(|b| b.title.clone())
+                    .unwrap_or_default();
                 match board_png(self.ed.doc.shapes(), 4096) {
                     Some(png) => self.platform.save_png(&title, &png),
-                    None => self.show_toast("Could not make the picture"),
+                    None => self.error_toast("Could not make the picture"),
                 }
             }
             Act::Copy(text) => {
                 self.platform.copy_text(&text);
                 self.show_toast("Copied");
             }
+            Act::CopyCode(code) => {
+                self.platform.copy_text(&code);
+                self.show_toast("Code copied");
+            }
             Act::Nothing => {}
         }
     }
 
     fn panel(&mut self, kind: PanelKind) {
-        self.overlay = Some(Overlay::Panel { kind, scroll: 0.0 });
-        self.focus = None;
+        self.show_overlay(Overlay::Panel { kind, scroll: 0.0 });
     }
 
     fn share(&mut self) {
@@ -2002,7 +2692,9 @@ impl App {
             return;
         };
         if !board.extra.contains_key("lanShare") && !board.extra.contains_key("lanHost") {
-            let n = random_token(12).bytes().fold(0u64, |a, b| a.wrapping_mul(37).wrapping_add(b as u64));
+            let n = random_token(12)
+                .bytes()
+                .fold(0u64, |a, b| a.wrapping_mul(37).wrapping_add(b as u64));
             let code = format!("{:06}", 100_000 + n % 900_000);
             board.extra.insert("lanHost".into(), Value::String(code));
             self.unsaved = true;
@@ -2048,6 +2740,11 @@ impl App {
                     }
                     AskFor::Rename(id) => {
                         if !name.is_empty() {
+                            if let Some(board) = self.board.as_mut().filter(|b| b.id == id) {
+                                board.title = name.to_string();
+                                self.mark_unsaved();
+                                return;
+                            }
                             let updated = self.timestamp();
                             self.send(Job::Rename {
                                 id,
@@ -2055,6 +2752,10 @@ impl App {
                                 updated,
                             });
                         }
+                    }
+                    AskFor::Text { id, x, y } => {
+                        self.ed.commit_text(&id, x, y, name);
+                        self.take_editor_events();
                     }
                     AskFor::Join => {
                         let input = name.to_string();
@@ -2076,754 +2777,1068 @@ impl App {
                     self.thumbs.remove(&id);
                     self.send(Job::Delete(id));
                 }
+                ConfirmFor::DeletePage => self.change_page(PageChange::Delete),
                 ConfirmFor::Install(url) => {
                     self.show_toast("Downloading the update…");
                     self.platform.install_update(&url);
                 }
             },
-            Overlay::Menu { .. } | Overlay::Panel { .. } => {}
+            Overlay::Menu { .. } | Overlay::Panel { .. } | Overlay::Style | Overlay::Shapes => {}
         }
     }
 
     // ------------------------------------------------------------ layout
 
-    fn wdp(&self) -> f32 {
-        self.w as f32 / self.d
+    fn unit(&self) -> f32 {
+        self.d * (2.0 / 3.0)
+    }
+
+    fn extent(&self) -> (f32, f32) {
+        (self.w as f32 / self.unit(), self.h as f32 / self.unit())
     }
 
     fn layout(&self) -> Vec<Node> {
         let mut ui = Ui {
-            nodes: Vec::with_capacity(64),
-            d: self.d,
+            nodes: Vec::with_capacity(96),
+            u: self.unit(),
             pressed: self.pressed.as_ref(),
             focus: self.focus.as_ref(),
+            clip: None,
+            overlay: false,
+            opacity: 255,
+            offset_y: 0.0,
         };
-        match self.screen {
-            Screen::Library => self.layout_library(&mut ui),
-            Screen::Board => self.layout_board(&mut ui),
-        }
+        let chrome = match self.screen {
+            Screen::Library => {
+                self.layout_library(&mut ui);
+                None
+            }
+            Screen::Board => {
+                let chrome = self.board_chrome();
+                self.layout_board(&mut ui, &chrome);
+                Some(chrome)
+            }
+        };
         if let Some(overlay) = &self.overlay {
-            self.layout_overlay(&mut ui, overlay);
+            ui.overlay = true;
+            self.layout_overlay(&mut ui, overlay, chrome.as_ref());
         }
-        if let Some((text, _)) = &self.toast {
-            let d = self.d;
-            let tw = font::measure(Face::Regular, 14.0 * d, text).0;
-            let w = (tw + 32.0 * d).min(self.w as f32 - 32.0 * d);
-            let r = Rf::new(
-                (self.w as f32 - w) / 2.0,
-                self.h as f32 - 104.0 * d,
-                w,
-                48.0 * d,
+        if let Some((label, anchor, _)) = self.tool_tip {
+            ui.opacity = 255;
+            ui.offset_y = 0.0;
+            let anchor = scale_rect(anchor, 1.0 / ui.u);
+            let width = font::measure(Face::Medium, 22.0 * ui.u, label).0 / ui.u + 40.0;
+            let (r, _) = self.popover(anchor, width, 52.0, anchor, 14.0, true);
+            ui.push(
+                r,
+                Look::Toast {
+                    text: label.into(),
+                    error: false,
+                    compact: true,
+                    action_width: 0.0,
+                },
+                None,
             );
-            ui.push(r, Look::Toast(text.clone()), None);
+        }
+        if let Some(toast) = &self.toast {
+            self.layout_toast(&mut ui, toast, chrome.as_ref());
         }
         ui.nodes
     }
 
-    /// Library geometry: (padding, columns, card width, card height, top of
-    /// the grid before scrolling, content height).
-    fn library_metrics(&self) -> (f32, usize, f32, f32, f32, f32) {
-        let d = self.d;
-        let wdp = self.wdp();
-        let pad = if wdp >= 600.0 { 36.0 } else { 20.0 } * d;
-        let cols = if wdp >= 1000.0 {
-            4
-        } else if wdp >= 600.0 {
-            3
+    fn layout_toast(&self, ui: &mut Ui, toast: &Toast, chrome: Option<&BoardChrome>) {
+        let (w, h) = self.extent();
+        let (action_width, action) = toast.action.as_ref().map_or((0.0, None), |(name, act)| {
+            let width = (font::measure(Face::Bold, 24.0 * ui.u, name).0 / ui.u + 40.0).max(100.0);
+            (width, Some((*name, act.clone())))
+        });
+        let text_width = font::measure(Face::Medium, 24.0 * ui.u, &toast.text).0 / ui.u;
+        let width = (text_width + 128.0 + action_width)
+            .clamp(360.0, 1200.0)
+            .min(w - 32.0);
+        let mut r = Rf::new((w - width) / 2.0, h - 104.0, width, 80.0);
+        if let Some(c) = chrome {
+            if self.settings.dock == Dock::Bottom {
+                r.y = r.y.min(c.dock.y - 96.0);
+            }
+            for bar in [c.history, c.zoom, c.pages] {
+                if overlaps(r, bar) {
+                    r.y = r.y.min(bar.y - 96.0);
+                }
+            }
+        } else if r.right() > w - self.library_metrics().margin - 260.0 {
+            r.y -= 104.0;
+        }
+        let fade = self.fade_in(toast.start);
+        let fade_out = if self.settings.fast_ink {
+            1.0
         } else {
-            2
+            (toast.end.saturating_sub(self.now) as f32 / 150.0).min(1.0)
         };
-        let avail = self.w as f32 - 2.0 * pad;
-        let cw = ((avail - 14.0 * d * (cols as f32 - 1.0)) / cols as f32).max(1.0);
-        let ch = cw / 0.95;
-        let heading = paint::wrap(Face::Bold, 32.0 * d, "Make room for ideas.", avail).len() as f32
-            * 40.0
-            * d;
-        let grid_top = 64.0 * d + pad + heading + 8.0 * d + 20.0 * d + 28.0 * d;
-        let rows = self.boards.len().div_ceil(cols) as f32;
-        let content = grid_top + rows * ch + (rows - 1.0).max(0.0) * 14.0 * d + 90.0 * d;
-        (pad, cols, cw, ch, grid_top, content)
+        ui.opacity = (255.0 * fade.min(fade_out)).round() as u8;
+        ui.offset_y = 8.0 * (1.0 - fade);
+        ui.push(
+            r,
+            Look::Toast {
+                text: toast.text.clone(),
+                error: toast.error,
+                compact: false,
+                action_width,
+            },
+            action.as_ref().map(|_| Act::Nothing),
+        );
+        if let Some((label, act)) = action {
+            ui.push(
+                Rf::new(
+                    r.right() - action_width - 8.0,
+                    r.y + 4.0,
+                    action_width,
+                    72.0,
+                ),
+                Look::Label {
+                    text: label.into(),
+                    size: 24.0,
+                    face: Face::Bold,
+                    color: TOAST_ACTION,
+                    center: true,
+                },
+                Some(act),
+            );
+        }
+    }
+
+    fn fade_in(&self, start: u64) -> f32 {
+        if self.settings.fast_ink {
+            1.0
+        } else {
+            (self.now.saturating_sub(start) as f32 / 120.0).min(1.0)
+        }
+    }
+
+    fn library_metrics(&self) -> LibraryGrid {
+        let (w, _) = self.extent();
+        let margin = if w >= 1200.0 { 96.0 } else { 24.0 };
+        let header = 136.0;
+        let avail = (w - 2.0 * margin).max(1.0);
+        let columns = (((avail + 32.0) / 340.0).floor() as usize).clamp(1, 4);
+        let card_width = ((avail - 32.0 * (columns - 1) as f32) / columns as f32).min(408.0);
+        let card_height = card_width * 336.0 / 408.0;
+        let top = 320.0;
+        let rows = self.boards.len().div_ceil(columns);
+        let content = if rows == 0 {
+            0.0
+        } else {
+            top + rows as f32 * card_height + rows.saturating_sub(1) as f32 * 32.0 + 160.0
+        };
+        LibraryGrid {
+            margin,
+            header,
+            columns,
+            card_width,
+            card_height,
+            top,
+            content,
+        }
     }
 
     fn clamp_scroll(&mut self) {
-        let (.., content) = self.library_metrics();
-        let max = (content - self.h as f32).max(0.0);
+        let max = (self.library_metrics().content * self.unit() - self.h as f32).max(0.0);
         self.scroll = self.scroll.clamp(0.0, max);
     }
 
     fn layout_library(&self, ui: &mut Ui) {
-        let d = self.d;
-        let (w, h) = (self.w as f32, self.h as f32);
-        let (pad, cols, cw, ch, grid_top, _) = self.library_metrics();
-        let avail = w - 2.0 * pad;
-        let top = 64.0 * d + pad - self.scroll;
+        let (w, h) = self.extent();
+        let grid = self.library_metrics();
+        let margin = grid.margin;
+        let wide = w - 2.0 * margin >= 1030.0;
+        let scroll = self.scroll / ui.u;
+        let avail = w - 2.0 * margin;
+        let mut right = w - margin;
 
-        // Heading.
-        let lines = paint::wrap(Face::Bold, 32.0 * d, "Make room for ideas.", avail).len() as f32;
-        let heading = lines * 40.0 * d;
         ui.push(
-            Rf::new(pad, top, avail, heading),
-            Look::Para {
-                text: "Make room for ideas.".into(),
-                face: Face::Bold,
-                size: 32.0 * d,
-                line: 40.0 * d,
-                color: INK,
-                center: false,
+            Rf::new(0.0, 0.0, w, grid.header),
+            Look::Surface {
+                color: PAGE,
+                radius: 0.0,
+                level: if scroll > 0.0 { 1 } else { 0 },
+                border: false,
             },
-            None,
+            Some(Act::Nothing),
         );
-        ui.push(
-            Rf::new(pad, top + heading + 8.0 * d, avail, 20.0 * d),
-            Look::Label {
-                text: "A blank canvas. Endless possibilities.".into(),
-                face: Face::Regular,
-                size: 14.0 * d,
-                color: HINT,
-                center: false,
-            },
-            None,
+        ui.push(square(margin, 40.0, 56.0), Look::Logo, None);
+        let actions = [
+            (
+                Ico::Gear,
+                "Settings".to_string(),
+                184.0,
+                Act::Settings,
+                ButtonKind::White,
+            ),
+            (
+                Ico::Claude,
+                "Claude".to_string(),
+                172.0,
+                Act::Claude,
+                ButtonKind::White,
+            ),
+            (
+                Ico::Join,
+                "Join".to_string(),
+                148.0,
+                Act::Join,
+                ButtonKind::White,
+            ),
+        ];
+        for (icon, text, width, act, kind) in
+            actions
+                .into_iter()
+                .chain(self.update.as_ref().map(|(v, _)| {
+                    (
+                        Ico::Update,
+                        format!("Update {v}"),
+                        268.0,
+                        Act::Updates,
+                        ButtonKind::AccentTint,
+                    )
+                }))
+        {
+            let width = if wide {
+                width
+            } else {
+                72.0_f32.min((avail / 6.0).max(44.0))
+            };
+            right -= width;
+            ui.button(
+                Rf::new(right, 40.0, width, 72.0),
+                Some(icon),
+                if wide { text } else { String::new() },
+                kind,
+                true,
+                act,
+            );
+            right -= if wide { 16.0 } else { 8.0 };
+        }
+        ui.label(
+            Rf::new(margin + 72.0, 40.0, right - margin - 72.0, 72.0),
+            "Inkboard",
+            Face::Bold,
+            32.0,
+            TEXT1,
+            false,
         );
 
-        let grid_y = grid_top - self.scroll;
-        if self.listed && self.boards.is_empty() {
-            let mid = (grid_y + h) / 2.0 - 40.0 * d;
-            ui.push(
-                Rf::new(0.0, mid - 64.0 * d, w, 64.0 * d),
-                Look::Glyph {
-                    icon: icon::DRAW,
-                    size: 64.0 * d,
-                    color: PURPLE,
-                },
-                None,
+        ui.clip = Some(
+            scale_rect(
+                Rf::new(0.0, grid.header, w, (h - grid.header).max(0.0)),
+                ui.u,
+            )
+            .covering(0.0),
+        );
+        if self.boards.is_empty() && self.listed {
+            let y = place_in(h / 2.0 - 120.0, grid.header + 24.0, 420.0);
+            ui.push(square(w / 2.0 - 80.0, y, 160.0), Look::EmptyLogo, None);
+            ui.label(
+                Rf::new(margin, y + 184.0, avail, 48.0),
+                "Make room for ideas.",
+                Face::Bold,
+                36.0,
+                TEXT1,
+                true,
             );
-            ui.push(
-                Rf::new(pad, mid + 20.0 * d, avail, 28.0 * d),
-                Look::Label {
-                    text: "Your next idea starts here".into(),
-                    face: Face::Regular,
-                    size: 22.0 * d,
-                    color: INK,
-                    center: true,
-                },
-                None,
+            ui.label(
+                Rf::new(margin, y + 240.0, avail, 32.0),
+                "Tap New board to start.",
+                Face::Regular,
+                24.0,
+                TEXT2,
+                true,
             );
-            ui.push(
-                Rf::new(pad, mid + 56.0 * d, avail, 20.0 * d),
-                Look::Label {
-                    text: "Create a board and make your first mark.".into(),
-                    face: Face::Regular,
-                    size: 14.0 * d,
-                    color: HINT,
-                    center: true,
-                },
-                None,
+        } else {
+            ui.label(
+                Rf::new(margin, 168.0 - scroll, avail, 64.0),
+                "Your boards",
+                Face::Bold,
+                56.0,
+                TEXT1,
+                false,
+            );
+            let count = self.boards.len();
+            let subtitle = if !self.listed {
+                "Loading boards…".into()
+            } else {
+                let noun = if count == 1 { "board" } else { "boards" };
+                format!("{count} {noun}  ·  Pick one to keep working, or start a new one.")
+            };
+            ui.label(
+                Rf::new(margin, 232.0 - scroll, avail, 40.0),
+                subtitle,
+                Face::Regular,
+                24.0,
+                TEXT2,
+                false,
             );
         }
-        for (i, b) in self.boards.iter().enumerate() {
-            let (row, col) = (i / cols, i % cols);
-            let r = Rf::new(
-                pad + col as f32 * (cw + 14.0 * d),
-                grid_y + row as f32 * (ch + 14.0 * d),
-                cw,
-                ch,
-            );
-            if r.bottom() < 64.0 * d || r.y > h {
+
+        let stamp = self.timestamp();
+        let today = stamp.get(..10).unwrap_or("");
+        let cw = grid.card_width;
+        let ch = grid.card_height;
+        for (i, meta) in self.boards.iter().enumerate() {
+            let x = margin + (i % grid.columns) as f32 * (cw + 32.0);
+            let y = grid.top + (i / grid.columns) as f32 * (ch + 32.0) - scroll;
+            // One row on each side of the viewport supports keyboard scrolling.
+            if y + ch < grid.header - ch - 32.0 || y > h + ch + 32.0 {
                 continue;
             }
+            let card = Rf::new(x, y, cw, ch);
+            let factor = cw / 408.0;
+            ui.surface(card, 28.0, 1, Some(Act::Open(meta.id.clone())));
+            let gen = self
+                .thumbs
+                .get(&meta.id)
+                .filter(|t| t.updated == meta.updated)
+                .map_or(0, |t| t.gen);
             ui.push(
-                r,
-                Look::Surface {
-                    color: WHITE,
-                    radius: 12.0,
-                    elev: 1.0,
-                    border: false,
-                },
-                Some(Act::Open(b.id.clone())),
-            );
-            let thumb = Rf::new(
-                r.x + 14.0 * d,
-                r.y + 14.0 * d,
-                r.w - 28.0 * d,
-                (r.h - 28.0 * d - 56.0 * d).max(1.0),
-            );
-            let gen = self.thumbs.get(&b.id).map_or(0, |t| t.gen);
-            ui.push(
-                thumb,
+                Rf::new(
+                    x + 8.0,
+                    y + 8.0,
+                    cw - 16.0,
+                    (236.0 * factor).min(ch - 100.0),
+                ),
                 Look::Thumb {
-                    id: b.id.clone(),
+                    id: meta.id.clone(),
                     gen,
                 },
                 None,
             );
-            let row_y = r.bottom() - 56.0 * d;
-            let text_w = r.w - 14.0 * d - 48.0 * d;
-            ui.push(
-                Rf::new(r.x + 14.0 * d, row_y + 6.0 * d, text_w, 20.0 * d),
-                Look::Label {
-                    text: b.title.clone(),
-                    face: Face::Medium,
-                    size: 14.0 * d,
-                    color: INK,
-                    center: false,
-                },
-                None,
+            let info_y = card.bottom() - 92.0;
+            let info_w = cw - 104.0;
+            ui.label(
+                Rf::new(x + 24.0, info_y + 6.0, info_w, 36.0),
+                &meta.title,
+                Face::Bold,
+                26.0,
+                TEXT1,
+                false,
             );
-            let marks = if b.shapes == 1 {
-                "1 mark".to_string()
-            } else {
-                format!("{} marks", b.shapes)
-            };
-            ui.push(
-                Rf::new(r.x + 14.0 * d, row_y + 26.0 * d, text_w, 16.0 * d),
-                Look::Label {
-                    text: marks,
-                    face: Face::Regular,
-                    size: 12.0 * d,
-                    color: GREY,
-                    center: false,
-                },
-                None,
+            let date = meta.updated.get(..10).unwrap_or(&meta.updated);
+            let date = if date == today { "Today" } else { date };
+            let marks = if meta.shapes == 1 { "mark" } else { "marks" };
+            ui.label(
+                Rf::new(x + 24.0, info_y + 44.0, info_w, 28.0),
+                format!("{} {marks}  ·  {date}", meta.shapes),
+                Face::Regular,
+                20.0,
+                TEXT3,
+                false,
             );
             ui.push(
-                Rf::new(r.right() - 48.0 * d, row_y, 48.0 * d, 48.0 * d),
-                Look::AppIcon {
-                    icon: icon::MORE,
-                    badge: false,
+                square(card.right() - 80.0, card.bottom() - 84.0, 72.0),
+                Look::IconBtn {
+                    ico: Ico::Kebab,
+                    size: 32.0,
+                    selected: false,
+                    enabled: true,
                 },
-                Some(Act::CardMenu(b.id.clone())),
+                Some(Act::CardMenu(meta.id.clone())),
             );
         }
-
-        // App bar, over the scrolled content.
+        ui.clip = None;
+        let fw = 244.0_f32.min(avail);
         ui.push(
-            Rf::new(0.0, 0.0, w, 64.0 * d),
-            Look::Surface {
-                color: PAGE,
-                radius: 0.0,
-                elev: if self.scroll > 0.0 { 0.6 } else { 0.0 },
-                border: false,
+            Rf::new(w - margin - fw, h - 136.0, fw, 88.0),
+            Look::Button {
+                icon: Some(Ico::Plus),
+                text: "New board".into(),
+                kind: ButtonKind::Primary,
+                pill: true,
+                level: 2,
             },
-            None,
-        );
-        ui.push(
-            Rf::new(16.0 * d, 14.0 * d, 36.0 * d, 36.0 * d),
-            Look::Logo,
-            None,
-        );
-        ui.push(
-            Rf::new(62.0 * d, 0.0, (w - 62.0 * d - 212.0 * d).max(0.0), 64.0 * d),
-            Look::Label {
-                text: "Inkboard".into(),
-                face: Face::Regular,
-                size: 22.0 * d,
-                color: INK,
-                center: false,
-            },
-            None,
-        );
-        ui.push(
-            Rf::new(w - 200.0 * d, 8.0 * d, 48.0 * d, 48.0 * d),
-            Look::AppIcon {
-                icon: icon::JOIN,
-                badge: false,
-            },
-            Some(Act::Join),
-        );
-        ui.push(
-            Rf::new(w - 152.0 * d, 8.0 * d, 48.0 * d, 48.0 * d),
-            Look::AppIcon {
-                icon: icon::CLAUDE,
-                badge: false,
-            },
-            Some(Act::Claude),
-        );
-        ui.push(
-            Rf::new(w - 104.0 * d, 8.0 * d, 48.0 * d, 48.0 * d),
-            Look::AppIcon {
-                icon: icon::SPEED,
-                badge: false,
-            },
-            Some(Act::Display),
-        );
-        ui.push(
-            Rf::new(w - 56.0 * d, 8.0 * d, 48.0 * d, 48.0 * d),
-            Look::AppIcon {
-                icon: icon::UPDATE,
-                badge: self.update.is_some(),
-            },
-            Some(Act::Updates),
-        );
-
-        // New board button.
-        let label_w = font::measure(Face::Medium, 14.0 * d, "New board").0;
-        let fw = 16.0 * d + 24.0 * d + 8.0 * d + label_w + 20.0 * d;
-        ui.push(
-            Rf::new(w - 16.0 * d - fw, h - 16.0 * d - 56.0 * d, fw, 56.0 * d),
-            Look::Fab,
             Some(Act::NewBoard),
         );
     }
 
-    fn layout_board(&self, ui: &mut Ui) {
-        let d = self.d;
-        let w = self.w as f32;
-        let h = self.h as f32;
-        let wdp = self.wdp();
-        let wide = wdp >= 700.0;
-        let large = wdp >= 1200.0;
-        let b = 42.0 * d; // button slot: 40 plus a margin of 1 on each side
-        let pad = 4.0 * d;
-        let ed = &self.ed;
-
-        // Top left: back, menu, title, undo, redo.
-        let title = self
-            .board
-            .as_ref()
-            .map(|b| b.title.clone())
-            .unwrap_or_default();
-        let (status, failed) = match self.save_state {
-            SaveState::Saved => ("Saved", false),
-            SaveState::Saving => ("Saving…", false),
-            SaveState::Failed => ("Save failed • tap to retry", true),
-        };
-        let status = if failed {
-            status.to_string()
-        } else if let Some(code) = self.host_code() {
-            format!("{status} • sharing {code}")
-        } else if self.link.is_some() {
-            match self.link_online {
-                Some(true) => format!("{status} • live"),
-                Some(false) => format!("{status} • reconnecting…"),
-                None => format!("{status} • connecting…"),
-            }
-        } else {
-            status.to_string()
-        };
-        let sharing = self.host_code().is_some() || self.link.is_some();
-        let title_w = if wide {
-            let tw = font::measure(Face::Medium, 14.0 * d, &title)
-                .0
-                .max(font::measure(Face::Regular, 11.0 * d, &status).0);
-            tw.min(220.0 * d) + 12.0 * d
+    fn board_chrome(&self) -> BoardChrome {
+        let (w, h) = self.extent();
+        let dock_side = self.settings.dock;
+        let margin = 24.0_f32.min(w / 12.0).min(h / 12.0);
+        let compact = (w / 460.0).min(h / 380.0).min(1.0);
+        let bar_h = 88.0 * compact;
+        let share_chip = if w >= 760.0 && (self.host_code().is_some() || self.joined()) {
+            248.0
         } else {
             0.0
         };
-        let x0 = 10.0 * d;
-        let y0 = 10.0 * d;
-        let panel_w = pad * 2.0 + b * 5.0 + title_w;
-        ui.panel(Rf::new(x0, y0, panel_w, pad * 2.0 + b));
-        let mut x = x0 + pad;
-        let y = y0 + pad;
-        ui.btn(x, y, b, icon::BACK, false, true, Act::Back);
-        x += b;
-        let menu_r = Rf::new(x + d, y + d, b - 2.0 * d, b - 2.0 * d);
-        ui.push(
-            menu_r,
-            Look::Btn {
-                icon: icon::MENU,
-                isz: 20.0 * d,
-                active: false,
-                enabled: true,
-            },
-            Some(Act::Menu),
+        let right_w = 160.0 * compact + share_chip;
+        let left_w = 400.0_f32.min(w - 3.0 * margin - right_w);
+        let left = Rf::new(margin, margin, left_w, bar_h);
+        let right = Rf::new(w - margin - right_w, margin, right_w, bar_h);
+        let bottom_scale = ((w - 3.0 * margin) / 528.0).min(compact);
+        let bottom_h = 88.0 * bottom_scale;
+        let bottom_y = h - 8.0 * compact - bottom_h;
+        let mut history = Rf::new(margin, bottom_y, 168.0 * bottom_scale, bottom_h);
+        let mut zoom = Rf::new(
+            w - margin - 360.0 * bottom_scale,
+            bottom_y,
+            360.0 * bottom_scale,
+            bottom_h,
         );
-        x += b;
-        if wide {
-            ui.push(
-                Rf::new(x, y, title_w, b),
-                Look::TitleBlock {
-                    title,
-                    status,
-                    failed,
-                },
-                if failed { Some(Act::Retry) } else { None },
+
+        let top = left.bottom() + 16.0 * compact;
+        let available = if dock_side.vertical() {
+            history.y - 16.0 * compact - top
+        } else {
+            w - 2.0 * margin
+        };
+        let k = (available / 754.0).min(compact).max(0.0);
+        let long = 754.0 * k;
+        let short = 96.0 * k;
+        let dock = match dock_side {
+            Dock::Left => Rf::new(margin, top + (available - long) / 2.0, short, long),
+            Dock::Right => Rf::new(
+                w - margin - short,
+                top + (available - long) / 2.0,
+                short,
+                long,
+            ),
+            Dock::Bottom => {
+                let r = Rf::new((w - long) / 2.0, h - margin - short, long, short);
+                if overlaps(r, history) || overlaps(r, zoom) {
+                    history.y = r.y - 16.0 * compact - history.h;
+                    zoom.y = history.y;
+                }
+                r
+            }
+            Dock::Top => {
+                let mut r = Rf::new((w - long) / 2.0, margin, long, short);
+                if overlaps(r, left) || overlaps(r, right) {
+                    r.y = top;
+                }
+                r
+            }
+        };
+        let point = |along: f32, cross: f32, length: f32, thickness: f32| {
+            if dock_side.vertical() {
+                Rf::new(
+                    dock.x + cross * k,
+                    dock.y + along * k,
+                    thickness * k,
+                    length * k,
+                )
+            } else {
+                Rf::new(
+                    dock.x + along * k,
+                    dock.y + cross * k,
+                    length * k,
+                    thickness * k,
+                )
+            }
+        };
+        let offsets = [12.0, 90.0, 184.0, 262.0, 340.0, 418.0, 496.0, 574.0, 670.0];
+        let buttons = offsets.map(|offset| point(offset, 12.0, 72.0, 72.0));
+        let dividers = [point(172.0, 20.0, 2.0, 56.0), point(658.0, 20.0, 2.0, 56.0)];
+
+        let centered =
+            |width: f32, y: f32| Rf::new((w - width * compact) / 2.0, y, width * compact, bar_h);
+        let mut pages = if self.joined() {
+            Rf::default()
+        } else if dock_side == Dock::Bottom {
+            let mut r = centered(296.0, margin);
+            if overlaps(r, left) || overlaps(r, right) {
+                r.y = top;
+            }
+            r
+        } else {
+            let mut r = centered(296.0, bottom_y);
+            if overlaps(r, history) || overlaps(r, zoom) {
+                r.y = history.y - r.h - 16.0 * compact;
+            }
+            r
+        };
+        if self.board.is_none() {
+            pages = Rf::default();
+        }
+        let text = self.ed.selected_text_count() > 0;
+        let inks = self.ed.selected_ink_count() > 0;
+        let count = 2 + if text { 3 } else { 0 } + if inks { 1 } else { 0 };
+        let selection_scale = compact.min((w - 2.0 * margin) / (16.0 + 78.0 * count as f32));
+        let sw = (16.0 + 78.0 * count as f32) * selection_scale;
+        let mut selection = Rf::new((w - sw) / 2.0, margin, sw, 88.0 * selection_scale);
+        for top_control in [
+            left,
+            right,
+            if dock_side == Dock::Top {
+                dock
+            } else {
+                Rf::default()
+            },
+            pages,
+        ] {
+            if overlaps(selection, top_control) {
+                selection.y = top_control.bottom() + 16.0 * compact;
+            }
+        }
+
+        BoardChrome {
+            left,
+            right,
+            history,
+            zoom,
+            dock,
+            dock_scale: k,
+            buttons,
+            dividers,
+            pages,
+            selection,
+        }
+    }
+
+    fn layout_board(&self, ui: &mut Ui, c: &BoardChrome) {
+        let s = c.left.h / 88.0;
+        let relative = |r: Rf, x: f32, y: f32, w: f32, h: f32, f: f32| {
+            Rf::new(r.x + x * f, r.y + y * f, w * f, h * f)
+        };
+        let bar_button = |r, x| relative(r, x, 8.0, 72.0, 72.0, s);
+        ui.surface(c.left, 28.0, 1, Some(Act::Nothing));
+        ui.scaled_icon(
+            bar_button(c.left, 8.0),
+            Ico::Back,
+            s,
+            false,
+            true,
+            Act::Back,
+        );
+        if let Some(board) = &self.board {
+            let (status, failed) = match self.save_state {
+                SaveState::Failed => ("Save failed. Tap to retry", true),
+                SaveState::Saving => ("Saving…", false),
+                SaveState::Saved if self.unsaved => ("Saving…", false),
+                SaveState::Saved => ("Saved", false),
+            };
+            let x = c.left.x + 96.0 * s;
+            let rw = c.left.right() - x - 12.0 * s;
+            let status_look = Look::TitleBlock {
+                title: board.title.clone(),
+                status: status.into(),
+                failed,
+            };
+            ui.scaled(
+                Rf::new(x, c.left.y, rw, c.left.h),
+                status_look,
+                Some(Act::Rename(board.id.clone())),
+                s,
             );
-            x += title_w;
-        }
-        ui.btn(x, y, b, icon::UNDO, false, ed.doc.can_undo(), Act::Undo);
-        x += b;
-        ui.btn(x, y, b, icon::REDO, false, ed.doc.can_redo(), Act::Redo);
-        x += b;
-        ui.btn(x, y, b, icon::SHARE, sharing, true, Act::Share);
-
-        // Selection actions.
-        let selected = ed.doc.selected_ids().len();
-        if selected > 0 {
-            let texts = ed.selected_text_count();
-            let inks = ed.selected_ink_count();
-            let mut acts = vec![(icon::DELETE, Act::Delete)];
-            if inks > 0 {
-                acts.push((icon::TO_TEXT, Act::Convert));
-            }
-            if texts > 0 {
-                acts.push((icon::FONT, Act::FontPanel));
-                acts.push((icon::BIGGER, Act::Bigger));
-                acts.push((icon::SMALLER, Act::Smaller));
-            }
-            let sy = y0 + pad * 2.0 + b + 8.0 * d;
-            ui.panel(Rf::new(
-                x0,
-                sy,
-                pad * 2.0 + b * acts.len() as f32,
-                pad * 2.0 + b,
-            ));
-            for (i, (code, act)) in acts.into_iter().enumerate() {
-                ui.btn(x0 + pad + b * i as f32, sy + pad, b, code, false, true, act);
+            if failed {
+                ui.push(
+                    Rf::new(x, c.left.y + 48.0 * s, rw, c.left.h - 48.0 * s),
+                    Look::Scrim(0),
+                    Some(Act::Retry),
+                );
             }
         }
 
-        // Top right: style.
-        let style_x = w - 10.0 * d - (pad * 2.0 + b);
-        ui.panel(Rf::new(style_x, y0, pad * 2.0 + b, pad * 2.0 + b));
-        ui.push(
-            Rf::new(style_x + pad + d, y0 + pad + d, b - 2.0 * d, b - 2.0 * d),
-            Look::StyleDot {
-                color: ed.color(),
-                open: self.style_open,
+        let menu = matches!(
+            self.overlay,
+            Some(Overlay::Menu {
+                kind: MenuKind::Main,
+                ..
+            })
+        );
+        ui.surface(c.right, 28.0, 1, Some(Act::Nothing));
+        let chip_w = c.right.w - 160.0 * s;
+        let live = self.joined();
+        let code = self.host_code();
+        if chip_w > 0.0 {
+            let text = code.as_deref().map_or_else(
+                || {
+                    if self.link_online == Some(true) {
+                        "Live board".into()
+                    } else {
+                        "Connecting…".into()
+                    }
+                },
+                |code| format!("Sharing {}", grouped_code(code)),
+            );
+            ui.push(
+                Rf::new(c.right.x + 8.0, c.right.y + 12.0, chip_w - 12.0, 64.0),
+                Look::StatusDot {
+                    text,
+                    online: !live || self.link_online == Some(true),
+                    chip: true,
+                },
+                Some(Act::Share),
+            );
+        }
+        ui.scaled_icon(
+            bar_button(c.right, chip_w / s + 4.0),
+            Ico::Share,
+            s,
+            false,
+            true,
+            Act::Share,
+        );
+        ui.scaled_icon(
+            bar_button(c.right, chip_w / s + 80.0),
+            Ico::More,
+            s,
+            menu,
+            true,
+            Act::Menu,
+        );
+
+        for bar in [c.history, c.zoom] {
+            ui.surface(bar, 28.0, 1, Some(Act::Nothing));
+        }
+        let b = c.history.h / 88.0;
+        ui.scaled_icon(
+            relative(c.history, 8.0, 8.0, 72.0, 72.0, b),
+            Ico::Undo,
+            b,
+            false,
+            self.ed.doc.can_undo(),
+            Act::Undo,
+        );
+        ui.scaled_icon(
+            relative(c.history, 88.0, 8.0, 72.0, 72.0, b),
+            Ico::Redo,
+            b,
+            false,
+            self.ed.doc.can_redo(),
+            Act::Redo,
+        );
+        ui.scaled_icon(
+            relative(c.zoom, 8.0, 8.0, 72.0, 72.0, b),
+            Ico::Minus,
+            b,
+            false,
+            true,
+            Act::ZoomOut,
+        );
+        ui.scaled(
+            relative(c.zoom, 88.0, 8.0, 104.0, 72.0, b),
+            Look::Label {
+                text: format!("{:.0}%", self.ed.zoom() * 100.0),
+                face: Face::Medium,
+                size: 22.0,
+                color: TEXT1,
+                center: true,
+            },
+            Some(Act::Zoom100),
+            b,
+        );
+        ui.scaled_icon(
+            relative(c.zoom, 200.0, 8.0, 72.0, 72.0, b),
+            Ico::Plus,
+            b,
+            false,
+            true,
+            Act::ZoomIn,
+        );
+        ui.scaled_icon(
+            relative(c.zoom, 280.0, 8.0, 72.0, 72.0, b),
+            Ico::Fit,
+            b,
+            false,
+            true,
+            Act::Fit,
+        );
+
+        let tool = self.ed.tool();
+        let mode = self.ed.pen_mode();
+        let selected = !self.ed.doc.selected_ids().is_empty();
+        let shape_ico = self.last_shape.map_or(Ico::Shapes, |i| SHAPES[i].1);
+        let tools = [
+            (
+                Ico::Select,
+                tool == Tool::Select,
+                Act::Tool(Tool::Select, PenMode::Ink),
+            ),
+            (
+                Ico::Hand,
+                tool == Tool::Hand,
+                Act::Tool(Tool::Hand, PenMode::Ink),
+            ),
+            (
+                Ico::Pen,
+                tool == Tool::Pen && mode == PenMode::Ink && !self.highlighter,
+                Act::Tool(Tool::Pen, PenMode::Ink),
+            ),
+            (Ico::Highlighter, self.highlighter, Act::Highlighter),
+            (
+                Ico::Eraser,
+                tool == Tool::Eraser,
+                Act::Tool(Tool::Eraser, PenMode::Ink),
+            ),
+            (
+                shape_ico,
+                self.shape_tool_active() || matches!(self.overlay, Some(Overlay::Shapes)),
+                Act::Shapes,
+            ),
+            (
+                Ico::Text,
+                tool == Tool::Text,
+                Act::Tool(Tool::Text, PenMode::Ink),
+            ),
+            (
+                Ico::Convert,
+                tool == Tool::Pen && mode == PenMode::Write,
+                Act::Tool(Tool::Pen, PenMode::Write),
+            ),
+        ];
+        ui.scaled(
+            c.dock,
+            Look::Surface {
+                color: SURFACE,
+                radius: 32.0,
+                level: 1,
+                border: true,
+            },
+            Some(Act::Nothing),
+            c.dock_scale,
+        );
+        for (r, (icon, active, act)) in c.buttons.iter().zip(tools) {
+            ui.scaled_icon(*r, icon, c.dock_scale, active, true, act);
+        }
+        for r in c.dividers {
+            ui.push(r, Look::Rule, None);
+        }
+        let style_open = matches!(self.overlay, Some(Overlay::Style));
+        ui.scaled(
+            c.buttons[8],
+            Look::ColorChip {
+                color: self.style_color(),
+                open: style_open,
             },
             Some(Act::Style),
+            c.dock_scale,
         );
-        if self.style_open || large {
-            let pw = 168.0 * d;
-            let inner = pw - 16.0 * d;
-            let sw = 42.0 * d;
-            let per_row = ((inner / sw).floor() as usize).max(1);
-            let rows = PALETTE.len().div_ceil(per_row);
-            let gap = (inner - sw * per_row as f32) / (per_row as f32 - 1.0).max(1.0);
-            let ph =
-                8.0 * d + rows as f32 * sw + 14.0 * d + 40.0 * d + 14.0 * d + 36.0 * d + 8.0 * d;
-            let px = w - 10.0 * d - pw;
-            let py = y0 + pad * 2.0 + b + 8.0 * d;
-            ui.panel(Rf::new(px, py, pw, ph));
-            let ix = px + 8.0 * d;
-            let mut iy = py + 8.0 * d;
-            for (i, c) in PALETTE.iter().enumerate() {
-                let (row, col) = (i / per_row, i % per_row);
-                let r = Rf::new(ix + col as f32 * (sw + gap), iy + row as f32 * sw, sw, sw);
-                ui.push(
-                    r,
-                    Look::Swatch {
-                        color: *c,
-                        chosen: ed.color() == *c,
-                    },
-                    Some(Act::Color(*c)),
-                );
+
+        if c.pages.w > 0.0 {
+            let r = c.pages;
+            ui.surface(r, 28.0, 1, Some(Act::Nothing));
+            ui.scaled_icon(
+                relative(r, 8.0, 8.0, 64.0, 72.0, s),
+                Ico::ChevronLeft,
+                s,
+                false,
+                self.page > 0,
+                Act::PagePrev,
+            );
+            ui.scaled(
+                relative(r, 76.0, 8.0, 72.0, 72.0, s),
+                Look::Label {
+                    text: format!("{} / {}", self.page + 1, self.pages.len()),
+                    face: Face::Medium,
+                    size: 22.0,
+                    color: TEXT1,
+                    center: true,
+                },
+                (self.pages.len() > 1).then_some(Act::PageMenu),
+                s,
+            );
+            ui.scaled_icon(
+                relative(r, 152.0, 8.0, 64.0, 72.0, s),
+                Ico::Chevron,
+                s,
+                false,
+                self.page + 1 < self.pages.len(),
+                Act::PageNext,
+            );
+            ui.scaled_icon(
+                relative(r, 224.0, 8.0, 64.0, 72.0, s),
+                Ico::Plus,
+                s,
+                false,
+                true,
+                Act::PageAdd,
+            );
+        }
+
+        if selected {
+            let r = c.selection;
+            let f = r.h / 88.0;
+            let mut x = 8.0;
+            ui.surface(r, 28.0, 1, Some(Act::Nothing));
+            ui.scaled(
+                relative(r, x, 8.0, 72.0, 72.0, f),
+                Look::ColorChip {
+                    color: self.style_color(),
+                    open: style_open,
+                },
+                Some(Act::Style),
+                f,
+            );
+            x += 78.0;
+            let mut items = Vec::with_capacity(5);
+            if self.ed.selected_ink_count() > 0 {
+                items.push((Ico::Convert, Act::Convert));
             }
-            iy += rows as f32 * sw;
-            ui.push(Rf::new(ix, iy, inner, 14.0 * d), Look::Rule, None);
-            iy += 14.0 * d;
-            let cwid = inner / SIZES.len() as f32;
-            for (i, (label, width)) in SIZES.iter().enumerate() {
-                let chosen = (ed.stroke_width() - width).abs() < 0.01;
-                ui.push(
-                    Rf::new(ix + cwid * i as f32, iy, cwid, 40.0 * d),
-                    Look::Chip {
-                        text: (*label).into(),
-                        chosen,
-                    },
-                    Some(Act::Width(i)),
-                );
+            if self.ed.selected_text_count() > 0 {
+                items.extend([
+                    (Ico::Font, Act::FontPanel),
+                    (Ico::Bigger, Act::Bigger),
+                    (Ico::Smaller, Act::Smaller),
+                ]);
             }
-            iy += 40.0 * d;
-            ui.push(Rf::new(ix, iy, inner, 14.0 * d), Look::Rule, None);
-            iy += 14.0 * d;
-            ui.push(
-                Rf::new(ix + 6.0 * d, iy, 60.0 * d, 36.0 * d),
+            items.push((Ico::Trash, Act::Delete));
+            for (icon, act) in items {
+                ui.scaled_icon(
+                    relative(r, x, 8.0, 72.0, 72.0, f),
+                    icon,
+                    f,
+                    false,
+                    true,
+                    act,
+                );
+                x += 78.0;
+            }
+        }
+    }
+
+    fn popover(
+        &self,
+        dock: Rf,
+        width: f32,
+        height: f32,
+        anchor: Rf,
+        gap: f32,
+        centered: bool,
+    ) -> (Rf, f32) {
+        let (w, h) = self.extent();
+        let side = self.settings.dock;
+        let edge = 16.0;
+        let (avail_w, avail_h) = match side {
+            Dock::Left => (w - dock.right() - gap - edge, h - 2.0 * edge),
+            Dock::Right => (dock.x - gap - edge, h - 2.0 * edge),
+            Dock::Bottom => (w - 2.0 * edge, dock.y - gap - edge),
+            Dock::Top => (w - 2.0 * edge, h - dock.bottom() - gap - edge),
+        };
+        let scale = (avail_w / width).min(avail_h / height).clamp(0.0, 1.0);
+        let (pw, ph) = (width * scale, height * scale);
+        let x = match side {
+            Dock::Left => dock.right() + gap,
+            Dock::Right => dock.x - gap - pw,
+            _ => place_in(anchor.cx() - pw / 2.0, edge, w - edge - pw),
+        };
+        let y = match side {
+            Dock::Bottom => dock.y - gap - ph,
+            Dock::Top => dock.bottom() + gap,
+            _ => place_in(
+                if centered {
+                    anchor.cy() - ph / 2.0
+                } else {
+                    anchor.bottom() - ph
+                },
+                edge,
+                h - edge - ph,
+            ),
+        };
+        (Rf::new(x, y, pw, ph), scale)
+    }
+
+    fn layout_style(&self, ui: &mut Ui, c: &BoardChrome) {
+        let fill = self.shape_tool_active();
+        let height = if fill { 448.0 } else { 352.0 };
+        let anchor = c.buttons[8];
+        let (r, k) = self.popover(c.dock, 536.0, height, anchor, 20.0, false);
+        if k <= 0.0 {
+            return;
+        }
+        let at = |x, y, w, h| Rf::new(r.x + x * k, r.y + y * k, w * k, h * k);
+        ui.scaled(
+            r,
+            Look::Surface {
+                color: SURFACE,
+                radius: 28.0,
+                level: 2,
+                border: true,
+            },
+            Some(Act::Nothing),
+            k,
+        );
+        let n = 12.0 * k;
+        let side = self.settings.dock;
+        let notch = if side.vertical() {
+            let cy = place_in(anchor.cy(), r.y + 25.0 * k, r.bottom() - 25.0 * k);
+            let x = if side == Dock::Left {
+                r.x - n
+            } else {
+                r.right() - 2.0 * k
+            };
+            Rf::new(x, cy - n, n + 2.0 * k, 2.0 * n)
+        } else {
+            let cx = place_in(anchor.cx(), r.x + 25.0 * k, r.right() - 25.0 * k);
+            let y = if side == Dock::Top {
+                r.y - n
+            } else {
+                r.bottom() - 2.0 * k
+            };
+            Rf::new(cx - n, y, 2.0 * n, n + 2.0 * k)
+        };
+        ui.scaled(notch, Look::Notch(side), Some(Act::Nothing), k);
+        ui.scaled(
+            at(24.0, 18.0, 488.0, 22.0),
+            Look::Overline("COLOR".into()),
+            None,
+            k,
+        );
+        let current_color = self.style_color();
+        for (i, color) in PALETTE.into_iter().enumerate() {
+            let chosen = current_color == color;
+            ui.scaled(
+                at(
+                    24.0 + (i % 6) as f32 * 80.0,
+                    46.0 + (i / 6) as f32 * 80.0,
+                    72.0,
+                    72.0,
+                ),
+                Look::Swatch { color, chosen },
+                Some(Act::Color(color)),
+                k,
+            );
+        }
+        ui.scaled(
+            at(24.0, 218.0, 488.0, 24.0),
+            Look::Overline("THICKNESS".into()),
+            None,
+            k,
+        );
+        let widths = if self.highlighter {
+            HL_WIDTHS
+        } else {
+            PEN_WIDTHS
+        };
+        let samples = if self.highlighter {
+            [8.0, 14.0, 22.0, 32.0]
+        } else {
+            [3.0, 6.0, 10.0, 18.0]
+        };
+        let width = self
+            .ed
+            .doc
+            .selected_shapes()
+            .first()
+            .map_or(self.ed.stroke_width(), |s| s.width);
+        for (i, preview) in samples.into_iter().enumerate() {
+            ui.scaled(
+                at(24.0 + i as f32 * 122.0, 248.0, 112.0, 80.0),
+                Look::Thick {
+                    width: preview,
+                    chosen: (widths[i] - width).abs() < 0.01,
+                },
+                Some(Act::Width(i)),
+                k,
+            );
+        }
+        if fill {
+            ui.scaled(
+                at(24.0, 352.0, 152.0, 64.0),
                 Look::Label {
                     text: "Fill".into(),
-                    face: Face::Regular,
-                    size: 14.0 * d,
-                    color: ICON,
+                    face: Face::Medium,
+                    size: 24.0,
+                    color: TEXT1,
                     center: false,
                 },
                 None,
+                k,
             );
-            let filled = ed.filled();
-            let fx = ix + inner - 72.0 * d;
-            ui.push(
-                Rf::new(fx, iy, 36.0 * d, 36.0 * d),
-                Look::Btn {
-                    icon: icon::NO_FILL,
-                    isz: 18.0 * d,
-                    active: !filled,
-                    enabled: true,
-                },
-                Some(Act::Fill(false)),
-            );
-            ui.push(
-                Rf::new(fx + 36.0 * d, iy, 36.0 * d, 36.0 * d),
-                Look::Btn {
-                    icon: icon::FILL,
-                    isz: 18.0 * d,
-                    active: filled,
-                    enabled: true,
-                },
-                Some(Act::Fill(true)),
-            );
+            for (rr, look, act) in segment(
+                Rf::new(184.0, 352.0, 328.0, 64.0),
+                [("Outline", Act::Fill(false)), ("Filled", Act::Fill(true))],
+                usize::from(self.ed.filled()),
+            ) {
+                ui.scaled(at(rr.x, rr.y, rr.w, rr.h), look, act, k);
+            }
         }
+    }
 
-        // Bottom left: zoom.
-        if wide {
-            let zw = pad * 2.0 + b * 3.0 + 54.0 * d;
-            let zy = h - 10.0 * d - (pad * 2.0 + b);
-            ui.panel(Rf::new(x0, zy, zw, pad * 2.0 + b));
-            let mut zx = x0 + pad;
-            ui.btn(zx, zy + pad, b, icon::REMOVE, false, true, Act::ZoomOut);
-            zx += b;
-            let pct = format!("{}%", (ed.zoom() * 100.0).round() as i64);
-            ui.push(
-                Rf::new(zx + d, zy + pad + d, 52.0 * d, 40.0 * d),
-                Look::Chip {
-                    text: pct,
-                    chosen: false,
-                },
-                Some(Act::Zoom100),
+    fn layout_shapes(&self, ui: &mut Ui, c: &BoardChrome) {
+        let anchor = c.buttons[5];
+        let (r, k) = self.popover(c.dock, 408.0, 174.0, anchor, 20.0, true);
+        ui.scaled(
+            r,
+            Look::Surface {
+                color: SURFACE,
+                radius: 28.0,
+                level: 2,
+                border: true,
+            },
+            Some(Act::Nothing),
+            k,
+        );
+        for (i, (_, icon, _)) in SHAPES.iter().enumerate() {
+            let rr = square(
+                r.x + (12.0 + 78.0 * (i % 5) as f32) * k,
+                r.y + (12.0 + 78.0 * (i / 5) as f32) * k,
+                72.0 * k,
             );
-            zx += 54.0 * d;
-            ui.btn(zx, zy + pad, b, icon::ADD, false, true, Act::ZoomIn);
-            zx += b;
-            ui.btn(zx, zy + pad, b, icon::FIT, false, true, Act::Fit);
-        }
-
-        // Bottom centre: tools.
-        let tools: [(u32, Tool, PenMode); 9] = [
-            (icon::SELECT, Tool::Select, PenMode::Ink),
-            (icon::HAND, Tool::Hand, PenMode::Ink),
-            (icon::PEN, Tool::Pen, PenMode::Ink),
-            (icon::WRITE, Tool::Pen, PenMode::Write),
-            (icon::SMART, Tool::Pen, PenMode::Shape),
-            (icon::ERASER, Tool::Eraser, PenMode::Ink),
-            (icon::ARROW, Tool::Arrow, PenMode::Ink),
-            (icon::RECTANGLE, Tool::Rectangle, PenMode::Ink),
-            (icon::ELLIPSE, Tool::Ellipse, PenMode::Ink),
-        ];
-        let tb = (if large { 54.0 } else { 44.0 } * d)
-            .min((w - 20.0 * d - pad * 2.0) / tools.len() as f32);
-        let tw = pad * 2.0 + tb * tools.len() as f32;
-        let tx = (w - tw) / 2.0;
-        let ty = h - 10.0 * d - (pad * 2.0 + tb);
-        ui.panel(Rf::new(tx, ty, tw, pad * 2.0 + tb));
-        for (i, (code, tool, mode)) in tools.iter().enumerate() {
-            let active = ed.tool() == *tool && (*tool != Tool::Pen || ed.pen_mode() == *mode);
-            ui.btn(
-                tx + pad + tb * i as f32,
-                ty + pad,
-                tb,
-                *code,
-                active,
+            ui.scaled_icon(
+                rr,
+                *icon,
+                k,
+                self.last_shape == Some(i),
                 true,
-                Act::Tool(tool.index() as usize, *mode),
+                Act::Shape(i),
             );
         }
     }
 
-    fn menu_entries(&self, kind: &MenuKind) -> Vec<Entry> {
-        let s = &self.settings;
-        let item = |t: &str, c: Option<bool>, a: Act| Entry::Item(t.to_string(), c, a);
-        match kind {
-            MenuKind::Main => {
-                let mut v = vec![
-                    item("Share board…", None, Act::Share),
-                    item("Connect Claude…", None, Act::Claude),
-                    item("Export as PNG", None, Act::Export),
-                    Entry::Rule,
-                    item("Zoom to fit", None, Act::Fit),
-                    item("Show grid", Some(s.grid), Act::Toggle(Opt::Grid)),
-                    Entry::Rule,
-                    item("Hold to snap shapes", Some(s.snap), Act::Toggle(Opt::Snap)),
-                    Entry::Rule,
-                ];
-                for (i, (code, name)) in LANGS.iter().enumerate() {
-                    v.push(item(
-                        &format!("Handwriting: {name}"),
-                        Some(s.lang == *code),
-                        Act::Lang(i),
-                    ));
-                }
-                v.push(Entry::Rule);
-                v.push(item(
-                    "Tidy drawn shapes",
-                    Some(s.tidy),
-                    Act::Toggle(Opt::Tidy),
-                ));
-                v.push(item(
-                    "Turn handwriting into typed text",
-                    Some(s.typed),
-                    Act::Toggle(Opt::Typed),
-                ));
-                v.push(item(
-                    "Ignore palm touches",
-                    Some(s.palm),
-                    Act::Toggle(Opt::Palm),
-                ));
-                v.push(item(
-                    "Pen draws, fingers move the board",
-                    Some(s.pen_priority),
-                    Act::Toggle(Opt::PenPriority),
-                ));
-                v.push(item(
-                    "Several fingers can write at once",
-                    Some(s.multi_ink),
-                    Act::Toggle(Opt::MultiInk),
-                ));
-                v.push(item("Text font…", None, Act::FontPanel));
-                v.push(item("Display and speed…", None, Act::Display));
-                v
-            }
-            MenuKind::Display => {
-                let mut v = vec![
-                    item("Full panel resolution (slower on 4K)", Some(s.full_res), Act::FullRes),
-                    item("Low-latency ink", Some(s.fast_ink), Act::Toggle(Opt::FastInk)),
-                    Entry::Rule,
-                ];
-                for (i, name) in ["Ink prediction: off", "Ink prediction: low", "Ink prediction: medium", "Ink prediction: high"]
-                    .iter()
-                    .enumerate()
-                {
-                    v.push(item(name, Some(s.predict as usize == i), Act::Predict(i as u8)));
-                }
-                v.push(Entry::Rule);
-                v.push(item("Import boards…", None, Act::Import));
-                v
-            }
-            MenuKind::Card(id) => vec![
-                item("Rename", None, Act::Rename(id.clone())),
-                item("Delete", None, Act::AskDelete(id.clone())),
-            ],
-        }
-    }
-
-    fn layout_overlay(&self, ui: &mut Ui, overlay: &Overlay) {
-        let d = self.d;
-        let (w, h) = (self.w as f32, self.h as f32);
+    fn layout_overlay(&self, ui: &mut Ui, overlay: &Overlay, chrome: Option<&BoardChrome>) {
+        let (w, h) = self.extent();
+        let screen = Rf::new(0.0, 0.0, w, h);
+        let fade = self.fade_in(self.overlay_start);
+        ui.opacity = (255.0 * fade).round() as u8;
         match overlay {
-            Overlay::Menu {
-                kind,
-                anchor,
-                right,
-            } => {
-                ui.push(Rf::new(0.0, 0.0, w, h), Look::Scrim(0), Some(Act::Outside));
-                let entries = self.menu_entries(kind);
-                let checks = entries
-                    .iter()
-                    .any(|e| matches!(e, Entry::Item(_, Some(_), _)));
-                let lead = if checks { 48.0 * d } else { 12.0 * d };
-                let widest = entries
-                    .iter()
-                    .map(|e| match e {
-                        Entry::Item(t, ..) => font::measure(Face::Regular, 14.0 * d, t).0,
-                        Entry::Rule => 0.0,
-                    })
-                    .fold(0.0, f32::max);
-                let mw = (lead + widest + 24.0 * d)
-                    .clamp(112.0 * d, 320.0 * d)
-                    .min(w - 16.0 * d);
-                let items = entries
-                    .iter()
-                    .filter(|e| matches!(e, Entry::Item(..)))
-                    .count() as f32;
-                let rules = entries.len() as f32 - items;
-                let room = h - 16.0 * d;
-                let mut ih = 48.0 * d;
-                if 16.0 * d + items * ih + rules * 16.0 * d > room {
-                    ih = ((room - 16.0 * d - rules * 16.0 * d) / items.max(1.0)).max(32.0 * d);
-                }
-                let mh = 16.0 * d + items * ih + rules * 16.0 * d;
-                let mx = if *right {
-                    anchor.right() - mw
-                } else {
-                    anchor.x
-                }
-                .clamp(8.0 * d, (w - 8.0 * d - mw).max(8.0 * d));
-                let my = anchor.y.clamp(8.0 * d, (h - 8.0 * d - mh).max(8.0 * d));
-                ui.push(
-                    Rf::new(mx, my, mw, mh),
-                    Look::Surface {
-                        color: MENU,
-                        radius: 4.0,
-                        elev: 3.0,
-                        border: false,
-                    },
-                    None,
-                );
-                let mut y = my + 8.0 * d;
-                for e in entries {
-                    match e {
-                        Entry::Item(text, check, act) => {
-                            ui.push(
-                                Rf::new(mx, y, mw, ih),
-                                Look::Item {
-                                    text,
-                                    check: if checks {
-                                        Some(check.unwrap_or(false))
-                                    } else {
-                                        None
-                                    },
-                                },
-                                Some(act),
-                            );
-                            y += ih;
-                        }
-                        Entry::Rule => {
-                            ui.push(Rf::new(mx, y, mw, 16.0 * d), Look::Rule, None);
-                            y += 16.0 * d;
-                        }
+            Overlay::Style | Overlay::Shapes => {
+                ui.push(screen, Look::Scrim(0), Some(Act::Outside));
+                ui.offset_y = 8.0 * (1.0 - fade);
+                if let Some(chrome) = chrome {
+                    if matches!(overlay, Overlay::Style) {
+                        self.layout_style(ui, chrome);
+                    } else {
+                        self.layout_shapes(ui, chrome);
                     }
                 }
+            }
+            Overlay::Menu { kind, anchor } => {
+                let scrim = if matches!(kind, MenuKind::Main) {
+                    SCRIM_LIGHT
+                } else {
+                    0
+                };
+                ui.push(screen, Look::Scrim(scrim), Some(Act::Outside));
+                ui.offset_y = 8.0 * (1.0 - fade);
+                self.layout_menu(ui, kind, *anchor);
+            }
+            Overlay::Panel { kind, scroll } => {
+                ui.push(screen, Look::Scrim(SCRIM), Some(Act::Nothing));
+                self.layout_panel(ui, *kind, *scroll);
             }
             Overlay::Ask {
                 title,
                 text,
                 hint,
                 multiline,
-                ..
+                purpose,
             } => {
-                let dw = (w - 80.0 * d).clamp((280.0 * d).min(w - 16.0 * d), 560.0 * d);
-                let inner = dw - 48.0 * d;
-                let field_h = if *multiline {
-                    let lines = paint::wrap(Face::Regular, 16.0 * d, text, inner)
-                        .len()
-                        .clamp(2, 6) as f32;
-                    lines * 24.0 * d + 16.0 * d
-                } else {
-                    48.0 * d
-                };
-                let title_h =
-                    paint::wrap(Face::Regular, 24.0 * d, title, inner).len() as f32 * 32.0 * d;
-                let dh = 24.0 * d + title_h + 16.0 * d + field_h + 24.0 * d + 40.0 * d + 24.0 * d;
-                let (dx, dy) = ((w - dw) / 2.0, ((h - dh) / 2.0).max(8.0 * d));
-                ui.push(
-                    Rf::new(0.0, 0.0, w, h),
-                    Look::Scrim(0x8a000000),
-                    Some(Act::Outside),
+                ui.push(screen, Look::Scrim(SCRIM), Some(Act::Nothing));
+                let dw = 800.0_f32.min(w - 48.0);
+                let dh = if *multiline { 520.0_f32 } else { 400.0 }.min(h - 32.0);
+                let r = Rf::new((w - dw) / 2.0, 150.0_f32.min((h - dh) * 0.36), dw, dh);
+                let inset = 48.0_f32.min(dw / 10.0);
+                ui.surface(r, 32.0, 3, Some(Act::Nothing));
+                ui.label(
+                    Rf::new(r.x + inset, r.y + 32.0, dw - 2.0 * inset, 52.0),
+                    title,
+                    Face::Bold,
+                    36.0,
+                    TEXT1,
+                    false,
                 );
+                let height = if *multiline { 224.0_f32 } else { 96.0 }.min((dh - 232.0).max(64.0));
                 ui.push(
-                    Rf::new(dx, dy, dw, dh),
-                    Look::Surface {
-                        color: DIALOG,
-                        radius: 28.0,
-                        elev: 3.0,
-                        border: false,
-                    },
-                    None,
-                );
-                let mut y = dy + 24.0 * d;
-                ui.push(
-                    Rf::new(dx + 24.0 * d, y, inner, title_h),
-                    Look::Para {
-                        text: title.clone(),
-                        face: Face::Regular,
-                        size: 24.0 * d,
-                        line: 32.0 * d,
-                        color: ON_SURFACE,
-                        center: false,
-                    },
-                    None,
-                );
-                y += title_h + 16.0 * d;
-                ui.push(
-                    Rf::new(dx + 24.0 * d, y, inner, field_h),
+                    Rf::new(r.x + inset, r.y + 120.0, dw - 2.0 * inset, height),
                     Look::Field {
                         text: text.clone(),
                         hint: hint.clone(),
@@ -2831,73 +3846,208 @@ impl App {
                     },
                     Some(Act::Field),
                 );
-                y += field_h + 24.0 * d;
-                self.dialog_buttons(ui, dx + dw - 24.0 * d, y, "Cancel", "Done");
+                let ok = match purpose {
+                    AskFor::NewBoard => "Create",
+                    AskFor::Rename(_) => "Save",
+                    AskFor::Join => "Join",
+                    AskFor::Text { .. } => "Done",
+                };
+                self.dialog_buttons(ui, r, inset, "Cancel", ok, ButtonKind::Primary);
             }
             Overlay::Confirm {
                 title,
                 body,
                 cancel,
                 ok,
-                ..
+                purpose,
             } => {
-                let dw = (w - 80.0 * d).clamp((280.0 * d).min(w - 16.0 * d), 560.0 * d);
-                let inner = dw - 48.0 * d;
-                let title_h =
-                    paint::wrap(Face::Regular, 24.0 * d, title, inner).len() as f32 * 32.0 * d;
-                let body_h =
-                    paint::wrap(Face::Regular, 14.0 * d, body, inner).len() as f32 * 20.0 * d;
-                let dh = 24.0 * d + title_h + 16.0 * d + body_h + 24.0 * d + 40.0 * d + 24.0 * d;
-                let (dx, dy) = ((w - dw) / 2.0, ((h - dh) / 2.0).max(8.0 * d));
-                ui.push(
-                    Rf::new(0.0, 0.0, w, h),
-                    Look::Scrim(0x8a000000),
-                    Some(Act::Outside),
+                ui.push(screen, Look::Scrim(SCRIM), Some(Act::Nothing));
+                let dw = 800.0_f32.min(w - 48.0);
+                let dh = 380.0_f32.min(h - 32.0);
+                let r = Rf::new((w - dw) / 2.0, (h - dh) / 2.0, dw, dh);
+                let inset = 48.0_f32.min(dw / 10.0);
+                let inner = dw - 2.0 * inset;
+                ui.surface(r, 32.0, 3, Some(Act::Nothing));
+                ui.label(
+                    Rf::new(r.x + inset, r.y + 32.0, inner, 52.0),
+                    title,
+                    Face::Bold,
+                    36.0,
+                    TEXT1,
+                    false,
                 );
                 ui.push(
-                    Rf::new(dx, dy, dw, dh),
-                    Look::Surface {
-                        color: DIALOG,
-                        radius: 28.0,
-                        elev: 3.0,
-                        border: false,
-                    },
-                    None,
-                );
-                let mut y = dy + 24.0 * d;
-                ui.push(
-                    Rf::new(dx + 24.0 * d, y, inner, title_h),
-                    Look::Para {
-                        text: title.clone(),
-                        face: Face::Regular,
-                        size: 24.0 * d,
-                        line: 32.0 * d,
-                        color: ON_SURFACE,
-                        center: false,
-                    },
-                    None,
-                );
-                y += title_h + 16.0 * d;
-                ui.push(
-                    Rf::new(dx + 24.0 * d, y, inner, body_h),
+                    Rf::new(r.x + inset, r.y + 114.0, inner, (dh - 224.0).max(34.0)),
                     Look::Para {
                         text: body.clone(),
                         face: Face::Regular,
-                        size: 14.0 * d,
-                        line: 20.0 * d,
-                        color: ON_VARIANT,
-                        center: false,
+                        size: 24.0,
+                        line: 34.0,
+                        color: TEXT2,
                     },
                     None,
                 );
-                y += body_h + 24.0 * d;
-                self.dialog_buttons(ui, dx + dw - 24.0 * d, y, cancel, ok);
+                let kind = if matches!(purpose, ConfirmFor::Install(_)) {
+                    ButtonKind::Primary
+                } else {
+                    ButtonKind::Danger
+                };
+                self.dialog_buttons(ui, r, inset, cancel, ok, kind);
             }
-            Overlay::Panel { kind, scroll } => self.layout_panel(ui, *kind, *scroll),
+        }
+        ui.opacity = 255;
+        ui.offset_y = 0.0;
+    }
+
+    fn layout_menu(&self, ui: &mut Ui, kind: &MenuKind, anchor: Rf) {
+        let (w, h) = self.extent();
+        let selected_font = text::FONT_NAMES[self.settings.font as usize];
+        let row = |icon, label: &str, value: &str, chevron, danger, act| {
+            Some((
+                Look::Row {
+                    icon: Some(icon),
+                    text: label.into(),
+                    value: value.into(),
+                    chevron,
+                    danger,
+                },
+                act,
+            ))
+        };
+        let (width, rows) = match kind {
+            MenuKind::Main => {
+                let update = match &self.update {
+                    Some((version, _)) => format!("{version} ready"),
+                    None if self.updates_current => "Up to date".to_string(),
+                    None => String::new(),
+                };
+                (
+                    560.0_f32,
+                    vec![
+                        row(Ico::Share, "Share board…", "", false, false, Act::Share),
+                        row(
+                            Ico::Claude,
+                            "Connect Claude…",
+                            "",
+                            false,
+                            false,
+                            Act::Claude,
+                        ),
+                        row(Ico::Export, "Export as PNG", "", false, false, Act::Export),
+                        row(Ico::Import, "Import boards…", "", false, false, Act::Import),
+                        row(Ico::Join, "Join a board…", "", false, false, Act::Join),
+                        None,
+                        row(Ico::Gear, "Settings…", "", true, false, Act::Settings),
+                        row(
+                            Ico::Font,
+                            "Text font…",
+                            selected_font,
+                            true,
+                            false,
+                            Act::FontPanel,
+                        ),
+                        row(
+                            Ico::Update,
+                            "Check for updates",
+                            &update,
+                            false,
+                            false,
+                            Act::Updates,
+                        ),
+                    ],
+                )
+            }
+            MenuKind::Card(id) => (
+                360.0,
+                vec![
+                    row(
+                        Ico::Rename,
+                        "Rename",
+                        "",
+                        false,
+                        false,
+                        Act::Rename(id.clone()),
+                    ),
+                    row(
+                        Ico::Trash,
+                        "Delete",
+                        "",
+                        false,
+                        true,
+                        Act::AskDelete(id.clone()),
+                    ),
+                ],
+            ),
+            MenuKind::Pages => (
+                320.0,
+                vec![row(
+                    Ico::Trash,
+                    "Delete page…",
+                    "",
+                    false,
+                    true,
+                    Act::AskDeletePage,
+                )],
+            ),
+        };
+        let width = width.min(w - 32.0);
+        let height = 24.0
+            + rows
+                .iter()
+                .map(|row| if row.is_some() { 72.0 } else { 16.0 })
+                .sum::<f32>();
+        let k = ((h - 32.0) / height).clamp(0.0, 1.0);
+        let right = if matches!(kind, MenuKind::Main) {
+            w - 24.0
+        } else {
+            anchor.right()
+        };
+        let x = place_in(right - width, 16.0, w - width - 16.0);
+        let below = anchor.bottom() + 20.0;
+        let y = place_in(
+            if below + height * k <= h - 16.0 {
+                below
+            } else if matches!(kind, MenuKind::Main) {
+                anchor.bottom() + 8.0
+            } else {
+                anchor.y - height * k - 12.0
+            },
+            16.0,
+            h - height * k - 16.0,
+        );
+        let rect = Rf::new(x, y, width, height * k);
+        ui.scaled(
+            rect,
+            Look::Surface {
+                color: SURFACE,
+                radius: 28.0,
+                level: 2,
+                border: true,
+            },
+            Some(Act::Nothing),
+            k,
+        );
+        let mut y = y + 12.0 * k;
+        for row in rows {
+            if let Some((look, act)) = row {
+                ui.scaled(
+                    Rf::new(x + 12.0, y, width - 24.0, 72.0 * k),
+                    look,
+                    Some(act),
+                    k,
+                );
+                y += 72.0 * k;
+            } else {
+                ui.push(
+                    Rf::new(x + 24.0, y + 7.0 * k, width - 48.0, 2.0 * k),
+                    Look::Rule,
+                    None,
+                );
+                y += 16.0 * k;
+            }
         }
     }
 
-    /// The open board's share code, when this device shares it.
     fn host_code(&self) -> Option<String> {
         self.board
             .as_ref()?
@@ -2915,7 +4065,11 @@ impl App {
 
     fn lan_mcp(&self) -> Option<String> {
         let ip = self.lan_ip?;
-        Some(format!("http://{ip}:{}/mcp/{}", net::PORT, self.settings.mcp_key))
+        Some(format!(
+            "http://{ip}:{}/mcp/{}",
+            net::PORT,
+            self.settings.mcp_key
+        ))
     }
 
     fn public_mcp(&self) -> Option<String> {
@@ -2928,152 +4082,71 @@ impl App {
         })
     }
 
-    /// Size of the panel sheet and the height its content needs.
-    fn panel_frame(&self, kind: PanelKind) -> (Rf, f32, f32) {
-        let d = self.d;
-        let (w, h) = (self.w as f32, self.h as f32);
-        let dw = (w - 80.0 * d).clamp((280.0 * d).min(w - 16.0 * d), 680.0 * d);
-        let inner = dw - 48.0 * d;
-        let (_, content) = self.panel_rows(kind, inner);
-        let chrome = 24.0 * d + 32.0 * d + 16.0 * d + 24.0 * d + 40.0 * d + 24.0 * d;
-        let dh = (chrome + content).min(h - 32.0 * d).max(chrome.min(h));
-        let r = Rf::new((w - dw) / 2.0, ((h - dh) / 2.0).max(8.0 * d), dw, dh);
-        let view = dh - chrome;
-        (r, content, view)
+    fn panel_frame(&self, kind: PanelKind) -> Rf {
+        let (w, h) = self.extent();
+        let (width, height) = match kind {
+            PanelKind::Settings => (1360.0_f32, 824.0_f32),
+            PanelKind::Claude => (960.0, 940.0),
+            PanelKind::Fonts => (960.0, 760.0),
+            PanelKind::Share if self.joined() => (880.0, 380.0),
+            PanelKind::Share => (880.0, 700.0),
+        };
+        let dw = width.min(w - 48.0).max(0.0);
+        let dh = height.min(h - 32.0).max(0.0);
+        Rf::new((w - dw) / 2.0, (h - dh) / 2.0, dw, dh)
+    }
+
+    fn panel_viewport(&self, kind: PanelKind, r: Rf) -> Rf {
+        let inset = match kind {
+            PanelKind::Share => 48.0_f32,
+            PanelKind::Settings => 40.0,
+            PanelKind::Claude | PanelKind::Fonts => 24.0,
+        }
+        .min(r.w / 10.0);
+        let footer = if kind == PanelKind::Share {
+            144.0
+        } else {
+            28.0
+        };
+        Rf::new(
+            r.x + inset,
+            r.y + 112.0,
+            r.w - 2.0 * inset,
+            (r.h - 112.0 - footer).max(0.0),
+        )
     }
 
     fn panel_max_scroll(&self) -> f32 {
-        match &self.overlay {
+        match self.overlay {
             Some(Overlay::Panel { kind, .. }) => {
-                let (_, content, view) = self.panel_frame(*kind);
-                (content - view).max(0.0)
+                let view = self.panel_viewport(kind, self.panel_frame(kind));
+                let (_, content) = self.panel_rows(kind, view.w);
+                ((content - view.h) * self.unit()).max(0.0)
             }
             _ => 0.0,
         }
     }
 
-    /// Content of a panel, positioned from (0, 0), and its height.
-    fn panel_rows(&self, kind: PanelKind, inner: f32) -> (Vec<(Rf, Look, Option<Act>)>, f32) {
-        let d = self.d;
-        let mut out: Vec<(Rf, Look, Option<Act>)> = Vec::new();
-        let mut y = 0.0;
-        let para = |out: &mut Vec<(Rf, Look, Option<Act>)>, y: &mut f32, text: &str, face: Face, color: u32| {
-            let lines = paint::wrap(face, 14.0 * d, text, inner).len() as f32;
-            out.push((
-                Rf::new(0.0, *y, inner, lines * 20.0 * d),
-                Look::Para {
-                    text: text.into(),
-                    face,
-                    size: 14.0 * d,
-                    line: 20.0 * d,
-                    color,
-                    center: false,
-                },
-                None,
-            ));
-            *y += lines * 20.0 * d + 12.0 * d;
-        };
-        let code = |out: &mut Vec<(Rf, Look, Option<Act>)>, y: &mut f32, text: &str| {
-            let bw = font::measure(Face::Medium, 14.0 * d, "Copy").0 + 32.0 * d;
-            let cw = inner - bw - 8.0 * d;
-            let lines = wrap_chars(14.0 * d, text, cw - 24.0 * d).len() as f32;
-            let ch = (lines * 20.0 * d + 16.0 * d).max(40.0 * d);
-            out.push((Rf::new(0.0, *y, cw, ch), Look::Code(text.into()), None));
-            out.push((
-                Rf::new(inner - bw, *y + (ch - 40.0 * d) / 2.0, bw, 40.0 * d),
-                Look::DlgBtn {
-                    text: "Copy".into(),
-                    filled: false,
-                },
-                Some(Act::Copy(text.into())),
-            ));
-            *y += ch + 16.0 * d;
-        };
+    /// Content of a panel, in logical coordinates relative to its viewport.
+    fn panel_rows(&self, kind: PanelKind, inner: f32) -> (Vec<UiRow>, f32) {
+        let mut content = PanelRows::new(inner, self.unit());
         match kind {
-            PanelKind::Claude => {
-                para(&mut out, &mut y, "Claude can read the open board, add notes, shapes, arrows and whole diagrams, move or delete things, and look at a picture of the board. Add this panel to Claude as an MCP connector:", Face::Regular, ON_VARIANT);
-                para(&mut out, &mut y, "From anywhere", Face::Medium, ON_SURFACE);
-                let online = self.relay_online();
-                para(
-                    &mut out,
-                    &mut y,
-                    if online {
-                        "Relay online. Works from claude.ai, the Claude apps and Claude Code."
-                    } else {
-                        "Relay offline right now. This address starts working as soon as the relay can be reached."
-                    },
-                    Face::Regular,
-                    if online { ON_VARIANT } else { ERROR },
-                );
-                if let Some(url) = self.public_mcp() {
-                    code(&mut out, &mut y, &url);
-                }
-                para(&mut out, &mut y, "On this network", Face::Medium, ON_SURFACE);
-                match self.lan_mcp() {
-                    Some(url) => code(&mut out, &mut y, &url),
-                    None => para(&mut out, &mut y, "Connect to Wi-Fi or Ethernet to get a local address.", Face::Regular, ON_VARIANT),
-                }
-                para(&mut out, &mut y, "Claude Code", Face::Medium, ON_SURFACE);
-                if let Some(url) = self.public_mcp().or_else(|| self.lan_mcp()) {
-                    code(&mut out, &mut y, &format!("claude mcp add --transport http inkboard {url}"));
-                }
-                para(&mut out, &mut y, "Claude app or claude.ai: Settings → Connectors → Add custom connector, name it Inkboard and paste the address from anywhere.", Face::Regular, ON_VARIANT);
-                para(&mut out, &mut y, "Suggested models: Claude Opus 5.5 for diagrams, plans and big layouts; Claude Sonnet 5.5 for quick notes and edits.", Face::Regular, ON_VARIANT);
-                para(&mut out, &mut y, "Anyone with these addresses can change the open board. Keep them private.", Face::Regular, ERROR);
-            }
-            PanelKind::Share => {
-                if let Some(c) = self.host_code() {
-                    para(&mut out, &mut y, "On another device open Inkboard, tap Join (the person-plus icon) and enter:", Face::Regular, ON_VARIANT);
-                    out.push((
-                        Rf::new(0.0, y, inner, 56.0 * d),
-                        Look::Label {
-                            text: c.clone(),
-                            face: Face::Bold,
-                            size: 40.0 * d,
-                            color: PRIMARY,
-                            center: true,
-                        },
-                        None,
-                    ));
-                    y += 64.0 * d;
-                    code(&mut out, &mut y, &c);
-                    let route = if self.relay_online() {
-                        "Devices on this network connect directly; others connect through the relay."
-                    } else {
-                        "Devices on this network connect directly. The relay is offline, so other networks cannot join yet."
-                    };
-                    para(&mut out, &mut y, route, Face::Regular, ON_VARIANT);
-                    if let Some(ip) = self.lan_ip {
-                        para(&mut out, &mut y, &format!("This panel: {ip}"), Face::Regular, STATUS);
-                    }
-                    let sw = font::measure(Face::Medium, 14.0 * d, "Stop sharing").0 + 32.0 * d;
-                    out.push((
-                        Rf::new(0.0, y, sw, 40.0 * d),
-                        Look::DlgBtn {
-                            text: "Stop sharing".into(),
-                            filled: false,
-                        },
-                        Some(Act::StopShare),
-                    ));
-                    y += 52.0 * d;
-                } else {
-                    let state = match self.link_online {
-                        Some(true) => "live: changes appear on both devices.",
-                        Some(false) => "reconnecting to the device that shares it…",
-                        None => "connecting to the device that shares it…",
-                    };
-                    para(&mut out, &mut y, &format!("This board was joined from another device and is {state}"), Face::Regular, ON_VARIANT);
-                }
-            }
+            PanelKind::Settings => return self.settings_rows(inner),
             PanelKind::Fonts => {
-                let gap = 8.0 * d;
-                let cols = (((inner + gap) / (168.0 * d)).floor() as usize).max(1);
-                let tw = (inner - gap * (cols as f32 - 1.0)) / cols as f32;
-                let th = 56.0 * d;
+                let cols = if inner >= 744.0 {
+                    3
+                } else if inner >= 360.0 {
+                    2
+                } else {
+                    1
+                };
+                let gap = 12.0;
+                let width = (inner - gap * (cols - 1) as f32) / cols as f32;
                 for (i, _) in text::FONT_NAMES.iter().enumerate() {
-                    let (c, r) = (i % cols, i / cols);
-                    out.push((
-                        Rf::new(c as f32 * (tw + gap), r as f32 * (th + gap), tw, th),
+                    let x = (i % cols) as f32 * (width + gap);
+                    let y = (i / cols) as f32 * (80.0 + gap);
+                    content.rows.push((
+                        Rf::new(x, y, width, 80.0),
                         Look::FontTile {
                             font: i as u8,
                             chosen: self.settings.font == i as u8,
@@ -3081,81 +4154,282 @@ impl App {
                         Some(Act::Font(i as u8)),
                     ));
                 }
-                let rows = text::FONT_NAMES.len().div_ceil(cols) as f32;
-                y = rows * (th + gap);
+                content.y = text::FONT_NAMES.len().div_ceil(cols) as f32 * (80.0 + gap) - gap;
+            }
+            PanelKind::Claude => {
+                content.para("Add Inkboard as an MCP connector so Claude can read and edit the open board, add diagrams and get a picture of it.", TEXT2);
+                content.heading("From anywhere");
+                let online = self.relay_online();
+                content.status(
+                    if online {
+                        "Relay online"
+                    } else {
+                        "Relay offline"
+                    },
+                    online,
+                );
+                if let Some(url) = self.public_mcp() {
+                    content.copy_code(&url);
+                }
+                content.heading("On this network");
+                if let Some(url) = self.lan_mcp() {
+                    content.status("Local address available", true);
+                    content.copy_code(&url);
+                } else {
+                    content.para(
+                        "Connect to Wi-Fi or Ethernet to get a local address.",
+                        TEXT2,
+                    );
+                }
+                content.heading("Claude Code");
+                if let Some(url) = self.public_mcp().or_else(|| self.lan_mcp()) {
+                    content.copy_code(&format!("claude mcp add --transport http inkboard {url}"));
+                }
+                content.para("In Claude, open Settings → Connectors → Add custom connector. Name it Inkboard and paste the address from anywhere.", TEXT2);
+                content.para(
+                    "Anyone with these addresses can change the open board. Keep them private.",
+                    DANGER,
+                );
+            }
+            PanelKind::Share => {
+                if let Some(code) = self.host_code() {
+                    content.para(
+                        "On another device open Inkboard, tap Join and enter this code.",
+                        TEXT2,
+                    );
+                    content.y = content.y.max(84.0);
+                    content.push(
+                        184.0,
+                        Look::ShareCode(code.clone()),
+                        Some(Act::CopyCode(code)),
+                    );
+                    content.y += 16.0;
+                    let online = self.relay_online();
+                    let route = if online {
+                        "Same network: direct. Other networks: via relay (online)"
+                    } else {
+                        "Same network: direct. Relay offline."
+                    };
+                    content.status(route, online);
+                    if let Some(ip) = self.lan_ip {
+                        content.heading(&format!("THIS PANEL  {ip}"));
+                    }
+                } else {
+                    let state = match self.link_online {
+                        Some(true) => "This board is live: changes appear on both devices.",
+                        Some(false) => "Reconnecting to the device sharing this board…",
+                        None => "Connecting to the device sharing this board…",
+                    };
+                    content.para(state, TEXT2);
+                }
             }
         }
-        (out, y.max(0.0))
+        (content.rows, content.y)
+    }
+
+    fn settings_rows(&self, inner: f32) -> (Vec<UiRow>, f32) {
+        let s = &self.settings;
+        let large = inner >= 1000.0;
+        let gap = 80.0;
+        let width = if large {
+            ((inner - gap) / 2.0).min(580.0)
+        } else {
+            inner
+        };
+        let mut left = PanelRows::new(width, self.unit());
+        left.heading("WRITING");
+        if self.is_board_open() {
+            left.segments(
+                "Handwriting language",
+                280.0,
+                LANGS
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (_, label))| (label, Act::Lang(i))),
+                usize::from(s.lang == "hi"),
+            );
+            left.toggle("Tidy drawn shapes", None, s.tidy, Act::Toggle(Opt::Tidy));
+        }
+        left.toggle(
+            "Handwriting to typed text",
+            None,
+            s.typed,
+            Act::Toggle(Opt::Typed),
+        );
+        left.push(
+            80.0,
+            Look::Row {
+                icon: None,
+                text: "Text font".into(),
+                value: text::FONT_NAMES[s.font as usize].into(),
+                chevron: true,
+                danger: false,
+            },
+            Some(Act::FontPanel),
+        );
+        left.y += 16.0;
+        left.heading("TOUCH");
+        left.toggle("Ignore palm touches", None, s.palm, Act::Toggle(Opt::Palm));
+        left.toggle(
+            "Pen draws and fingers move the board",
+            None,
+            s.pen_priority,
+            Act::Toggle(Opt::PenPriority),
+        );
+        left.toggle(
+            "Several fingers can write at once",
+            None,
+            s.multi_ink,
+            Act::Toggle(Opt::MultiInk),
+        );
+
+        let mut right = PanelRows::new(width, self.unit());
+        right.heading("CANVAS");
+        right.toggle("Show grid", None, s.grid, Act::Toggle(Opt::Grid));
+        if self.is_board_open() {
+            right.toggle("Hold to snap shapes", None, s.snap, Act::Toggle(Opt::Snap));
+        }
+        right.segments(
+            "Dock on",
+            356.0,
+            ["Left", "Right", "Bottom", "Top"]
+                .into_iter()
+                .zip(Dock::ALL.map(Act::Dock)),
+            s.dock as usize,
+        );
+        right.y += 16.0;
+        right.heading("DISPLAY");
+        right.toggle(
+            "Full panel resolution",
+            Some("Sharper, but slower on 4K"),
+            s.full_res,
+            Act::FullRes,
+        );
+        right.toggle(
+            "Low-latency ink",
+            Some("Draws the pen tip ahead of the screen"),
+            s.fast_ink,
+            Act::Toggle(Opt::FastInk),
+        );
+        right.toggle("Smooth ink", None, s.smooth, Act::Toggle(Opt::Smooth));
+        right.segments(
+            "Ink prediction",
+            380.0,
+            ["Off", "Low", "Medium", "High"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, label)| (label, Act::Predict(i as u8))),
+            s.predict as usize,
+        );
+        if !self.is_board_open() {
+            right.y += 8.0;
+            right.push(
+                72.0,
+                Look::Row {
+                    icon: Some(Ico::Import),
+                    text: "Import boards…".into(),
+                    value: String::new(),
+                    chevron: false,
+                    danger: false,
+                },
+                Some(Act::Import),
+            );
+        }
+        let (x, y) = if large {
+            (width + gap, 0.0)
+        } else {
+            (0.0, left.y + 24.0)
+        };
+        left.rows
+            .extend(right.rows.into_iter().map(|(mut r, look, act)| {
+                r.x += x;
+                r.y += y;
+                (r, look, act)
+            }));
+        (left.rows, left.y.max(y + right.y))
     }
 
     fn layout_panel(&self, ui: &mut Ui, kind: PanelKind, scroll: f32) {
-        let d = self.d;
-        let (w, h) = (self.w as f32, self.h as f32);
-        let (r, _, view) = self.panel_frame(kind);
-        ui.push(
-            Rf::new(0.0, 0.0, w, h),
-            Look::Scrim(0x8a000000),
-            Some(Act::Outside),
-        );
-        ui.push(
-            r,
-            Look::Surface {
-                color: DIALOG,
-                radius: 28.0,
-                elev: 3.0,
-                border: false,
-            },
-            Some(Act::Nothing),
-        );
+        let r = self.panel_frame(kind);
+        let view = self.panel_viewport(kind, r);
         let title = match kind {
-            PanelKind::Share => "Share board",
+            PanelKind::Share => {
+                if self.joined() {
+                    "Shared board"
+                } else {
+                    "Share this board"
+                }
+            }
             PanelKind::Claude => "Connect Claude",
             PanelKind::Fonts => "Text font",
+            PanelKind::Settings => "Settings",
         };
-        let inner = r.w - 48.0 * d;
-        ui.push(
-            Rf::new(r.x + 24.0 * d, r.y + 24.0 * d, inner, 32.0 * d),
-            Look::Label {
-                text: title.into(),
-                face: Face::Regular,
-                size: 24.0 * d,
-                color: ON_SURFACE,
-                center: false,
-            },
-            None,
+        ui.surface(r, 32.0, 3, Some(Act::Nothing));
+        ui.label(
+            Rf::new(view.x, r.y + 24.0, view.w - 76.0, 60.0),
+            title,
+            Face::Bold,
+            36.0,
+            TEXT1,
+            false,
         );
-        let top = r.y + 24.0 * d + 32.0 * d + 16.0 * d;
-        let bottom = top + view;
-        let (rows, _) = self.panel_rows(kind, inner);
+        ui.icon(
+            square(view.right() - 72.0, r.y + 16.0, 72.0),
+            Ico::Close,
+            false,
+            true,
+            Act::Cancel,
+        );
+
+        let (rows, content) = self.panel_rows(kind, view.w);
+        let scroll = (scroll / ui.u).clamp(0.0, (content - view.h).max(0.0));
+        ui.clip = Some(scale_rect(view, ui.u).covering(0.0));
         for (rr, look, act) in rows {
-            let placed = Rf::new(r.x + 24.0 * d + rr.x, top + rr.y - scroll, rr.w, rr.h);
-            if placed.y >= top - 0.5 && placed.bottom() <= bottom + 0.5 {
-                ui.push(placed, look, act);
+            let r = Rf::new(view.x + rr.x, view.y + rr.y - scroll, rr.w, rr.h);
+            ui.push(r, look, act);
+        }
+        ui.clip = None;
+
+        if kind == PanelKind::Share {
+            let y = r.bottom() - 120.0;
+            let scale = (view.w / 632.0).min(1.0);
+            let end = view.right();
+            ui.button(
+                Rf::new(end - 176.0 * scale, y, 176.0 * scale, 72.0),
+                None,
+                "Done",
+                ButtonKind::Primary,
+                false,
+                Act::Done,
+            );
+            if let Some(code) = self.host_code() {
+                ui.button(
+                    Rf::new(end - 368.0 * scale, y, 176.0 * scale, 72.0),
+                    Some(Ico::Copy),
+                    "Copy",
+                    ButtonKind::Secondary,
+                    false,
+                    Act::CopyCode(code),
+                );
+                ui.button(
+                    Rf::new(view.x, y, 248.0 * scale, 72.0),
+                    None,
+                    "Stop sharing",
+                    ButtonKind::DangerTint,
+                    false,
+                    Act::StopShare,
+                );
+            } else {
+                ui.button(
+                    Rf::new(view.x, y, 176.0 * scale, 72.0),
+                    None,
+                    "Leave",
+                    ButtonKind::DangerTint,
+                    false,
+                    Act::Leave,
+                );
             }
         }
-        let ow = font::measure(Face::Medium, 14.0 * d, "Done").0 + 48.0 * d;
-        let by = r.bottom() - 24.0 * d - 40.0 * d;
-        if self.panel_max_scroll() > 0.0 {
-            ui.push(
-                Rf::new(r.x + 24.0 * d, by, inner - ow - 8.0 * d, 40.0 * d),
-                Look::Label {
-                    text: "Drag to see more".into(),
-                    face: Face::Regular,
-                    size: 12.0 * d,
-                    color: STATUS,
-                    center: false,
-                },
-                None,
-            );
-        }
-        ui.push(
-            Rf::new(r.right() - 24.0 * d - ow, by, ow, 40.0 * d),
-            Look::DlgBtn {
-                text: "Done".into(),
-                filled: true,
-            },
-            Some(Act::Cancel),
-        );
     }
 
     // ------------------------------------------------------------ sharing
@@ -3182,7 +4456,11 @@ impl App {
         };
         self.known = self.shape_map();
         self.ops_sent = 0;
-        self.link = Some(net::link(host.to_string(), code.to_string(), self.wake.clone()));
+        self.link = Some(net::link(
+            host.to_string(),
+            code.to_string(),
+            self.wake.clone(),
+        ));
     }
 
     /// Tells the relay which share codes may be looked up.
@@ -3219,20 +4497,26 @@ impl App {
         };
         let code = req.query.get("code").cloned().unwrap_or_default();
         if code.is_empty() || self.host_code().as_deref() != Some(code.as_str()) {
-            return net::Resp::json(404, &json!({ "error": "No board is shared with that code" }));
+            return net::Resp::json(
+                404,
+                &json!({ "error": "No board is shared with that code" }),
+            );
         }
         match what {
             "hello" => {
-                let name = self.board.as_ref().map(|b| b.title.clone()).unwrap_or_default();
+                let name = self
+                    .board
+                    .as_ref()
+                    .map(|b| b.title.clone())
+                    .unwrap_or_default();
                 net::Resp::json(200, &json!({ "name": name }))
             }
             "board" => {
                 let since = req.query.get("since").and_then(|s| s.parse::<u64>().ok());
                 let mut v = json!({ "revision": self.doc_gen });
                 if since != Some(self.doc_gen) {
-                    v["shapes"] = Value::Array(
-                        self.ed.doc.shapes().iter().map(|s| s.to_json()).collect(),
-                    );
+                    v["shapes"] =
+                        Value::Array(self.ed.doc.shapes().iter().map(|s| s.to_json()).collect());
                 }
                 net::Resp::json(200, &v)
             }
@@ -3262,7 +4546,9 @@ impl App {
         if let Some(link) = &self.link {
             while let Ok(ev) = link.events.try_recv() {
                 match ev {
-                    net::LinkEvent::Snapshot { shapes, batches, .. } => {
+                    net::LinkEvent::Snapshot {
+                        shapes, batches, ..
+                    } => {
                         if batches >= self.ops_sent {
                             snapshot = Some(shapes);
                         }
@@ -3293,7 +4579,11 @@ impl App {
                 }
             }
         }
-        let remove: Vec<String> = mine.keys().filter(|id| !theirs.contains_key(*id)).cloned().collect();
+        let remove: Vec<String> = mine
+            .keys()
+            .filter(|id| !theirs.contains_key(*id))
+            .cloned()
+            .collect();
         // What the host has is now known, so these changes are not sent back.
         self.known = theirs;
         if !put.is_empty() || !remove.is_empty() {
@@ -3314,7 +4604,11 @@ impl App {
             Ok((host, name)) => {
                 let mut extra = Map::new();
                 extra.insert("lanShare".into(), json!({ "host": host, "code": code }));
-                let title = if name.is_empty() { "Shared board".to_string() } else { name };
+                let title = if name.is_empty() {
+                    "Shared board".to_string()
+                } else {
+                    name
+                };
                 let id = Self::new_board_id();
                 let updated = self.timestamp();
                 self.send(Job::Create {
@@ -3324,89 +4618,88 @@ impl App {
                     extra,
                 });
             }
-            Err(e) => self.show_toast(&e),
+            Err(e) => self.error_toast(&e),
         }
     }
 
-
-    /// A text button and a filled button, right aligned at `right`.
-    fn dialog_buttons(&self, ui: &mut Ui, right: f32, y: f32, cancel: &str, ok: &str) {
-        let d = self.d;
-        let ow = font::measure(Face::Medium, 14.0 * d, ok).0 + 48.0 * d;
-        let cw = font::measure(Face::Medium, 14.0 * d, cancel).0 + 24.0 * d;
-        ui.push(
-            Rf::new(right - ow, y, ow, 40.0 * d),
-            Look::DlgBtn {
-                text: ok.into(),
-                filled: true,
-            },
-            Some(Act::Done),
+    fn dialog_buttons(
+        &self,
+        ui: &mut Ui,
+        r: Rf,
+        inset: f32,
+        cancel: &str,
+        ok: &str,
+        kind: ButtonKind,
+    ) {
+        let width = 176.0_f32.min((r.w - 2.0 * inset - 16.0) / 2.0);
+        let x = r.right() - inset - width;
+        let y = r.bottom() - 120.0;
+        ui.button(
+            Rf::new(x - width - 16.0, y, width, 72.0),
+            None,
+            cancel,
+            ButtonKind::Secondary,
+            false,
+            Act::Cancel,
         );
-        ui.push(
-            Rf::new(right - ow - 8.0 * d - cw, y, cw, 40.0 * d),
-            Look::DlgBtn {
-                text: cancel.into(),
-                filled: false,
-            },
-            Some(Act::Cancel),
-        );
+        ui.button(Rf::new(x, y, width, 72.0), None, ok, kind, false, Act::Done);
     }
 
     // ------------------------------------------------------------ drawing
 
     fn draw(&self, p: &mut Painter, n: &Node) {
-        let d = self.d;
         let r = n.rect;
-        let middle = |p: &Painter, face: Face, size: f32, top: f32, height: f32| {
-            let _ = p;
-            let (_, asc, desc) = font::measure(face, size, "Hg");
-            top + (height + asc - desc) / 2.0
-        };
+        let u = n.u;
+        let radius = n.radius();
+        let pressed = n.hl == Hl::Pressed;
         match &n.look {
             Look::Scrim(color) => {
-                if color >> 24 != 0 {
+                if *color != 0 {
                     p.rrect(r, 0.0, *color);
                 }
             }
             Look::Surface {
                 color,
-                radius,
-                elev,
+                level,
                 border,
+                ..
             } => {
-                if *elev > 0.0 {
-                    p.shadow(r, radius * d, d, *elev / 2.0);
-                }
-                p.rrect(r, radius * d, *color);
-                if *border {
-                    p.rrect_line(r, radius * d, BORDER, d.max(1.0));
+                draw_surface(p, r, radius, u, *level, *color, *border);
+                if pressed {
+                    p.rrect(r, radius, 0x0d14161c);
                 }
             }
-            Look::Btn {
-                icon,
-                isz,
-                active,
+            Look::IconBtn {
+                ico,
+                size,
+                selected,
                 enabled,
             } => {
-                let color = if *active {
-                    p.rrect(r, 8.0 * d, BLUE);
-                    WHITE
+                let color = if *selected {
+                    p.rrect(r, radius, if pressed { ACCENT_PRESSED } else { ACCENT });
+                    SURFACE
                 } else if *enabled {
-                    ICON
+                    if pressed {
+                        p.rrect(r, radius, SURFACE2);
+                    }
+                    TEXT1
                 } else {
                     DISABLED
                 };
-                if *icon == icon::ERASER {
-                    p.eraser(*isz, r.cx(), r.cy(), color);
-                } else {
-                    p.icon(*icon, *isz, r.cx(), r.cy(), color);
-                }
+                p.ico(*ico, size * u, r.cx(), r.cy(), color);
             }
-            Look::AppIcon { icon, badge } => {
-                p.icon(*icon, 24.0 * d, r.cx(), r.cy(), ON_VARIANT);
-                if *badge {
-                    p.circle(r.cx() + 9.0 * d, r.cy() - 9.0 * d, 4.0 * d, ERROR);
+            Look::ColorChip { color, open } => {
+                if pressed || *open {
+                    p.rrect(r, radius, SURFACE2);
                 }
+                p.circle(r.cx(), r.cy(), 27.0 * u, BORDER);
+                p.circle(r.cx(), r.cy(), 25.0 * u, SURFACE);
+                p.circle(
+                    r.cx(),
+                    r.cy(),
+                    if pressed { 20.0 } else { 22.0 } * u,
+                    *color,
+                );
             }
             Look::Label {
                 text,
@@ -3415,13 +4708,10 @@ impl App {
                 color,
                 center,
             } => {
-                let base = middle(p, *face, *size, r.y, r.h);
-                if *center {
-                    let tw = font::measure(*face, *size, text).0.min(r.w);
-                    p.text_fit(*face, *size, text, r.cx() - tw / 2.0, base, r.w, *color);
-                } else {
-                    p.text_fit(*face, *size, text, r.x, base, r.w, *color);
+                if pressed {
+                    p.rrect(r, radius, 0x1214161c);
                 }
+                line_text(p, r, *face, size * u, text, *color, *center);
             }
             Look::Para {
                 text,
@@ -3429,165 +4719,246 @@ impl App {
                 size,
                 line,
                 color,
-                center,
             } => {
-                for (i, l) in paint::wrap(*face, *size, text, r.w).iter().enumerate() {
-                    let base = middle(p, *face, *size, r.y + *line * i as f32, *line);
-                    let x = if *center {
-                        r.cx() - font::measure(*face, *size, l).0 / 2.0
-                    } else {
-                        r.x
-                    };
-                    p.text(*face, *size, l, x, base, *color);
+                let line = line * u;
+                for (i, text) in paint::wrap(*face, size * u, text, r.w).iter().enumerate() {
+                    let row = Rf::new(r.x, r.y + line * i as f32, r.w, line);
+                    if row.bottom() > r.bottom() + 0.5 {
+                        break;
+                    }
+                    line_text(p, row, *face, size * u, text, *color, false);
                 }
             }
-            Look::Glyph { icon, size, color } => p.icon(*icon, *size, r.cx(), r.cy(), *color),
+            Look::Overline(text) => {
+                let size = 18.0 * u;
+                let y = baseline(r, Face::Bold, size);
+                let mut x = r.x;
+                for c in text.chars() {
+                    let mut encoded = [0; 4];
+                    let c = c.encode_utf8(&mut encoded);
+                    let width = font::measure(Face::Bold, size, c).0;
+                    if x + width > r.right() {
+                        break;
+                    }
+                    p.text(Face::Bold, size, c, x, y, TEXT3);
+                    x += width + 1.4 * u;
+                }
+            }
             Look::Swatch { color, chosen } => {
+                if *chosen || pressed {
+                    p.rrect(r, radius, SURFACE2);
+                }
                 if *chosen {
-                    p.rrect(r, 8.0 * d, CHOSEN);
+                    p.rrect_line(r, radius, ACCENT, 3.0 * u);
                 }
-                p.circle(r.cx(), r.cy(), 11.0 * d, *color);
-            }
-            Look::Chip { text, chosen } => {
-                if *chosen {
-                    p.rrect(r, 8.0 * d, CHOSEN);
-                }
-                let size = if text.ends_with('%') { 12.0 } else { 14.0 } * d;
-                let tw = font::measure(Face::Medium, size, text).0;
-                let base = middle(p, Face::Medium, size, r.y, r.h);
-                p.text(Face::Medium, size, text, r.cx() - tw / 2.0, base, ICON);
-            }
-            Look::StyleDot { color, open } => {
-                if *open {
-                    p.rrect(r, 8.0 * d, CHOSEN);
-                }
-                p.circle(r.cx(), r.cy(), 11.0 * d, *color);
-                p.circle_line(r.cx(), r.cy(), 11.0 * d, 0x33000000, d.max(1.0));
-            }
-            Look::Rule => {
-                let y = (r.cy() - d / 2.0).round();
-                p.rrect(Rf::new(r.x, y, r.w, d.max(1.0).round()), 0.0, BORDER);
-            }
-            Look::Logo => p.logo(r),
-            Look::Thumb { id, .. } => {
-                p.rrect(r, 8.0 * d, render::BACKGROUND);
-                if let Some(t) = self.thumbs.get(id) {
-                    let (x, y) = (r.cx() - t.w as f32 / 2.0, r.cy() - t.h as f32 / 2.0);
-                    p.image(&t.rgba, t.w, t.h, x, y);
-                }
-            }
-            Look::Fab => {
-                p.shadow(r, 16.0 * d, d, 1.5);
-                p.rrect(r, 16.0 * d, FAB_BG);
-                p.icon(
-                    icon::ADD,
-                    24.0 * d,
-                    r.x + 16.0 * d + 12.0 * d,
+                p.circle(
+                    r.cx(),
                     r.cy(),
-                    FAB_FG,
-                );
-                let base = middle(p, Face::Medium, 14.0 * d, r.y, r.h);
-                p.text(
-                    Face::Medium,
-                    14.0 * d,
-                    "New board",
-                    r.x + 48.0 * d,
-                    base,
-                    FAB_FG,
+                    if pressed { 22.0 } else { 24.0 } * u,
+                    *color,
                 );
             }
-            Look::DlgBtn { text, filled } => {
-                let color = if *filled {
-                    p.rrect(r, 20.0 * d, PRIMARY);
-                    WHITE
-                } else {
-                    PRIMARY
-                };
-                let tw = font::measure(Face::Medium, 14.0 * d, text).0;
-                let base = middle(p, Face::Medium, 14.0 * d, r.y, r.h);
-                p.text(Face::Medium, 14.0 * d, text, r.cx() - tw / 2.0, base, color);
+            Look::Thick { width, chosen } => {
+                if *chosen || pressed {
+                    p.rrect(r, radius, if *chosen { ACCENT_TINT } else { SURFACE2 });
+                }
+                if *chosen {
+                    p.rrect_line(r, radius, ACCENT, 3.0 * u);
+                }
+                let width = width * u;
+                p.rrect(
+                    Rf::new(r.cx() - 32.0 * u, r.cy() - width / 2.0, 64.0 * u, width),
+                    width / 2.0,
+                    TEXT1,
+                );
             }
-            Look::Field {
-                text,
-                hint,
-                multiline,
-            } => {
-                let size = 16.0 * d;
-                let (mut caret_x, mut caret_y) = (r.x, r.y + 12.0 * d);
-                if text.is_empty() {
-                    let base = if *multiline {
-                        middle(p, Face::Regular, size, r.y + 8.0 * d, 24.0 * d)
-                    } else {
-                        middle(p, Face::Regular, size, r.y, r.h)
+            Look::SegOpt { text, chosen } => {
+                if *chosen || pressed {
+                    let color = match (*chosen, pressed) {
+                        (true, true) => ACCENT_PRESSED,
+                        (true, false) => ACCENT,
+                        _ => 0xffe3e6ee,
                     };
-                    p.text_fit(Face::Regular, size, hint, r.x, base, r.w, HINT);
-                    if !*multiline {
-                        caret_y = r.cy() - 10.0 * d;
-                    } else {
-                        caret_y = r.y + 10.0 * d;
-                    }
-                } else if *multiline {
-                    let lines = paint::wrap(Face::Regular, size, text, r.w);
-                    let shown = lines.len().saturating_sub(6);
-                    for (i, l) in lines[shown..].iter().enumerate() {
-                        let top = r.y + 8.0 * d + 24.0 * d * i as f32;
-                        p.text(
-                            Face::Regular,
-                            size,
-                            l,
-                            r.x,
-                            middle(p, Face::Regular, size, top, 24.0 * d),
-                            ON_SURFACE,
-                        );
-                        caret_x = r.x + font::measure(Face::Regular, size, l).0;
-                        caret_y = top + 2.0 * d;
-                    }
-                } else {
-                    // Show the end of a long line, where the typing is.
-                    let mut shown: &str = text;
-                    let mut prefix = "";
-                    while font::measure(Face::Regular, size, &format!("{prefix}{shown}")).0
-                        > r.w - 4.0 * d
-                        && !shown.is_empty()
-                    {
-                        let mut it = shown.chars();
-                        it.next();
-                        shown = it.as_str();
-                        prefix = "…";
-                    }
-                    let line = format!("{prefix}{shown}");
-                    let base = middle(p, Face::Regular, size, r.y, r.h);
-                    caret_x = r.x + p.text(Face::Regular, size, &line, r.x, base, ON_SURFACE);
-                    caret_y = r.cy() - 10.0 * d;
+                    p.rrect(r, radius, color);
                 }
-                p.rrect(
-                    Rf::new(caret_x + d, caret_y, 2.0 * d, 20.0 * d),
-                    0.0,
-                    PRIMARY,
-                );
-                p.rrect(
-                    Rf::new(r.x, r.bottom() - 2.0 * d, r.w, 2.0 * d),
-                    0.0,
-                    PRIMARY,
+                line_text(
+                    p,
+                    r.inset(4.0 * u),
+                    Face::Medium,
+                    22.0 * u,
+                    text,
+                    if *chosen { SURFACE } else { TEXT2 },
+                    true,
                 );
             }
-            Look::Item { text, check } => {
-                let mut x = r.x + 12.0 * d;
-                if let Some(checked) = check {
-                    if *checked {
-                        p.icon(icon::CHECK, 24.0 * d, x + 12.0 * d, r.cy(), ON_VARIANT);
-                    }
-                    x += 36.0 * d;
+            Look::Toggle { on, label, helper } => {
+                if pressed {
+                    p.rrect(r, radius, SURFACE2);
                 }
-                let base = middle(p, Face::Regular, 14.0 * d, r.y, r.h);
-                p.text_fit(
-                    Face::Regular,
-                    14.0 * d,
+                let text = Rf::new(r.x, r.y, (r.w - 104.0 * u).max(0.0), r.h);
+                if let Some(helper) = helper {
+                    line_text(
+                        p,
+                        Rf::new(text.x, r.cy() - 29.0 * u, text.w, 31.0 * u),
+                        Face::Medium,
+                        24.0 * u,
+                        label,
+                        TEXT1,
+                        false,
+                    );
+                    line_text(
+                        p,
+                        Rf::new(text.x, r.cy() + 2.0 * u, text.w, 28.0 * u),
+                        Face::Regular,
+                        18.0 * u,
+                        helper,
+                        TEXT3,
+                        false,
+                    );
+                } else {
+                    let lines = paint::wrap(Face::Medium, 24.0 * u, label, text.w);
+                    let height = 28.0 * u;
+                    let top = r.cy() - height * lines.len() as f32 / 2.0;
+                    for (i, text_line) in lines.iter().enumerate() {
+                        line_text(
+                            p,
+                            Rf::new(text.x, top + height * i as f32, text.w, height),
+                            Face::Medium,
+                            24.0 * u,
+                            text_line,
+                            TEXT1,
+                            false,
+                        );
+                    }
+                }
+                let track = Rf::new(r.right() - 88.0 * u, r.cy() - 26.0 * u, 88.0 * u, 52.0 * u);
+                p.toggle(
+                    track,
+                    *on,
+                    if pressed { ACCENT_PRESSED } else { ACCENT },
+                    TOGGLE_OFF,
+                    SURFACE,
+                );
+            }
+            Look::Row {
+                icon,
+                text,
+                value,
+                chevron,
+                danger,
+            } => {
+                if pressed {
+                    p.rrect(r, radius, SURFACE2);
+                }
+                let fg = if *danger { DANGER } else { TEXT1 };
+                let x = if let Some(icon) = icon {
+                    p.ico(*icon, 36.0 * u, r.x + 38.0 * u, r.cy(), fg);
+                    r.x + 68.0 * u
+                } else {
+                    r.x
+                };
+                let end = if *chevron {
+                    p.ico(Ico::Chevron, 28.0 * u, r.right() - 16.0 * u, r.cy(), TEXT3);
+                    r.right() - 36.0 * u
+                } else {
+                    r.right() - 12.0 * u
+                };
+                let max = (end - x).max(0.0);
+                let value_width = font::measure(Face::Medium, 20.0 * u, value)
+                    .0
+                    .min(max * 0.42);
+                if value_width > 0.0 {
+                    line_text(
+                        p,
+                        Rf::new(end - value_width, r.y, value_width, r.h),
+                        Face::Medium,
+                        20.0 * u,
+                        value,
+                        if matches!(n.act, Some(Act::Updates)) && self.update.is_some() {
+                            ACCENT
+                        } else {
+                            TEXT3
+                        },
+                        false,
+                    );
+                }
+                line_text(
+                    p,
+                    Rf::new(x, r.y, (max - value_width - 8.0 * u).max(0.0), r.h),
+                    Face::Medium,
+                    24.0 * u,
                     text,
-                    x,
-                    base,
-                    r.right() - x - 12.0 * d,
-                    ON_SURFACE,
+                    fg,
+                    false,
+                );
+            }
+            Look::Logo => p.logo_accent(r, ACCENT),
+            Look::EmptyLogo => draw_empty_logo(p, r),
+            Look::Thumb { id, gen } => {
+                p.rrect(r, 20.0 * u, render::BACKGROUND);
+                if let Some(t) = self.thumbs.get(id).filter(|t| {
+                    t.gen == *gen && t.w == r.w.round() as u32 && t.h == r.h.round() as u32
+                }) {
+                    p.image(&t.rgba, t.w, t.h, r.x, r.y);
+                }
+                p.rrect_line(r, 20.0 * u, BORDER, 1.5 * u);
+            }
+            Look::Button {
+                icon,
+                text,
+                kind,
+                level,
+                ..
+            } => {
+                let (bg, fg, down) = match kind {
+                    ButtonKind::Primary => (ACCENT, SURFACE, ACCENT_PRESSED),
+                    ButtonKind::Secondary => (SURFACE2, TEXT2, 0xffe3e6ee),
+                    ButtonKind::White => (SURFACE, TEXT1, SURFACE2),
+                    ButtonKind::AccentTint => (ACCENT_TINT, ACCENT, 0xffd4ddff),
+                    ButtonKind::Danger => (DANGER, SURFACE, 0xffa71e1e),
+                    ButtonKind::DangerTint => (DANGER_TINT, DANGER, 0xfff8d8d8),
+                };
+                draw_surface(
+                    p,
+                    r,
+                    radius,
+                    u,
+                    *level,
+                    if pressed { down } else { bg },
+                    matches!(kind, ButtonKind::White | ButtonKind::AccentTint),
+                );
+                let isize = if r.h >= 84.0 * u { 40.0 } else { 32.0 } * u;
+                let icon_area = if icon.is_some() && !text.is_empty() {
+                    isize + 12.0 * u
+                } else {
+                    0.0
+                };
+                let size = if r.h >= 84.0 * u { 26.0 } else { 24.0 } * u;
+                let width = font::measure(Face::Bold, size, text)
+                    .0
+                    .min((r.w - icon_area - 20.0 * u).max(0.0));
+                let x = r.cx() - (width + icon_area) / 2.0;
+                if let Some(icon) = icon {
+                    p.ico(
+                        *icon,
+                        isize,
+                        if text.is_empty() {
+                            r.cx()
+                        } else {
+                            x + isize / 2.0
+                        },
+                        r.cy(),
+                        fg,
+                    );
+                }
+                line_text(
+                    p,
+                    Rf::new(x + icon_area, r.y, width, r.h),
+                    Face::Bold,
+                    size,
+                    text,
+                    fg,
+                    false,
                 );
             }
             Look::TitleBlock {
@@ -3595,89 +4966,483 @@ impl App {
                 status,
                 failed,
             } => {
-                p.text_fit(
-                    Face::Medium,
-                    14.0 * d,
+                if pressed {
+                    p.rrect(r, radius, SURFACE2);
+                }
+                line_text(
+                    p,
+                    Rf::new(r.x, r.y + 10.0 * u, r.w, 36.0 * u),
+                    Face::Bold,
+                    26.0 * u,
                     title,
-                    r.x + 6.0 * d,
-                    r.y + 19.0 * d,
-                    r.w - 12.0 * d,
-                    ICON,
+                    TEXT1,
+                    false,
                 );
-                p.text_fit(
+                line_text(
+                    p,
+                    Rf::new(r.x, r.y + 46.0 * u, r.w, 24.0 * u),
                     Face::Regular,
-                    11.0 * d,
+                    18.0 * u,
                     status,
-                    r.x + 6.0 * d,
-                    r.y + 34.0 * d,
-                    r.w - 12.0 * d,
-                    if *failed { ERROR } else { STATUS },
+                    if *failed { DANGER } else { TEXT3 },
+                    false,
+                );
+            }
+            Look::Field {
+                text,
+                hint,
+                multiline,
+            } => {
+                p.rrect(r, radius, SURFACE);
+                p.rrect_line(r, radius, ACCENT, 3.0 * u);
+                let inner = r.inset(18.0 * u);
+                let size = 32.0 * u;
+                let row_h = 42.0 * u;
+                let x = inner.x;
+                let mut caret = (
+                    x,
+                    if *multiline {
+                        inner.y
+                    } else {
+                        r.cy() - row_h / 2.0
+                    },
+                );
+                if text.is_empty() {
+                    line_text(
+                        p,
+                        Rf::new(x + 6.0 * u, caret.1, inner.w - 6.0 * u, row_h),
+                        Face::Medium,
+                        size,
+                        hint,
+                        TEXT3,
+                        false,
+                    );
+                } else if *multiline {
+                    let lines = paint::wrap(Face::Medium, size, text, inner.w - 5.0 * u);
+                    let shown = (inner.h / row_h).floor().max(1.0) as usize;
+                    for (i, line) in lines[lines.len().saturating_sub(shown)..]
+                        .iter()
+                        .enumerate()
+                    {
+                        caret.1 = inner.y + i as f32 * row_h;
+                        let row = Rf::new(x, caret.1, inner.w - 5.0 * u, row_h);
+                        line_text(p, row, Face::Medium, size, line, TEXT1, false);
+                        caret.0 = x + font::measure(Face::Medium, size, line).0.min(row.w);
+                    }
+                } else {
+                    let mut tail = text.as_str();
+                    let mut prefix = "";
+                    while font::measure(Face::Medium, size, &format!("{prefix}{tail}")).0
+                        > inner.w - 5.0 * u
+                        && !tail.is_empty()
+                    {
+                        let mut chars = tail.chars();
+                        chars.next();
+                        tail = chars.as_str();
+                        prefix = "…";
+                    }
+                    let row = Rf::new(x, caret.1, inner.w - 5.0 * u, row_h);
+                    caret.0 = x + p.text_fit(
+                        Face::Medium,
+                        size,
+                        &format!("{prefix}{tail}"),
+                        x,
+                        baseline(row, Face::Medium, size),
+                        row.w,
+                        TEXT1,
+                    );
+                }
+                p.rrect(
+                    Rf::new(caret.0 + 2.0 * u, caret.1, 3.0 * u, row_h),
+                    1.0 * u,
+                    ACCENT,
                 );
             }
             Look::Code(text) => {
-                p.rrect(r, 8.0 * d, CHOSEN);
-                let size = 14.0 * d;
-                for (i, l) in wrap_chars(size, text, r.w - 24.0 * d).iter().enumerate() {
-                    let base = middle(p, Face::Regular, size, r.y + 8.0 * d + 20.0 * d * i as f32, 20.0 * d);
-                    p.text(Face::Regular, size, l, r.x + 12.0 * d, base, ON_SURFACE);
+                p.rrect(r, 20.0 * u, SURFACE2);
+                let font = 22.0 * u;
+                let line_height = 28.0 * u;
+                for (i, line) in wrap_chars(font, text, r.w - 32.0 * u).iter().enumerate() {
+                    line_text(
+                        p,
+                        Rf::new(
+                            r.x + 16.0 * u,
+                            r.y + 12.0 * u + i as f32 * line_height,
+                            r.w - 32.0 * u,
+                            line_height,
+                        ),
+                        Face::Bold,
+                        font,
+                        line,
+                        TEXT1,
+                        false,
+                    );
                 }
             }
-            Look::FontTile { font: f, chosen } => {
-                if *chosen {
-                    p.rrect(r, 10.0 * d, FAB_BG);
-                    p.rrect_line(r, 10.0 * d, PRIMARY, 2.0 * d);
-                } else {
-                    p.rrect(r, 10.0 * d, WHITE);
-                    p.rrect_line(r, 10.0 * d, BORDER, d.max(1.0));
+            Look::ShareCode(code) => {
+                p.rrect(r, 28.0 * u, if pressed { 0xffe3e6ee } else { SURFACE2 });
+                let scale = u.min((r.w - 24.0 * u) / 408.0);
+                let cell = 64.0 * scale;
+                let x = r.cx() - 204.0 * scale;
+                for (i, digit) in code.chars().enumerate() {
+                    let gap = if i >= 3 { 24.0 * scale } else { 0.0 };
+                    let rect = Rf::new(x + i as f32 * cell + gap, r.y, cell, r.h);
+                    let mut encoded = [0; 4];
+                    let digit = digit.encode_utf8(&mut encoded);
+                    let size = 112.0 * scale;
+                    let dx = font::measure(Face::Bold, size, digit).0 / 2.0;
+                    p.text(
+                        Face::Bold,
+                        size,
+                        digit,
+                        rect.cx() - dx,
+                        baseline(rect, Face::Bold, size),
+                        TEXT1,
+                    );
                 }
+            }
+            Look::StatusDot { text, online, chip } => {
+                let bg = if *chip { ACCENT_TINT } else { SURFACE2 };
+                let radius = if *chip { r.h / 2.0 } else { 20.0 * u };
+                p.rrect(r, radius, if pressed { 0xffd4ddff } else { bg });
+                p.circle(
+                    r.x + 24.0 * u,
+                    r.cy(),
+                    7.0 * u,
+                    if *online { OK } else { DANGER },
+                );
+                line_text(
+                    p,
+                    Rf::new(r.x + 40.0 * u, r.y, r.w - 56.0 * u, r.h),
+                    Face::Medium,
+                    if *chip { 22.0 } else { 20.0 } * u,
+                    text,
+                    if *chip { ACCENT } else { TEXT2 },
+                    false,
+                );
+            }
+            Look::FontTile { font: f, chosen } => {
+                p.rrect(r, radius, if pressed { 0xffe3e6ee } else { SURFACE2 });
+                if *chosen {
+                    p.rrect_line(r, radius, ACCENT, 3.0 * u);
+                    p.ico(Ico::Check, 24.0 * u, r.right() - 22.0 * u, r.cy(), ACCENT);
+                }
+                let inset = if *chosen { 44.0 } else { 16.0 } * u;
                 let name = text::FONT_NAMES[*f as usize];
-                let px = (22.0 * d).round() as u32;
+                let px = (26.0 * u).round() as u32;
                 let mut cache = self.font_tiles.borrow_mut();
                 let bitmap = cache
                     .entry((*f, px))
-                    .or_insert_with(|| text::rasterize(name, px as f64, INK, *f));
+                    .or_insert_with(|| text::rasterize(name, px as f64, TEXT1, *f));
+                let text_rect = Rf::new(r.x + 16.0 * u, r.y, r.w - inset - 16.0 * u, r.h);
                 match bitmap {
-                    Some(b) if b.width as f32 <= r.w - 16.0 * d => {
-                        let x = r.cx() - b.width as f32 / 2.0;
-                        let y = r.cy() - b.height as f32 / 2.0;
-                        p.image(&b.rgba, b.width, b.height, x, y);
+                    Some(b) if b.width as f32 <= text_rect.w && b.height as f32 <= r.h => {
+                        p.image(
+                            &b.rgba,
+                            b.width,
+                            b.height,
+                            text_rect.cx() - b.width as f32 / 2.0,
+                            r.cy() - b.height as f32 / 2.0,
+                        );
                     }
-                    _ => {
-                        let tw = font::measure(Face::Regular, 16.0 * d, name).0.min(r.w - 16.0 * d);
-                        let base = middle(p, Face::Regular, 16.0 * d, r.y, r.h);
-                        p.text_fit(Face::Regular, 16.0 * d, name, r.cx() - tw / 2.0, base, r.w - 16.0 * d, INK);
-                    }
+                    _ => line_text(p, text_rect, Face::Regular, 22.0 * u, name, TEXT1, true),
                 }
             }
-            Look::Toast(text) => {
-                p.shadow(r, 4.0 * d, d, 1.0);
-                p.rrect(r, 4.0 * d, TOAST_BG);
-                let base = middle(p, Face::Regular, 14.0 * d, r.y, r.h);
-                p.text_fit(
-                    Face::Regular,
-                    14.0 * d,
+            Look::Toast {
+                text,
+                error,
+                compact,
+                action_width,
+            } => {
+                let radius = r.h / 2.0;
+                p.elev(r, radius, u, 2);
+                p.rrect(r, radius, TOAST_BG);
+                let (inset, size) = if *compact { (20.0, 22.0) } else { (80.0, 24.0) };
+                if !*compact {
+                    let x = r.x + 48.0 * u;
+                    if *error {
+                        let color = 0xffffb4a9;
+                        p.ico(Ico::Triangle, 32.0 * u, x, r.cy(), color);
+                        p.rrect(Rf::new(x - u, r.cy() - 3.0 * u, 2.0 * u, 7.0 * u), u, color);
+                        p.circle(x, r.cy() + 7.0 * u, u, color);
+                    } else {
+                        p.ico(Ico::Check, 32.0 * u, x, r.cy(), 0xff7fe3b0);
+                    }
+                }
+                line_text(
+                    p,
+                    Rf::new(
+                        r.x + inset * u,
+                        r.y,
+                        r.w - (inset + 20.0 + action_width) * u,
+                        r.h,
+                    ),
+                    Face::Medium,
+                    size * u,
                     text,
-                    r.x + 16.0 * d,
-                    base,
-                    r.w - 32.0 * d,
-                    TOAST_FG,
+                    SURFACE,
+                    false,
                 );
             }
-        }
-        match n.hl {
-            Hl::Pressed => p.rrect(r, n.radius(d), 0x1f000000),
-            Hl::Focused => {
-                p.rrect(r, n.radius(d), 0x14000000);
-                let g = 3.0 * d;
-                p.rrect_line(
-                    Rf::new(r.x - g, r.y - g, r.w + 2.0 * g, r.h + 2.0 * g),
-                    n.radius(d) + g,
-                    BLUE,
-                    2.5 * d,
-                );
+            Look::Rule => p.rrect(r, r.h.min(r.w) / 2.0, BORDER),
+            Look::Notch(side) => {
+                let vertices = match side {
+                    Dock::Left => [(r.x, r.cy()), (r.right(), r.y), (r.right(), r.bottom())],
+                    Dock::Right => [(r.right(), r.cy()), (r.x, r.y), (r.x, r.bottom())],
+                    Dock::Bottom => [(r.cx(), r.bottom()), (r.x, r.y), (r.right(), r.y)],
+                    Dock::Top => [(r.cx(), r.y), (r.x, r.bottom()), (r.right(), r.bottom())],
+                };
+                p.polygon(&vertices, BORDER);
+                let (mut inner, mut a, mut b) = (vertices[0], vertices[1], vertices[2]);
+                let step = 2.0 * u;
+                match side {
+                    Dock::Left | Dock::Right => {
+                        inner.0 += if *side == Dock::Left { step } else { -step };
+                        a.1 += step;
+                        b.1 -= step;
+                    }
+                    Dock::Bottom | Dock::Top => {
+                        inner.1 += if *side == Dock::Top { step } else { -step };
+                        a.0 += step;
+                        b.0 -= step;
+                    }
+                }
+                p.polygon(&[inner, a, b], SURFACE);
             }
-            Hl::None => {}
         }
+        if n.hl == Hl::Focused {
+            p.rrect_line(r, radius, ACCENT, 3.0 * u);
+        }
+    }
+}
+
+fn draw_empty_logo(p: &mut Painter, r: Rf) {
+    p.circle(r.cx(), r.cy(), r.w / 2.0, ACCENT_TINT);
+    let wave = [
+        (-24.0, 14.0),
+        (-17.0, 7.0),
+        (-7.0, 14.0),
+        (2.0, 2.0),
+        (13.0, 8.0),
+        (25.0, -13.0),
+    ];
+    let mut path = tiny_skia::PathBuilder::new();
+    paint::push_polyline(&mut path, &wave);
+    if let Some(path) = path.finish() {
+        let mut fill = tiny_skia::Paint::default();
+        fill.set_color_rgba8(0x27, 0x48, 0xe8, 0xff);
+        fill.anti_alias = true;
+        let stroke = tiny_skia::Stroke {
+            width: 6.0,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+        let scale = r.w / 160.0;
+        let transform = tiny_skia::Transform::from_scale(scale, scale)
+            .post_translate(r.cx() - p.ox, r.cy() - p.oy);
+        p.pm.stroke_path(&path, &fill, &stroke, transform, None);
+    }
+}
+
+fn draw_surface(p: &mut Painter, r: Rf, radius: f32, u: f32, level: u8, color: u32, border: bool) {
+    p.elev(r, radius, u, level);
+    p.rrect(r, radius, color);
+    if border {
+        p.rrect_line(r, radius, BORDER, 1.5 * u);
+    }
+}
+
+fn baseline(r: Rf, face: Face, size: f32) -> f32 {
+    let (_, ascent, descent) = font::measure(face, size, "Hg");
+    r.cy() + (ascent - descent) / 2.0
+}
+
+fn line_text(p: &mut Painter, r: Rf, face: Face, size: f32, text: &str, color: u32, center: bool) {
+    if r.w <= 0.0 {
+        return;
+    }
+    let x = if center {
+        r.cx() - font::measure(face, size, text).0.min(r.w) / 2.0
+    } else {
+        r.x
+    };
+    p.text_fit(face, size, text, x, baseline(r, face, size), r.w, color);
+}
+
+fn grouped_code(code: &str) -> String {
+    match (code.get(..3), code.get(3..)) {
+        (Some(a), Some(b)) => format!("{a} {b}"),
+        _ => code.to_string(),
+    }
+}
+
+type UiRow = (Rf, Look, Option<Act>);
+
+fn segment<'a>(
+    r: Rf,
+    items: impl IntoIterator<Item = (&'a str, Act)>,
+    selected: usize,
+) -> Vec<UiRow> {
+    let items: Vec<_> = items.into_iter().collect();
+    let width = (r.w - 8.0) / items.len() as f32;
+    let track = Look::Surface {
+        color: SURFACE2,
+        radius: 24.0,
+        level: 0,
+        border: false,
+    };
+    let mut rows = vec![(r, track, None)];
+    rows.extend(items.into_iter().enumerate().map(|(i, (text, act))| {
+        (
+            Rf::new(r.x + 4.0 + width * i as f32, r.y + 4.0, width, r.h - 8.0),
+            Look::SegOpt {
+                text: text.into(),
+                chosen: selected == i,
+            },
+            Some(act),
+        )
+    }));
+    rows
+}
+
+struct PanelRows {
+    rows: Vec<UiRow>,
+    width: f32,
+    y: f32,
+    u: f32,
+}
+
+impl PanelRows {
+    fn new(width: f32, u: f32) -> Self {
+        Self {
+            rows: Vec::new(),
+            width,
+            y: 0.0,
+            u,
+        }
+    }
+
+    fn push(&mut self, h: f32, look: Look, act: Option<Act>) {
+        self.rows
+            .push((Rf::new(0.0, self.y, self.width, h), look, act));
+        self.y += h;
+    }
+
+    fn para(&mut self, text: &str, color: u32) {
+        let line = 34.0;
+        let count = paint::wrap(Face::Regular, 24.0 * self.u, text, self.width * self.u).len();
+        self.push(
+            count as f32 * line,
+            Look::Para {
+                text: text.into(),
+                face: Face::Regular,
+                size: 24.0,
+                line,
+                color,
+            },
+            None,
+        );
+        self.y += 16.0;
+    }
+
+    fn heading(&mut self, text: &str) {
+        self.push(30.0, Look::Overline(text.into()), None);
+        self.y += 6.0;
+    }
+
+    fn status(&mut self, text: &str, online: bool) {
+        self.push(
+            72.0,
+            Look::StatusDot {
+                text: text.into(),
+                online,
+                chip: false,
+            },
+            None,
+        );
+        self.y += 16.0;
+    }
+
+    fn copy_code(&mut self, text: &str) {
+        let button_width = 160.0_f32.min(self.width * 0.31);
+        let width = self.width - button_width - 12.0;
+        let count = wrap_chars(22.0 * self.u, text, (width - 32.0) * self.u).len();
+        let height = (count as f32 * 28.0 + 24.0).max(64.0);
+        self.rows.push((
+            Rf::new(0.0, self.y, width, height),
+            Look::Code(text.into()),
+            None,
+        ));
+        self.rows.push((
+            Rf::new(
+                width + 12.0,
+                self.y + (height - 64.0) / 2.0,
+                button_width,
+                64.0,
+            ),
+            Look::Button {
+                icon: Some(Ico::Copy),
+                text: "Copy".into(),
+                kind: ButtonKind::Secondary,
+                pill: false,
+                level: 0,
+            },
+            Some(Act::Copy(text.into())),
+        ));
+        self.y += height + 16.0;
+    }
+
+    fn toggle(&mut self, label: &str, helper: Option<&'static str>, on: bool, act: Act) {
+        self.push(
+            if helper.is_some() { 96.0 } else { 80.0 },
+            Look::Toggle {
+                on,
+                label: label.into(),
+                helper,
+            },
+            Some(act),
+        );
+    }
+
+    fn segments<'a>(
+        &mut self,
+        label: &str,
+        width: f32,
+        items: impl IntoIterator<Item = (&'a str, Act)>,
+        selected: usize,
+    ) {
+        let label_width = font::measure(Face::Medium, 24.0 * self.u, label).0 / self.u;
+        let inline = self.width >= label_width + width + 24.0;
+        let label_height = if inline { 80.0 } else { 34.0 };
+        let label_rect = Rf::new(
+            0.0,
+            self.y,
+            if inline {
+                self.width - width - 16.0
+            } else {
+                self.width
+            },
+            label_height,
+        );
+        self.rows.push((
+            label_rect,
+            Look::Label {
+                text: label.into(),
+                face: Face::Medium,
+                size: 24.0,
+                color: TEXT1,
+                center: false,
+            },
+            None,
+        ));
+        let track = if inline {
+            Rf::new(self.width - width, self.y + 8.0, width, 64.0)
+        } else {
+            Rf::new(0.0, self.y + label_height, self.width, 64.0)
+        };
+        self.rows.extend(segment(track, items, selected));
+        self.y += if inline { 80.0 } else { label_height + 72.0 };
     }
 }
 
@@ -3688,7 +5453,7 @@ fn wrap_chars(size: f32, text: &str, width: f32) -> Vec<String> {
     let mut line = String::new();
     for c in text.chars() {
         line.push(c);
-        if line.chars().count() > 1 && font::measure(Face::Regular, size, &line).0 > width {
+        if line.chars().count() > 1 && font::measure(Face::Bold, size, &line).0 > width {
             line.pop();
             lines.push(std::mem::take(&mut line));
             line.push(c);
@@ -3868,17 +5633,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn req(app: &mut App, method: &str, path: &str, query: &[(&str, &str)], body: Value) -> (u16, Value) {
+    fn req(
+        app: &mut App,
+        method: &str,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Value,
+    ) -> (u16, Value) {
         let (reply, _rx) = mpsc::sync_channel(1);
         let r = net::Req {
             method: method.into(),
             path: path.into(),
-            query: query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            body: if body.is_null() { Vec::new() } else { body.to_string().into_bytes() },
+            query: query
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: if body.is_null() {
+                Vec::new()
+            } else {
+                body.to_string().into_bytes()
+            },
             reply,
         };
         let resp = app.answer(&r);
-        (resp.status, serde_json::from_slice(&resp.body).unwrap_or(Value::Null))
+        (
+            resp.status,
+            serde_json::from_slice(&resp.body).unwrap_or(Value::Null),
+        )
     }
 
     #[test]
@@ -3895,7 +5676,13 @@ mod tests {
         // A wrong key is not found; the right one is an MCP server.
         assert_eq!(req(&mut app, "POST", "/mcp/nope", &[], json!({})).0, 404);
         let mcp = format!("/mcp/{key}");
-        let (status, init) = req(&mut app, "POST", &mcp, &[], json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}));
+        let (status, init) = req(
+            &mut app,
+            "POST",
+            &mcp,
+            &[],
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}),
+        );
         assert_eq!(status, 200);
         assert_eq!(init["result"]["serverInfo"]["name"], "inkboard");
         let add = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add_shapes","arguments":{"shapes":[
@@ -3905,24 +5692,64 @@ mod tests {
         assert!(added["result"].get("isError").is_none(), "{added}");
         assert_eq!(app.ed.doc.shapes().len(), 2);
         assert!(app.unsaved);
-        let (_, image) = req(&mut app, "POST", &mcp, &[], json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_board_image","arguments":{}}}));
+        let (_, image) = req(
+            &mut app,
+            "POST",
+            &mcp,
+            &[],
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_board_image","arguments":{}}}),
+        );
         assert_eq!(image["result"]["content"][0]["type"], "image");
         let png = net::unbase64(image["result"]["content"][0]["data"].as_str().unwrap());
         assert_eq!(&png[1..4], b"PNG");
 
         // Not shared yet: the canvas endpoints refuse.
-        assert_eq!(req(&mut app, "GET", "/canvas/hello", &[("code", "123456")], Value::Null).0, 404);
+        assert_eq!(
+            req(
+                &mut app,
+                "GET",
+                "/canvas/hello",
+                &[("code", "123456")],
+                Value::Null
+            )
+            .0,
+            404
+        );
         app.run(Act::Share);
         let code = app.host_code().unwrap();
         assert_eq!(code.len(), 6);
-        assert!(matches!(app.overlay, Some(Overlay::Panel { kind: PanelKind::Share, .. })));
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Panel {
+                kind: PanelKind::Share,
+                ..
+            })
+        ));
         app.frame(5000);
-        let (_, hello) = req(&mut app, "GET", "/canvas/hello", &[("code", &code)], Value::Null);
+        let (_, hello) = req(
+            &mut app,
+            "GET",
+            "/canvas/hello",
+            &[("code", &code)],
+            Value::Null,
+        );
         assert_eq!(hello["name"], "Team");
-        let (_, board) = req(&mut app, "GET", "/canvas/board", &[("code", &code), ("since", "0")], Value::Null);
+        let (_, board) = req(
+            &mut app,
+            "GET",
+            "/canvas/board",
+            &[("code", &code), ("since", "0")],
+            Value::Null,
+        );
         assert_eq!(board["shapes"].as_array().unwrap().len(), 2);
         let rev = board["revision"].as_u64().unwrap().to_string();
-        let (_, same) = req(&mut app, "GET", "/canvas/board", &[("code", &code), ("since", &rev)], Value::Null);
+        let (_, same) = req(
+            &mut app,
+            "GET",
+            "/canvas/board",
+            &[("code", &code), ("since", &rev)],
+            Value::Null,
+        );
         assert!(same.get("shapes").is_none());
         let ops = json!({"operations":[{"type":"delete","id":"c2"}]});
         let (status, _) = req(&mut app, "POST", "/canvas/ops", &[("code", &code)], ops);
@@ -3930,7 +5757,17 @@ mod tests {
         assert_eq!(app.ed.doc.shapes().len(), 1);
         app.run(Act::StopShare);
         assert!(app.host_code().is_none());
-        assert_eq!(req(&mut app, "GET", "/canvas/hello", &[("code", &code)], Value::Null).0, 404);
+        assert_eq!(
+            req(
+                &mut app,
+                "GET",
+                "/canvas/hello",
+                &[("code", &code)],
+                Value::Null
+            )
+            .0,
+            404
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3941,24 +5778,32 @@ mod tests {
         settle(&mut app);
         app.run(Act::Claude);
         app.frame(3000);
-        assert!(app.nodes.iter().any(|n| matches!(&n.act, Some(Act::Copy(t)) if t.contains("/mcp/"))));
+        assert!(app
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.act, Some(Act::Copy(t)) if t.contains("/mcp/"))));
         app.run(Act::Cancel);
         app.panel(PanelKind::Fonts);
         app.frame(3100);
-        let tiles = app.nodes.iter().filter(|n| matches!(n.look, Look::FontTile { .. })).count();
+        let tiles = app
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.look, Look::FontTile { .. }))
+            .count();
         assert!(tiles > 4);
         assert!(app.panel_max_scroll() >= 0.0);
         app.run(Act::Font(3));
         assert_eq!(app.settings.font, 3);
         assert!(app.overlay.is_none());
         // The settings keep the generated keys.
-        let saved: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap()).unwrap();
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap())
+                .unwrap();
         assert_eq!(saved["mcpKey"], app.settings.mcp_key.as_str());
         assert_eq!(share_code("join 654321 please"), "654321");
         assert_eq!(wrap_chars(14.0, "abcdefghij", 30.0).concat(), "abcdefghij");
         let _ = std::fs::remove_dir_all(dir);
     }
-
 
     #[test]
     fn dates_are_civil() {
@@ -4024,9 +5869,24 @@ mod tests {
         let menu = app.node_rect(&Act::Menu);
         tap(&mut app, menu.cx(), menu.cy(), 3000);
         assert!(matches!(app.overlay, Some(Overlay::Menu { .. })));
+        let settings = app.node_rect(&Act::Settings);
+        tap(&mut app, settings.cx(), settings.cy(), 3050);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Panel {
+                kind: PanelKind::Settings,
+                ..
+            })
+        ));
         let grid = app.node_rect(&Act::Toggle(Opt::Grid));
         tap(&mut app, grid.cx(), grid.cy(), 3100);
-        assert!(app.overlay.is_none());
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Panel {
+                kind: PanelKind::Settings,
+                ..
+            })
+        ));
         assert!(!app.settings.grid);
         assert!(!Settings::load(&app.settings_path).grid);
         // The remote moves focus between the controls.
@@ -4036,6 +5896,190 @@ mod tests {
         assert!(app.key(keys::RIGHT));
         app.frame(3300);
         assert!(app.nodes.iter().any(|n| n.hl == Hl::Focused));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dock_moves_to_each_edge_without_covering_canvas_centre() {
+        let (mut app, dir) = app();
+        app.resize(1920, 1080, 1.5);
+        app.run(Act::NewBoard);
+        app.text_input("Dock positions", true);
+        settle(&mut app);
+        let (w, h) = app.extent();
+        for dock in Dock::ALL {
+            app.run(Act::Dock(dock));
+            let chrome = app.board_chrome();
+            let r = chrome.dock;
+            assert!(!r.contains(w / 2.0, h / 2.0));
+            assert!(chrome
+                .buttons
+                .iter()
+                .all(|button| r.contains(button.cx(), button.cy())));
+            match dock {
+                Dock::Left => assert_eq!(r.x, 24.0),
+                Dock::Right => assert_eq!(r.right(), w - 24.0),
+                Dock::Bottom => assert_eq!(r.bottom(), h - 24.0),
+                Dock::Top => assert_eq!(r.y, 24.0),
+            }
+            let (p, _) = app.popover(r, 536.0, 352.0, chrome.buttons[8], 20.0, false);
+            match dock {
+                Dock::Left => assert!(p.x > r.right()),
+                Dock::Right => assert!(p.right() < r.x),
+                Dock::Bottom => assert!(p.bottom() < r.y),
+                Dock::Top => assert!(p.y > r.bottom()),
+            }
+            assert_eq!(Settings::load(&app.settings_path).dock, dock);
+        }
+        // Both sets of corner bars move out of the way of a crowded horizontal dock.
+        app.resize(720, 1280, 2.0);
+        for dock in [Dock::Top, Dock::Bottom] {
+            app.run(Act::Dock(dock));
+            let chrome = app.board_chrome();
+            for bar in [
+                chrome.left,
+                chrome.right,
+                chrome.history,
+                chrome.zoom,
+                chrome.pages,
+            ] {
+                assert!(!overlaps(chrome.dock, bar), "{dock:?}, {bar:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pages_save_and_reopen_with_independent_shapes_and_views() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.0);
+        app.run(Act::NewBoard);
+        app.text_input("Pages", true);
+        settle(&mut app);
+        let board_id = app.board.as_ref().unwrap().id.clone();
+        let shape = |id| Shape::new(id, Tool::Rectangle, vec![Pt::ZERO, Pt::new(100.0, 60.0)]);
+        app.ed.apply_remote(vec![shape("first")], Vec::new());
+        app.ed.set_view(Pt::new(10.0, -20.0), 1.25);
+        app.run(Act::PageAdd);
+        assert_eq!(app.page, 1);
+        assert!(app.ed.doc.shapes().is_empty());
+        app.ed.apply_remote(vec![shape("second")], Vec::new());
+        app.ed.set_view(Pt::new(-90.0, 91.0), 2.0);
+        app.run(Act::PagePrev);
+        assert_eq!(app.ed.doc.shapes()[0].id, "first");
+        assert_eq!(app.ed.camera(), Pt::new(10.0, -20.0));
+        app.run(Act::PageNext);
+        assert_eq!(app.ed.doc.shapes()[0].id, "second");
+        assert_eq!(app.ed.zoom(), 2.0);
+        let (tx, rx) = mpsc::sync_channel(1);
+        app.pause(tx);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let saved = store::load(&dir.join("boards"), &board_id).unwrap();
+        assert_eq!(saved.shapes[0].id, "first");
+        let second = Page::decode(&saved.extra["pages"][0]).unwrap();
+        assert_eq!(second.shapes[0].id, "second");
+        assert_eq!(second.view, Some((Pt::new(-90.0, 91.0), 2.0)));
+        app.run(Act::Back);
+        settle(&mut app);
+        app.run(Act::Open(board_id));
+        settle(&mut app);
+        assert_eq!(app.page, 0);
+        assert_eq!(app.ed.doc.shapes()[0].id, "first");
+        assert_eq!(app.ed.camera(), Pt::new(10.0, -20.0));
+        app.run(Act::PageNext);
+        assert_eq!(app.ed.doc.shapes()[0].id, "second");
+        assert_eq!(app.ed.camera(), Pt::new(-90.0, 91.0));
+        app.run(Act::AskDeletePage);
+        app.run(Act::Done);
+        assert_eq!(app.pages.len(), 1);
+        assert_eq!(app.ed.doc.shapes()[0].id, "first");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn highlighter_draws_translucent_ink_and_keeps_its_own_style() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.0);
+        app.run(Act::NewBoard);
+        app.text_input("Highlights", true);
+        settle(&mut app);
+        app.run(Act::Color(PALETTE[8]));
+        app.run(Act::Width(2));
+        app.run(Act::Highlighter);
+        app.run(Act::Highlighter);
+        assert!(matches!(app.overlay, Some(Overlay::Style)));
+        app.run(Act::Color(PALETTE[2]));
+        app.run(Act::Width(3));
+        assert_eq!(app.ed.color(), 0x73e0_3131);
+        assert_eq!(app.ed.stroke_width(), 32.0);
+        assert!(app.layout().iter().any(
+            |node| matches!(node.look, Look::Swatch { color, chosen: true } if color == PALETTE[2])
+        ));
+        app.run(Act::Cancel);
+        app.frame(2000);
+        let sample = Sample {
+            id: 1,
+            x: 600.0,
+            y: 400.0,
+            time: 2010,
+            stylus: true,
+            ..Sample::default()
+        };
+        app.touch(Phase::Down, &[sample]);
+        app.touch(
+            Phase::Move,
+            &[Sample {
+                x: 650.0,
+                time: 2050,
+                ..sample
+            }],
+        );
+        app.touch(
+            Phase::Up,
+            &[Sample {
+                x: 700.0,
+                time: 2100,
+                ..sample
+            }],
+        );
+        assert_eq!(app.ed.doc.shapes()[0].color, 0x73e0_3131);
+        assert_eq!(app.ed.doc.shapes()[0].tool, Tool::Pen);
+        app.run(Act::Tool(Tool::Pen, PenMode::Ink));
+        assert_eq!(app.ed.color(), PALETTE[8]);
+        assert_eq!(app.ed.stroke_width(), 5.0);
+        app.run(Act::Highlighter);
+        assert_eq!(app.ed.color(), 0x73e0_3131);
+        assert_eq!(app.ed.stroke_width(), 32.0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn text_request_opens_multiline_input_and_commits_opaque_text() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.0);
+        app.run(Act::NewBoard);
+        app.text_input("Typing", true);
+        settle(&mut app);
+        app.run(Act::Color(PALETTE[9]));
+        app.run(Act::Highlighter);
+        app.run(Act::Tool(Tool::Text, PenMode::Ink));
+        app.frame(2000);
+        tap(&mut app, 640.0, 400.0, 2100);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Ask {
+                multiline: true,
+                purpose: AskFor::Text { .. },
+                ..
+            })
+        ));
+        app.text_input("First line\nSecond line", false);
+        app.run(Act::Done);
+        assert!(app.overlay.is_none());
+        let shape = &app.ed.doc.shapes()[0];
+        assert_eq!(shape.tool, Tool::Text);
+        assert_eq!(shape.color, PALETTE[9]);
+        assert_eq!(shape.text, "First line\nSecond line");
         let _ = std::fs::remove_dir_all(dir);
     }
 

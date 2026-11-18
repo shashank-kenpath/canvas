@@ -3,6 +3,7 @@
 use crate::geom::{segment_distance, Pt, Rect};
 use crate::text;
 use serde_json::{json, Map, Value};
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Tool {
@@ -14,10 +15,15 @@ pub enum Tool {
     Arrow,
     Text,
     Eraser,
+    Line,
+    Triangle,
+    Diamond,
+    Star,
+    Hexagon,
 }
 
 impl Tool {
-    pub const ALL: [Tool; 8] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Select,
         Tool::Hand,
         Tool::Pen,
@@ -26,6 +32,11 @@ impl Tool {
         Tool::Arrow,
         Tool::Text,
         Tool::Eraser,
+        Tool::Line,
+        Tool::Triangle,
+        Tool::Diamond,
+        Tool::Star,
+        Tool::Hexagon,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -37,6 +48,11 @@ impl Tool {
             Tool::Arrow => "arrow",
             Tool::Text => "text",
             Tool::Eraser => "eraser",
+            Tool::Line => "line",
+            Tool::Triangle => "triangle",
+            Tool::Diamond => "diamond",
+            Tool::Star => "star",
+            Tool::Hexagon => "hexagon",
         }
     }
     pub fn by_name(name: &str) -> Option<Tool> {
@@ -52,8 +68,26 @@ impl Tool {
 
 pub const DEFAULT_COLOR: u32 = 0xff1d1d1d;
 
+fn normalized_star() -> &'static [(f64, f64); 10] {
+    static VERTICES: OnceLock<[(f64, f64); 10]> = OnceLock::new();
+    VERTICES.get_or_init(|| {
+        use std::f64::consts::PI;
+
+        // Fit the outer tips to the box with one tip pointing up.
+        let half_width = (PI / 10.0).cos();
+        let height = 1.0 + (PI / 5.0).cos();
+        std::array::from_fn(|i| {
+            let angle = i as f64 * PI / 5.0;
+            let radius = if i % 2 == 0 { 1.0 } else { 0.45 };
+            let x = 0.5 + radius * angle.sin() / (2.0 * half_width);
+            let y = (1.0 - radius * angle.cos()) / height;
+            (x, y)
+        })
+    })
+}
+
 /// Immutable once built; edits make a new shape with the same id.
-/// A straight line is a pen shape with exactly two points.
+/// A straight line can also be represented by a pen shape with two points.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shape {
     pub id: String,
@@ -118,6 +152,21 @@ impl Shape {
         self.bounds
     }
 
+    /// Clockwise vertices of the box-based polygons, shared by drawing and hit testing.
+    pub(crate) fn polygon_vertices(&self) -> impl Iterator<Item = Pt> + '_ {
+        let vertices: &[(f64, f64)] = match self.tool {
+            Tool::Triangle => &[(0.5, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            Tool::Diamond => &[(0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.0, 0.5)],
+            Tool::Star => normalized_star(),
+            Tool::Hexagon => &[
+                (0.25, 0.0), (0.75, 0.0), (1.0, 0.5), (0.75, 1.0), (0.25, 1.0), (0.0, 0.5),
+            ],
+            _ => &[],
+        };
+        let b = self.bounds;
+        vertices.iter().map(move |&(x, y)| Pt::new(b.l + x * b.width(), b.t + y * b.height()))
+    }
+
     pub fn is_dot(&self) -> bool {
         let a = self.points[0];
         self.points.iter().all(|p| (*p - a).len2() <= 0.01)
@@ -135,6 +184,9 @@ impl Shape {
                 first.x + w.max(self.font_size),
                 first.y + h.max(self.font_size * text::LINE_HEIGHT),
             );
+        }
+        if self.tool == Tool::Line {
+            return Rect::from_points(*first, *self.points.last().unwrap());
         }
         let mut r = Rect::ltrb(first.x, first.y, first.x, first.y);
         for p in &self.points[1..] {
@@ -214,7 +266,8 @@ impl Shape {
         }
         let radius = tolerance + self.width / 2.0;
         let bounds = self.bounds;
-        if !bounds.inflate(radius).contains(point) {
+        let reach = bounds.inflate(radius);
+        if !(reach.l..=reach.r).contains(&point.x) || !(reach.t..=reach.b).contains(&point.y) {
             return false;
         }
         match self.tool {
@@ -249,6 +302,29 @@ impl Shape {
                 let on_outline = c + Pt::new(dx / normalized, dy / normalized);
                 on_outline.dist(point) <= radius
             }
+            Tool::Triangle | Tool::Diamond | Tool::Star | Tool::Hexagon => {
+                let mut vertices = self.polygon_vertices();
+                let first = vertices.next().unwrap();
+                let mut a = first;
+                let mut inside = false;
+                for b in vertices.chain([first]) {
+                    if segment_distance(point, a, b) <= radius {
+                        return true;
+                    }
+                    // Count crossings of the ray extending to the right of the point.
+                    if self.filled && (a.y > point.y) != (b.y > point.y) {
+                        let crossing_x = a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x);
+                        if point.x < crossing_x {
+                            inside = !inside;
+                        }
+                    }
+                    a = b;
+                }
+                inside
+            }
+            Tool::Line => {
+                segment_distance(point, self.points[0], *self.points.last().unwrap()) <= radius
+            }
             Tool::Pen | Tool::Arrow => {
                 if self.points.len() == 1 {
                     return self.points[0].dist(point) <= radius;
@@ -256,6 +332,30 @@ impl Shape {
                 self.points.windows(2).any(|w| segment_distance(point, w[0], w[1]) <= radius)
             }
             Tool::Select | Tool::Hand | Tool::Eraser => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_tools_round_trip_with_stable_indices() {
+        for (tool, name, index) in [
+            (Tool::Line, "line", 8),
+            (Tool::Triangle, "triangle", 9),
+            (Tool::Diamond, "diamond", 10),
+            (Tool::Star, "star", 11),
+            (Tool::Hexagon, "hexagon", 12),
+        ] {
+            let shape = Shape::new(name, tool, vec![Pt::new(90.0, 10.0), Pt::new(0.0, 60.0)])
+                .styled(0xffabcdef, 5.0, true);
+            let json = shape.to_json();
+            assert_eq!(json["tool"], name);
+            assert_eq!(Shape::from_json(&json).unwrap(), shape);
+            assert_eq!(tool.index(), index);
+            assert_eq!(Tool::from_index(index), Some(tool));
         }
     }
 }
