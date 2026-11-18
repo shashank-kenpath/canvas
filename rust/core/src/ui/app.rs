@@ -59,7 +59,7 @@ const SHAPES: [(Tool, Ico, &str); 9] = [
     (Tool::Pen, Ico::Smart, "Smart shapes"),
 ];
 const RELAY: &str = "https://inkboard.taila6db10.ts.net";
-const LANGS: [(&str, &str); 2] = [("en", "English"), ("hi", "हिन्दी")];
+const LANGS: [(&str, &str); 1] = [("en", "English")];
 
 // ----------------------------------------------------------- host side
 
@@ -485,7 +485,6 @@ enum Act {
     AskDeletePage,
     Retry,
     Toggle(Opt),
-    Lang(usize),
     FontPanel,
     Font(u8),
     FullRes,
@@ -673,7 +672,7 @@ struct BoardChrome {
     zoom: Rf,
     dock: Rf,
     dock_scale: f32,
-    buttons: [Rf; 9],
+    buttons: [Rf; 8],
     dividers: [Rf; 2],
     pages: Rf,
     selection: Rf,
@@ -2538,9 +2537,6 @@ impl App {
             Act::Shapes => {
                 if matches!(self.overlay, Some(Overlay::Shapes)) {
                     self.dismiss();
-                } else if self.shape_tool_active() && !matches!(self.overlay, Some(Overlay::Style))
-                {
-                    self.show_overlay(Overlay::Style);
                 } else {
                     self.show_overlay(Overlay::Shapes);
                 }
@@ -2583,7 +2579,6 @@ impl App {
                 Opt::MultiInk => s.multi_ink = !s.multi_ink,
                 Opt::Smooth => s.smooth = !s.smooth,
             }),
-            Act::Lang(i) => self.set(|s| s.lang = LANGS[i].0.to_string()),
             Act::FontPanel => self.panel(PanelKind::Fonts),
             Act::Font(f) => {
                 self.set(|s| s.font = f);
@@ -3190,8 +3185,8 @@ impl App {
         } else {
             w - 2.0 * margin
         };
-        let k = (available / 754.0).min(compact).max(0.0);
-        let long = 754.0 * k;
+        let k = (available / 676.0).min(compact).max(0.0);
+        let long = 676.0 * k;
         let short = 96.0 * k;
         let dock = match dock_side {
             Dock::Left => Rf::new(margin, top + (available - long) / 2.0, short, long),
@@ -3234,9 +3229,9 @@ impl App {
                 )
             }
         };
-        let offsets = [12.0, 90.0, 184.0, 262.0, 340.0, 418.0, 496.0, 574.0, 670.0];
+        let offsets = [12.0, 90.0, 184.0, 262.0, 340.0, 418.0, 496.0, 592.0];
         let buttons = offsets.map(|offset| point(offset, 12.0, 72.0, 72.0));
-        let dividers = [point(172.0, 20.0, 2.0, 56.0), point(658.0, 20.0, 2.0, 56.0)];
+        let dividers = [point(172.0, 20.0, 2.0, 56.0), point(580.0, 20.0, 2.0, 56.0)];
 
         let centered =
             |width: f32, y: f32| Rf::new((w - width * compact) / 2.0, y, width * compact, bar_h);
@@ -3475,11 +3470,6 @@ impl App {
                 Act::Shapes,
             ),
             (
-                Ico::Text,
-                tool == Tool::Text,
-                Act::Tool(Tool::Text, PenMode::Ink),
-            ),
-            (
                 Ico::Convert,
                 tool == Tool::Pen && mode == PenMode::Write,
                 Act::Tool(Tool::Pen, PenMode::Write),
@@ -3504,7 +3494,7 @@ impl App {
         }
         let style_open = matches!(self.overlay, Some(Overlay::Style));
         ui.scaled(
-            c.buttons[8],
+            c.buttons[7],
             Look::ColorChip {
                 color: self.style_color(),
                 open: style_open,
@@ -3639,7 +3629,7 @@ impl App {
     fn layout_style(&self, ui: &mut Ui, c: &BoardChrome) {
         let fill = self.shape_tool_active();
         let height = if fill { 448.0 } else { 352.0 };
-        let anchor = c.buttons[8];
+        let anchor = c.buttons[7];
         let (r, k) = self.popover(c.dock, 536.0, height, anchor, 20.0, false);
         if k <= 0.0 {
             return;
@@ -4239,15 +4229,6 @@ impl App {
         let mut left = PanelRows::new(width, self.unit());
         left.heading("WRITING");
         if self.is_board_open() {
-            left.segments(
-                "Handwriting language",
-                280.0,
-                LANGS
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (_, label))| (label, Act::Lang(i))),
-                usize::from(s.lang == "hi"),
-            );
             left.toggle("Tidy drawn shapes", None, s.tidy, Act::Toggle(Opt::Tidy));
         }
         left.toggle(
@@ -5922,7 +5903,7 @@ mod tests {
                 Dock::Bottom => assert_eq!(r.bottom(), h - 24.0),
                 Dock::Top => assert_eq!(r.y, 24.0),
             }
-            let (p, _) = app.popover(r, 536.0, 352.0, chrome.buttons[8], 20.0, false);
+            let (p, _) = app.popover(r, 536.0, 352.0, chrome.buttons[7], 20.0, false);
             match dock {
                 Dock::Left => assert!(p.x > r.right()),
                 Dock::Right => assert!(p.right() < r.x),
