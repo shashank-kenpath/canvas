@@ -13,6 +13,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.Log
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
@@ -36,7 +37,15 @@ class Updater(private val activity: Activity, private val message: (String) -> U
         busy = true
         Thread({
             var version = ""; var url = ""; var failed = false
+            // The office build machine serves updates on the local network first.
             try {
+                val feed = JSONObject(String(fetch(LAN_FEED, 64 * 1024), Charsets.UTF_8))
+                val apk = feed.getString("apk")
+                require(!apk.contains('/') && apk.endsWith(".apk")) { "Bad update file name" }
+                version = feed.getString("version")
+                url = LAN_BASE + apk
+            } catch (error: Exception) { Log.i(Handwriting.TAG, "Local update feed unavailable: ${error.message}") }
+            if (url.isEmpty()) try {
                 val connection = open(RELEASES)
                 val bytes = try { connection.inputStream.use { input ->
                     val output = ByteArrayOutputStream()
@@ -70,10 +79,25 @@ class Updater(private val activity: Activity, private val message: (String) -> U
         }, "update-check").start()
     }
 
-    private fun open(url: String): HttpURLConnection {
-        require(URL(url).protocol == "https") { "Updates require HTTPS" }
+    private fun fetch(url: String, limit: Int): ByteArray {
+        val connection = open(url, 3_000)
+        return try { connection.inputStream.use { input ->
+            val output = ByteArrayOutputStream()
+            val buffer = ByteArray(16 * 1024)
+            while (true) {
+                val n = input.read(buffer); if (n < 0) break
+                require(output.size() + n <= limit) { "Response is too large" }
+                output.write(buffer, 0, n)
+            }
+            output.toByteArray()
+        } } finally { connection.disconnect() }
+    }
+
+    private fun open(url: String, connectTimeout: Int = 15_000): HttpURLConnection {
+        // Cleartext only for the local build machine; the APK's signature is checked before install.
+        require(URL(url).protocol == "https" || url.startsWith(LAN_BASE)) { "Updates require HTTPS" }
         val connection = URL(url).openConnection() as HttpURLConnection
-        connection.connectTimeout = 15_000
+        connection.connectTimeout = connectTimeout
         connection.readTimeout = 30_000
         connection.instanceFollowRedirects = true
         connection.setRequestProperty("User-Agent", "canvas-studio-updater")
@@ -83,7 +107,7 @@ class Updater(private val activity: Activity, private val message: (String) -> U
 
     fun download(url: String) {
         if (busy) { report("An update operation is already running"); return }
-        if (!url.startsWith("https://github.com/tejasgowda0012/canvas/releases/download/")) { report("This update address is invalid"); return }
+        if (!url.startsWith("https://github.com/tejasgowda0012/canvas/releases/download/") && !url.startsWith(LAN_BASE)) { report("This update address is invalid"); return }
         busy = true
         report("Downloading the update…")
         Thread({
@@ -180,6 +204,8 @@ class Updater(private val activity: Activity, private val message: (String) -> U
         const val ACTION = "com.canvasstudio.rust.UPDATE_RESULT"
         private const val NONCE = "com.canvasstudio.rust.UPDATE_NONCE"
         const val PREFIX = "rust-v"
+        const val LAN_BASE = "http://192.168.88.67:8790/"
+        const val LAN_FEED = LAN_BASE + "latest.json"
         const val RELEASES = "https://api.github.com/repos/tejasgowda0012/canvas/releases?per_page=30"
     }
 }
