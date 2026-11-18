@@ -15,4 +15,5 @@ image = { version = "0.25", default-features = false, features = ["bmp", "gif", 
 quick-xml = "0.38"
 resvg = { version = "0.45", default-features = false, features = ["text", "raster-images"] }
 sha2 = "0.10"
+qrcode = { version = "0.14", default-features = false }
 zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }

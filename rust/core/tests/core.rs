@@ -1167,3 +1167,41 @@ fn with_wide_erase_off_a_finger_draws_and_two_fingers_pinch() {
     assert!(e.zoom() > zoom * 1.5, "two fingers zoom");
     assert_eq!(e.doc.shapes().len(), 1);
 }
+
+/// A hand-drawn closed outline: `corner` rounds the corners of a w x h box
+/// (0 = sharp, 1 = an ellipse), with a steady wobble and a small gap.
+fn sketched(w: f64, h: f64, corner: f64, wobble: f64) -> Shape {
+    let (rx, ry) = (w / 2.0, h / 2.0);
+    let n = 160;
+    ink((0..n - 3)
+        .map(|i| {
+            let a = i as f64 * PI * 2.0 / n as f64;
+            let (c, s) = (a.cos(), a.sin());
+            // Superellipse: exponent 2 is an ellipse, large is a box.
+            let e = 2.0 + (1.0 - corner) * 10.0;
+            let k = (c.abs().powf(e) + s.abs().powf(e)).powf(-1.0 / e);
+            let jitter = 1.0 + wobble * (a * 7.0).sin() + wobble * 0.5 * (a * 13.0).cos();
+            p(200.0 + c * k * rx * jitter, 200.0 + s * k * ry * jitter)
+        })
+        .collect())
+}
+
+#[test]
+fn a_rough_box_with_rounded_corners_stays_a_box_not_a_circle() {
+    for (w, h) in [(200., 200.), (300., 140.)] {
+        for corner in [0.0, 0.3, 0.5] {
+            let tool = recognize_shape(&sketched(w, h, corner, 0.03)).map(|s| s.tool);
+            assert_ne!(tool, Some(Tool::Ellipse), "{w}x{h} box, corner {corner}");
+        }
+        let tool = recognize_shape(&sketched(w, h, 0.0, 0.03)).map(|s| s.tool);
+        assert_eq!(tool, Some(Tool::Rectangle), "{w}x{h} rough box");
+    }
+}
+
+#[test]
+fn a_wobbly_circle_or_ellipse_is_still_recognized() {
+    for (w, h) in [(200., 200.), (300., 160.)] {
+        let tool = recognize_shape(&sketched(w, h, 1.0, 0.04)).map(|s| s.tool);
+        assert_eq!(tool, Some(Tool::Ellipse), "{w}x{h}");
+    }
+}

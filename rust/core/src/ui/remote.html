@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#111318">
+<title>Inkboard remote</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111318; color: #e8eaf0; overflow: hidden;
+    overscroll-behavior: none; font: 15px system-ui, sans-serif; -webkit-user-select: none; user-select: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; touch-action: none; }
+  #bar { position: fixed; top: 8px; right: 8px; display: flex; gap: 8px; z-index: 2; }
+  #bar button { background: rgba(40,44,54,.85); color: #e8eaf0; border: 0; border-radius: 999px;
+    padding: 8px 14px; font: inherit; }
+  #msg { position: fixed; left: 50%; top: 50%; transform: translate(-50%,-50%); text-align: center;
+    max-width: 80%; z-index: 1; pointer-events: none; opacity: .85; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: #e5484d; align-self: center; }
+  #dot.on { background: #30a46c; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="msg">Connecting to the board…</div>
+<div id="bar"><span id="dot"></span><button id="full">Full screen</button></div>
+<script>
+(() => {
+  const cv = document.getElementById('c'), g = cv.getContext('2d');
+  const msg = document.getElementById('msg'), dot = document.getElementById('dot');
+  let key = new URLSearchParams(location.hash.slice(1)).get('k');
+  try { if (key) localStorage.setItem('k', key); else key = localStorage.getItem('k'); } catch (e) {}
+  if (!key) { msg.textContent = 'Scan the QR code on the board again.'; return; }
+  const q = 'k=' + encodeURIComponent(key);
+
+  let img = null, gen = 0, box = { x: 0, y: 0, w: 1, h: 1 };
+  const trail = new Map();       // pointer -> points drawn locally until the board catches up
+  let clearAt = Infinity;        // clear the local trail once a frame newer than this arrives
+
+  function size() {
+    const d = devicePixelRatio || 1;
+    cv.width = Math.round(innerWidth * d); cv.height = Math.round(innerHeight * d);
+    draw();
+  }
+  function draw() {
+    const W = cv.width, H = cv.height;
+    g.fillStyle = '#111318'; g.fillRect(0, 0, W, H);
+    if (img) {
+      const s = Math.min(W / img.width, H / img.height);
+      const w = img.width * s, h = img.height * s;
+      box = { x: (W - w) / 2, y: (H - h) / 2, w, h };
+      g.drawImage(img, box.x, box.y, w, h);
+    }
+    g.lineCap = g.lineJoin = 'round'; g.strokeStyle = 'rgba(37,99,235,.8)';
+    g.lineWidth = 3 * (devicePixelRatio || 1);
+    for (const pts of trail.values()) {
+      g.beginPath();
+      pts.forEach((p, i) => i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1]));
+      g.stroke();
+    }
+  }
+  addEventListener('resize', size); size();
+
+  // Mirror: ask for a new picture whenever the board has repainted.
+  let fails = 0;
+  async function poll() {
+    for (;;) {
+      try {
+        const w = Math.min(1280, Math.max(640, Math.round(Math.max(cv.width, cv.height))));
+        const r = await fetch('/r/frame?' + q + '&since=' + gen + '&w=' + w, { cache: 'no-store' });
+        if (r.status === 403) { msg.textContent = 'This link is out of date. Scan the QR code again.'; dot.className = ''; return; }
+        dot.className = 'on'; fails = 0;
+        if (r.status === 200) {
+          const j = await r.json();
+          const im = new Image();
+          im.src = 'data:image/jpeg;base64,' + j.jpg;
+          await im.decode();
+          img = im; gen = j.gen; msg.style.display = 'none';
+          if (gen > clearAt) { trail.clear(); clearAt = Infinity; }
+          draw();
+          await wait(30);
+        } else {
+          await wait(80);
+        }
+      } catch (e) {
+        dot.className = ''; fails++;
+        msg.style.display = ''; msg.textContent = 'Reconnecting…';
+        await wait(Math.min(3000, 300 * fails));
+      }
+    }
+  }
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  poll();
+
+  // Touches: [phase, id, x, y, ms since the batch started], x and y from 0 to 1.
+  const ids = new Map();
+  let queue = [], t0 = 0, sending = false;
+  function slot(pid) {
+    if (!ids.has(pid)) { let n = 0; while ([...ids.values()].includes(n)) n++; ids.set(pid, n); }
+    return ids.get(pid);
+  }
+  function at(e) {
+    const d = devicePixelRatio || 1, px = e.clientX * d, py = e.clientY * d;
+    return [px, py, (px - box.x) / box.w, (py - box.y) / box.h];
+  }
+  function push(phase, e) {
+    const [px, py, x, y] = at(e);
+    if (!queue.length) t0 = performance.now();
+    queue.push([phase, slot(e.pointerId), +x.toFixed(5), +y.toFixed(5), Math.round(performance.now() - t0)]);
+    return [px, py];
+  }
+  async function flush() {
+    if (sending || !queue.length) return;
+    sending = true;
+    const batch = queue; queue = [];
+    try {
+      const r = await fetch('/r/input?' + q, { method: 'POST', body: JSON.stringify(batch) });
+      const j = await r.json();
+      if (batch.some(e => e[0] >= 2) && !ids.size) clearAt = j.gen;
+    } catch (e) {}
+    sending = false;
+    if (queue.length) flush();
+  }
+  setInterval(flush, 25);
+
+  cv.addEventListener('pointerdown', e => {
+    if (!img) return;
+    cv.setPointerCapture(e.pointerId);
+    const p = push(0, e);
+    trail.set(e.pointerId, [p]);
+    if (trail.size > 1) trail.clear();   // two fingers move the board, no preview
+    draw(); flush();
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!ids.has(e.pointerId)) return;
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+    for (const c of (evs.length ? evs : [e])) {
+      const p = push(1, Object.assign({}, { clientX: c.clientX, clientY: c.clientY, pointerId: e.pointerId }));
+      const t = trail.get(e.pointerId); if (t) t.push(p);
+    }
+    draw();
+  });
+  function end(phase) {
+    return e => {
+      if (!ids.has(e.pointerId)) return;
+      push(phase, e); ids.delete(e.pointerId); flush();
+    };
+  }
+  cv.addEventListener('pointerup', end(2));
+  cv.addEventListener('pointercancel', end(3));
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+
+  document.getElementById('full').onclick = async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else { await document.documentElement.requestFullscreen(); await screen.orientation.lock('landscape'); }
+    } catch (e) {}
+  };
+})();
+</script>
+</body>
+</html>

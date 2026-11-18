@@ -330,6 +330,8 @@ struct Settings {
     lang: String,
     /// Secret part of the Claude (MCP) address.
     mcp_key: String,
+    /// Secret part of the phone remote address.
+    remote_key: String,
     /// This panel's name and password at the relay.
     relay_id: String,
     relay_secret: String,
@@ -421,6 +423,7 @@ impl Settings {
                 .unwrap_or("en")
                 .to_string(),
             mcp_key: token("mcpKey", 24, 24),
+            remote_key: token("remoteKey", 16, 16),
             relay_id: token("relayId", 8, 16),
             relay_secret: token("relaySecret", 16, 32),
             relay_url: v
@@ -437,7 +440,7 @@ impl Settings {
             "snap": self.snap, "font": self.font, "fullRes": self.full_res, "lang": self.lang,
             "fastInk": self.fast_ink, "predict": self.predict, "penPriority": self.pen_priority,
             "multiInk": self.multi_ink, "wideErase": self.wide_erase, "smooth": self.smooth, "dock": self.dock as u8,
-            "mcpKey": self.mcp_key, "relayId": self.relay_id, "relaySecret": self.relay_secret,
+            "mcpKey": self.mcp_key, "remoteKey": self.remote_key, "relayId": self.relay_id, "relaySecret": self.relay_secret,
             "relayUrl": self.relay_url,
         });
         let tmp = path.with_extension("tmp");
@@ -554,6 +557,7 @@ enum Act {
     Leave,
     Join,
     Claude,
+    Remote,
     Export,
     Copy(String),
     CopyCode(String),
@@ -575,6 +579,8 @@ enum ButtonKind {
 
 #[derive(Clone, PartialEq, Debug)]
 enum Look {
+    /// A QR code of the text, black on white.
+    Qr(String),
     Surface {
         color: u32,
         radius: f32,
@@ -906,6 +912,7 @@ enum AskFor {
 enum PanelKind {
     Share,
     Claude,
+    Remote,
     Fonts,
     Settings,
 }
@@ -1119,6 +1126,10 @@ pub struct App {
     relay: Option<net::Relay>,
     /// Counts changes to the open board; joiners poll by it.
     doc_gen: u64,
+    /// Counts repaints of the output; the phone remote polls by it.
+    out_gen: u64,
+    /// Time of the last touch from the phone remote.
+    remote_t: u64,
     /// A board joined from another device.
     link: Option<net::Link>,
     known: HashMap<String, Value>,
@@ -1294,6 +1305,8 @@ impl App {
             server,
             relay,
             doc_gen: 1,
+            out_gen: 1,
+            remote_t: 0,
             link: None,
             known: HashMap::new(),
             ops_sent: 0,
@@ -1510,6 +1523,9 @@ impl App {
             }
             self.compose(r);
             total = Some(total.map_or(r, |t| t.union(&r)));
+        }
+        if total.is_some() {
+            self.out_gen += 1;
         }
         total
     }
@@ -2769,6 +2785,10 @@ impl App {
                 self.lan_ip = net::local_ip();
                 self.panel(PanelKind::Claude);
             }
+            Act::Remote => {
+                self.lan_ip = net::local_ip();
+                self.panel(PanelKind::Remote);
+            }
             Act::Export => {
                 self.dismiss();
                 let title = self
@@ -3114,6 +3134,13 @@ impl App {
                 "Claude".to_string(),
                 172.0,
                 Act::Claude,
+                ButtonKind::White,
+            ),
+            (
+                Ico::Hand,
+                "Phone".to_string(),
+                164.0,
+                Act::Remote,
                 ButtonKind::White,
             ),
             (
@@ -4129,6 +4156,7 @@ impl App {
                             false,
                             Act::Claude,
                         ),
+                        row(Ico::Hand, "Phone remote…", "", false, false, Act::Remote),
                         row(Ico::Export, "Export as PNG", "", false, false, Act::Export),
                         row(Ico::Import, "Import boards…", "", false, false, Act::Import),
                         row(Ico::Join, "Join a board…", "", false, false, Act::Join),
@@ -4259,6 +4287,82 @@ impl App {
             .is_some_and(|r| r.online.load(std::sync::atomic::Ordering::SeqCst))
     }
 
+    fn remote_url(&self) -> Option<String> {
+        let ip = self.lan_ip?;
+        Some(format!("http://{ip}:{}/r#k={}", net::PORT, self.settings.remote_key))
+    }
+
+    /// The phone remote: a page that mirrors the screen and sends touches back.
+    fn remote(&mut self, path: &str, req: &net::Req) -> net::Resp {
+        if path == "/r" {
+            return net::Resp {
+                status: 200,
+                ctype: "text/html; charset=utf-8",
+                body: include_str!("remote.html").as_bytes().to_vec(),
+            };
+        }
+        if req.query.get("k").map(String::as_str) != Some(self.settings.remote_key.as_str()) {
+            return net::Resp::empty(403);
+        }
+        match path {
+            "/r/frame" => {
+                let since = req.query.get("since").and_then(|s| s.parse::<u64>().ok());
+                if since == Some(self.out_gen) {
+                    return net::Resp::empty(204);
+                }
+                let want = req
+                    .query
+                    .get("w")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1280)
+                    .clamp(320, 1920);
+                match remote_jpeg(&self.out, want) {
+                    Some((w, h, jpg)) => {
+                        use base64::Engine;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(jpg);
+                        net::Resp::json(200, &json!({ "gen": self.out_gen, "w": w, "h": h, "jpg": b64 }))
+                    }
+                    None => net::Resp::empty(503),
+                }
+            }
+            "/r/input" if req.method == "POST" => {
+                let events = serde_json::from_slice::<Value>(&req.body)
+                    .ok()
+                    .and_then(|v| v.as_array().cloned())
+                    .unwrap_or_default();
+                let (w, h) = (self.w as f32, self.h as f32);
+                let base = self.now.max(self.remote_t + 1);
+                for e in events.iter().take(2000) {
+                    let num = |i: usize| e.get(i).and_then(Value::as_f64);
+                    let (Some(phase), Some(id), Some(x), Some(y)) = (num(0), num(1), num(2), num(3)) else {
+                        continue;
+                    };
+                    let phase = match phase as i64 {
+                        0 => Phase::Down,
+                        1 => Phase::Move,
+                        2 => Phase::Up,
+                        _ => Phase::Cancel,
+                    };
+                    let time = base + num(4).unwrap_or(0.0).clamp(0.0, 5000.0) as u64;
+                    self.remote_t = self.remote_t.max(time);
+                    let sample = Sample {
+                        id: 1000 + (id as i32).clamp(0, 99),
+                        x: x.clamp(0.0, 1.0) as f32 * w,
+                        y: y.clamp(0.0, 1.0) as f32 * h,
+                        time,
+                        size: 0.0,
+                        stylus: false,
+                        eraser: false,
+                        norm: 0.0,
+                    };
+                    self.touch(phase, &[sample]);
+                }
+                net::Resp::json(200, &json!({ "gen": self.out_gen }))
+            }
+            _ => net::Resp::empty(404),
+        }
+    }
+
     fn lan_mcp(&self) -> Option<String> {
         let ip = self.lan_ip?;
         Some(format!(
@@ -4283,6 +4387,7 @@ impl App {
         let (width, height) = match kind {
             PanelKind::Settings => (1360.0_f32, 824.0_f32),
             PanelKind::Claude => (960.0, 940.0),
+            PanelKind::Remote => (760.0, 900.0),
             PanelKind::Fonts => (960.0, 760.0),
             PanelKind::Share if self.joined() => (880.0, 380.0),
             PanelKind::Share => (880.0, 700.0),
@@ -4296,7 +4401,7 @@ impl App {
         let inset = match kind {
             PanelKind::Share => 48.0_f32,
             PanelKind::Settings => 40.0,
-            PanelKind::Claude | PanelKind::Fonts => 24.0,
+            PanelKind::Claude | PanelKind::Fonts | PanelKind::Remote => 24.0,
         }
         .min(r.w / 10.0);
         let footer = if kind == PanelKind::Share {
@@ -4351,6 +4456,15 @@ impl App {
                     ));
                 }
                 content.y = text::FONT_NAMES.len().div_ceil(cols) as f32 * (80.0 + gap) - gap;
+            }
+            PanelKind::Remote => {
+                content.para("Scan with a phone on the same Wi-Fi to draw and move around this screen from your seat. One finger draws, two fingers pan and zoom.", TEXT2);
+                if let Some(url) = self.remote_url() {
+                    content.qr(&url);
+                    content.copy_code(&url);
+                } else {
+                    content.para("Connect to Wi-Fi or Ethernet to use the phone remote.", TEXT2);
+                }
             }
             PanelKind::Claude => {
                 content.para("Add Inkboard as an MCP connector so Claude can read and edit the open board, add diagrams and get a picture of it.", TEXT2);
@@ -4554,6 +4668,7 @@ impl App {
                 }
             }
             PanelKind::Claude => "Connect Claude",
+            PanelKind::Remote => "Phone remote",
             PanelKind::Fonts => "Text font",
             PanelKind::Settings => "Settings",
         };
@@ -4681,6 +4796,9 @@ impl App {
             }
             let version = self.version.clone();
             return net::mcp(self, &req.method, &req.body, &version);
+        }
+        if path == "/r" || path.starts_with("/r/") {
+            return self.remote(path, req);
         }
         if path == "/health" {
             return net::Resp::json(200, &json!({ "app": "Inkboard", "version": self.version }));
@@ -5261,6 +5379,27 @@ impl App {
                     ACCENT,
                 );
             }
+            Look::Qr(text) => {
+                p.rrect(r, 16.0 * u, 0xffffffff);
+                if let Ok(code) = qrcode::QrCode::new(text.as_bytes()) {
+                    let n = code.width();
+                    let quiet = 2.0;
+                    let side = r.w.min(r.h);
+                    let cell = side / (n as f32 + 2.0 * quiet);
+                    let x0 = r.x + (r.w - side) / 2.0 + quiet * cell;
+                    let y0 = r.y + (r.h - side) / 2.0 + quiet * cell;
+                    for (i, c) in code.to_colors().iter().enumerate() {
+                        if *c == qrcode::Color::Dark {
+                            let (cx, cy) = ((i % n) as f32, (i / n) as f32);
+                            p.rrect(
+                                Rf::new(x0 + cx * cell, y0 + cy * cell, cell + 0.5, cell + 0.5),
+                                0.0,
+                                0xff000000,
+                            );
+                        }
+                    }
+                }
+            }
             Look::Code(text) => {
                 p.rrect(r, 20.0 * u, SURFACE2);
                 let font = 22.0 * u;
@@ -5567,6 +5706,16 @@ impl PanelRows {
         self.y += 16.0;
     }
 
+    fn qr(&mut self, text: &str) {
+        let side = 360.0_f32.min(self.width);
+        self.rows.push((
+            Rf::new((self.width - side) / 2.0, self.y, side, side),
+            Look::Qr(text.into()),
+            None,
+        ));
+        self.y += side + 16.0;
+    }
+
     fn copy_code(&mut self, text: &str) {
         let button_width = 160.0_f32.min(self.width * 0.31);
         let width = self.width - button_width - 12.0;
@@ -5711,6 +5860,38 @@ impl net::Board for App {
         self.board.as_ref()?;
         board_png(self.ed.doc.shapes(), max_side)
     }
+}
+
+/// Scales the screen down to `want` pixels wide and encodes it as JPEG.
+fn remote_jpeg(out: &Layer, want: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if out.w == 0 || out.h == 0 {
+        return None;
+    }
+    // Averages a 2x2 patch per output pixel straight from the screen, which
+    // is quick enough to run between frames without a full-size copy.
+    let w = want.min(out.w);
+    let h = ((out.h as u64 * w as u64) / out.w as u64).max(1) as u32;
+    let (sw, sh) = (out.w as usize, out.h as usize);
+    let mut rgb = vec![0u8; w as usize * h as usize * 3];
+    for y in 0..h as usize {
+        let sy = (y * sh / h as usize).min(sh - 1);
+        let sy2 = (sy + 1).min(sh - 1);
+        for x in 0..w as usize {
+            let sx = (x * sw / w as usize).min(sw - 1);
+            let sx2 = (sx + 1).min(sw - 1);
+            let o = (y * w as usize + x) * 3;
+            for c in 0..3 {
+                let px = |xx: usize, yy: usize| out.data[(yy * sw + xx) * 4 + c] as u16;
+                rgb[o + c] = ((px(sx, sy) + px(sx2, sy) + px(sx, sy2) + px(sx2, sy2) + 2) / 4) as u8;
+            }
+        }
+    }
+    let small = image::RgbImage::from_raw(w, h, rgb)?;
+    let mut jpg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 70)
+        .encode_image(&small)
+        .ok()?;
+    Some((w, h, jpg))
 }
 
 #[cfg(test)]
@@ -5868,6 +6049,42 @@ mod tests {
             resp.status,
             serde_json::from_slice(&resp.body).unwrap_or(Value::Null),
         )
+    }
+
+    #[test]
+    fn a_phone_remote_sees_the_screen_and_draws_on_the_board() {
+        let (mut app, dir) = app();
+        app.resize(1280, 800, 1.5);
+        settle(&mut app);
+        app.run(Act::NewBoard);
+        app.text_input("Remote", true);
+        settle(&mut app);
+        let key = app.settings.remote_key.clone();
+        assert_eq!(key.len(), 16);
+        // The page itself is open; the picture and touches need the key.
+        assert_eq!(req(&mut app, "GET", "/r", &[], Value::Null).0, 200);
+        assert_eq!(req(&mut app, "GET", "/r/frame", &[("k", "nope")], Value::Null).0, 403);
+        let (status, frame) = req(&mut app, "GET", "/r/frame", &[("k", &key), ("w", "640")], Value::Null);
+        assert_eq!(status, 200);
+        assert_eq!(frame["w"], 640);
+        let jpg = net::unbase64(frame["jpg"].as_str().unwrap());
+        assert_eq!(&jpg[..2], &[0xff, 0xd8]);
+        let gen = frame["gen"].as_u64().unwrap().to_string();
+        assert_eq!(req(&mut app, "GET", "/r/frame", &[("k", &key), ("since", &gen)], Value::Null).0, 204);
+
+        let before = app.ed.doc.shapes().len();
+        let mut events = vec![json!([0, 0, 0.40, 0.50, 0])];
+        for i in 1..=20 {
+            events.push(json!([1, 0, 0.40 + i as f64 * 0.01, 0.50 + (i % 3) as f64 * 0.004, i * 8]));
+        }
+        events.push(json!([2, 0, 0.60, 0.50, 170]));
+        let (status, _) = req(&mut app, "POST", "/r/input", &[("k", &key)], Value::Array(events));
+        assert_eq!(status, 200);
+        settle(&mut app);
+        assert_eq!(app.ed.doc.shapes().len(), before + 1);
+        // The board repainted, so the phone gets a new picture.
+        assert_eq!(req(&mut app, "GET", "/r/frame", &[("k", &key), ("since", &gen)], Value::Null).0, 200);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

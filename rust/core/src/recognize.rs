@@ -90,6 +90,9 @@ pub fn recognize_shape(stroke: &Shape) -> Option<Shape> {
     let (rx, ry) = (bw / 2.0, bh / 2.0);
     let (mut area, mut radial_error, mut winding) = (0.0, 0.0, 0.0);
     let mut near_edge = 0usize;
+    // How far the outline reaches into each corner of its box, in units of
+    // the ellipse radius: about 1 for an ellipse, up to 1.41 for a box.
+    let mut reach = [0.0f64; 4];
     let mut previous_angle: Option<f64> = None;
     let edge_band = bw.min(bh) * 0.14 + 2.0;
     let n = points.len();
@@ -104,7 +107,10 @@ pub fn recognize_shape(stroke: &Shape) -> Option<Shape> {
             near_edge += 1;
         }
         let (x, y) = ((p.x - center.x) / rx, (p.y - center.y) / ry);
-        radial_error += ((x * x + y * y).sqrt() - 1.0).abs();
+        let r = (x * x + y * y).sqrt();
+        radial_error += (r - 1.0).abs();
+        let quadrant = (x >= 0.0) as usize + 2 * (y >= 0.0) as usize;
+        reach[quadrant] = reach[quadrant].max(r);
         let angle = y.atan2(x);
         if let Some(prev) = previous_angle {
             let mut delta = angle - prev;
@@ -128,15 +134,22 @@ pub fn recognize_shape(stroke: &Shape) -> Option<Shape> {
     let edge_share = near_edge as f64 / n as f64;
     radial_error /= n as f64;
     let corners = vec![bounds.top_left(), bounds.bottom_right()];
+    let mut sorted = reach;
+    sorted.sort_by(f64::total_cmp);
+    // The two smallest: a box reaches into all its corners, a circle into
+    // none, and one wobbly corner does not make a circle a box.
+    let low_reach = (sorted[0] + sorted[1]) / 2.0;
+    let high_reach = (sorted[2] + sorted[3]) / 2.0;
+    if low_reach >= 1.18 && fill >= 0.72 && edge_share >= 0.55 {
+        return result(Tool::Rectangle, corners);
+    }
+    if (0.66..=0.86).contains(&fill) && radial_error <= 0.10 && high_reach <= 1.16 {
+        return result(Tool::Ellipse, corners);
+    }
     if fill >= 0.84 && edge_share >= 0.70 {
         return result(Tool::Rectangle, corners);
     }
-    if (0.62..=0.88).contains(&fill) && radial_error <= 0.20 {
-        return result(Tool::Ellipse, corners);
-    }
-    if fill >= 0.80 && edge_share >= 0.60 {
-        return result(Tool::Rectangle, corners);
-    }
+    // Neither clearly: leave the ink as drawn.
     None
 }
 
