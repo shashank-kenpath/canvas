@@ -44,19 +44,25 @@ pub struct Contact {
     pub eraser: bool,
     /// Android's normalised size (`getSize`, raw width / panel range) from an
     /// IR panel that reports real widths; 0 when unknown. Measured on the
-    /// Aaztec IR frame (raw units of 1/32767): finger ~15, pen tip ~35, pen
-    /// back nib ~70-190, palm 450-900.
+    /// Aaztec IR frame (raw units of 1/32767): pen tip ~15, pen back nib
+    /// ~35, palm 300-650 (it lands smaller and grows as it settles).
     pub norm: f64,
 }
 
-/// [`Contact::norm`] bands: above `NIB_NORM` is the pen's back nib (erases),
-/// above `PALM_NORM` a palm or fist (ignored).
-const NIB_NORM: f64 = 60.0 / 32767.0;
-const PALM_NORM: f64 = 300.0 / 32767.0;
+/// [`Contact::norm`] bands: up to `NIB_NORM` the pen tip, from there to
+/// `NIB_MAX` the pen's back nib (erases), from `PALM_NORM` a palm or fist
+/// (ignored). Between the nib and the palm is an ordinary touch (a finger).
+const NIB_NORM: f64 = 26.0 / 32767.0;
+const NIB_MAX: f64 = 60.0 / 32767.0;
+const PALM_NORM: f64 = 200.0 / 32767.0;
 
 impl Contact {
     fn nib(&self) -> bool {
-        self.eraser || (self.norm > NIB_NORM && self.norm < PALM_NORM)
+        self.eraser || (self.norm >= NIB_NORM && self.norm <= NIB_MAX)
+    }
+    /// The pen's tip or back nib, by width.
+    fn pen(&self) -> bool {
+        self.norm > 0.0 && self.norm <= NIB_MAX
     }
     fn big(&self) -> bool {
         self.norm >= PALM_NORM
@@ -243,6 +249,8 @@ pub struct Editor {
     stylus: Option<i32>,
     stylus_lifted: Option<u64>,
     primary_size: f64,
+    /// The primary contact is pen sized on an IR panel.
+    primary_pen: bool,
     /// Raw samples of the primary contact since it landed (bounded).
     trail: Vec<(Pt, u64)>,
     pair: Option<Pair>,
@@ -390,6 +398,7 @@ impl Editor {
             stylus: None,
             stylus_lifted: None,
             primary_size: 0.0,
+            primary_pen: false,
             trail: Vec::new(),
             pair: None,
             pending: Vec::new(),
@@ -975,6 +984,14 @@ impl Editor {
                 self.ignored.push(id);
                 return;
             }
+            // While the pen (tip or nib, known by width) is down, anything
+            // else near it is the hand or the frame seeing the pen twice.
+            // A second pen well away from it is another writer.
+            let near = self.pointers.iter().any(|(_, q)| q.dist(pos) < PALM_REACH);
+            if self.primary_pen && !self.pointers.is_empty() && !contact.stylus && (near || !contact.pen()) {
+                self.ignored.push(id);
+                return;
+            }
             // Most people rest the hand first and then write: what has been
             // lying still is that hand, and the new touch is the writer.
             if !contact.stylus {
@@ -1035,6 +1052,7 @@ impl Editor {
         self.pointers.push((id, pos));
         self.primary = Some(id);
         self.primary_size = contact.size / self.dpr;
+        self.primary_pen = contact.pen();
         self.down_stamp = time;
         self.travel = 0.0;
         self.trail.clear();

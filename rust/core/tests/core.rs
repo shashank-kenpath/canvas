@@ -1047,14 +1047,14 @@ fn ir(raw: f64) -> Contact {
 #[test]
 fn the_pens_back_nib_erases_on_an_ir_panel() {
     let mut e = editor();
-    e.pointer_down_with(0, p(100., 100.), 0, ir(35.));
-    e.pointer_move_with(0, p(300., 100.), 50, ir(35.));
+    e.pointer_down_with(0, p(100., 100.), 0, ir(15.));
+    e.pointer_move_with(0, p(300., 100.), 50, ir(15.));
     e.pointer_up(0, p(300., 100.), 60, false);
     assert_eq!(e.doc.shapes().len(), 1, "the tip writes");
-    // The nib lands edge first (tip sized) and widens a moment later.
-    e.pointer_down_with(1, p(200., 60.), 1000, ir(35.));
-    e.pointer_move_with(1, p(200., 80.), 1020, ir(120.));
-    e.pointer_move_with(1, p(200., 140.), 1040, ir(150.));
+    // The nib can land edge first (tip sized) and widen a moment later.
+    e.pointer_down_with(1, p(200., 60.), 1000, ir(15.));
+    e.pointer_move_with(1, p(200., 80.), 1020, ir(35.));
+    e.pointer_move_with(1, p(200., 140.), 1040, ir(35.));
     e.pointer_up(1, p(200., 140.), 1060, false);
     assert_eq!(e.doc.shapes().len(), 0, "the nib erased the stroke without drawing");
 }
@@ -1072,4 +1072,77 @@ fn a_wide_ir_contact_is_a_palm_even_after_it_moved() {
     e.pointer_move_with(1, p(200., 100.), 1050, ir(15.));
     e.pointer_up(1, p(200., 100.), 1060, false);
     assert_eq!(e.doc.shapes().len(), 1);
+}
+
+/// Replays a capture from the Aaztec IR frame (`down|move|up id x y ms raw`,
+/// logical pixels) and returns how many shapes it left.
+fn replay(name: &str, seed: Option<&str>) -> (usize, usize) {
+    let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    let mut e = Editor::new();
+    e.resize(1280, 720, 1.0);
+    e.set_grid(false);
+    e.set_auto_convert(false);
+    e.set_auto_text(false);
+    e.render();
+    if let Some(seed) = seed {
+        let rows: Vec<Vec<f64>> = std::fs::read_to_string(format!("{}/tests/fixtures/{seed}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+            .lines()
+            .map(|l| l.split_whitespace().skip(2).take(2).map(|v| v.parse().unwrap()).collect())
+            .collect();
+        // Ink under the whole path so the nib has something to erase.
+        for (i, r) in rows.iter().step_by(40).enumerate() {
+            let at = p(r[0], r[1]);
+            e.pointer_down_with(9000 + i as i32, at - p(20., 0.), 0, ir(15.));
+            e.pointer_move_with(9000 + i as i32, at + p(20., 0.), 30, ir(15.));
+            e.pointer_up(9000 + i as i32, at + p(20., 0.), 40, false);
+        }
+    }
+    let seeded = e.doc.shapes().len();
+    let base = 100_000;
+    for line in std::fs::read_to_string(path).unwrap().lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let id: i32 = f[1].parse().unwrap();
+        let at = p(f[2].parse().unwrap(), f[3].parse().unwrap());
+        let t = base + f[4].parse::<u64>().unwrap();
+        let c = ir(f[5].parse().unwrap());
+        match f[0] {
+            "down" => e.pointer_down_with(id, at, t, c),
+            "move" => e.pointer_move_with(id, at, t, c),
+            _ => {
+                e.pointer_up(id, at, t, false);
+            }
+        }
+    }
+    (seeded, e.doc.shapes().len())
+}
+
+#[test]
+fn a_recorded_palm_and_pen_leave_only_the_pen_strokes() {
+    // 12 pen-tip strokes (raw 15) written with the palm resting (raw 150-650).
+    assert_eq!(replay("ir_palm_and_pen.txt", None).1, 12);
+}
+
+#[test]
+fn a_recorded_back_nib_erases_and_never_draws() {
+    assert_eq!(replay("ir_back_nib.txt", None).1, 0);
+    let (seeded, left) = replay("ir_back_nib.txt", Some("ir_back_nib.txt"));
+    assert!(seeded > 20 && left * 2 < seeded, "the nib erased the ink under it: {left} of {seeded} left");
+}
+
+
+#[test]
+fn two_ir_pens_write_together_but_a_ghost_beside_one_does_not() {
+    let mut e = editor();
+    e.set_multi_ink(true);
+    e.pointer_down_with(0, p(100., 100.), 0, ir(15.));
+    e.pointer_move_with(0, p(140., 100.), 300, ir(15.));
+    e.pointer_down_with(1, p(700., 100.), 310, ir(15.)); // a second pen, far away
+    e.pointer_move_with(1, p(760., 100.), 400, ir(15.));
+    e.pointer_down_with(2, p(150., 130.), 410, ir(15.)); // beside the first pen
+    e.pointer_move_with(2, p(190., 130.), 420, ir(15.));
+    e.pointer_up(2, p(190., 130.), 430, false);
+    e.pointer_up(1, p(760., 100.), 440, false);
+    e.pointer_up(0, p(180., 100.), 450, false);
+    assert_eq!(e.doc.shapes().len(), 2);
 }
