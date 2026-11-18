@@ -49,20 +49,22 @@ pub struct Contact {
     pub norm: f64,
 }
 
-/// [`Contact::norm`] bands: up to `NIB_NORM` the pen tip, from there to
-/// `NIB_MAX` the pen's back nib (erases), from `PALM_NORM` a palm or fist
-/// (ignored). Between the nib and the palm is an ordinary touch (a finger).
+/// [`Contact::norm`] bands: below `NIB_NORM` the pen tip (the Aaztec frame
+/// reports 15), up to `NIB_MAX` a wide touch: the pen's back nib or a
+/// finger, which the frame reports alike (35, with the same minor axis and
+/// pressure), from `PALM_NORM` a palm or fist (ignored).
 const NIB_NORM: f64 = 26.0 / 32767.0;
 const NIB_MAX: f64 = 60.0 / 32767.0;
 const PALM_NORM: f64 = 200.0 / 32767.0;
 
 impl Contact {
-    fn nib(&self) -> bool {
-        self.eraser || (self.norm >= NIB_NORM && self.norm <= NIB_MAX)
+    /// Back nib or finger, by width.
+    fn wide(&self) -> bool {
+        self.norm >= NIB_NORM && self.norm <= NIB_MAX
     }
-    /// The pen's tip or back nib, by width.
-    fn pen(&self) -> bool {
-        self.norm > 0.0 && self.norm <= NIB_MAX
+    /// The pen tip, by width.
+    fn tip(&self) -> bool {
+        self.norm > 0.0 && self.norm < NIB_NORM
     }
     fn big(&self) -> bool {
         self.norm >= PALM_NORM
@@ -212,6 +214,8 @@ pub struct Editor {
     pen_priority: bool,
     /// Several fingers can write at once.
     multi_ink: bool,
+    /// A wide touch (pen back nib or finger) erases.
+    wide_erases: bool,
     /// How far ahead (milliseconds) the live stroke is drawn.
     predict_ms: f64,
     /// Filter touch jitter out of live ink.
@@ -371,6 +375,7 @@ impl Editor {
             palm_size: 52.0,
             pen_priority: false,
             multi_ink: false,
+            wide_erases: true,
             predict_ms: 0.0,
             smoothing: true,
             smooth: Smoother::default(),
@@ -681,6 +686,23 @@ impl Editor {
         self.multi_ink = on;
     }
 
+    /// Whether a wide touch on an IR panel (the pen's back nib, or a finger:
+    /// the frame cannot tell them apart) erases instead of drawing.
+    pub fn set_wide_erases(&mut self, on: bool) {
+        self.wide_erases = on;
+    }
+
+    /// The contact erases: a stylus eraser, or a wide touch when set to.
+    fn erases(&self, c: Contact) -> bool {
+        c.eraser || (self.wide_erases && c.wide())
+    }
+
+    /// The contact is the pen, by width: its tip, or its back nib when wide
+    /// touches erase.
+    fn pen_sized(&self, c: Contact) -> bool {
+        c.tip() || (self.wide_erases && c.wide())
+    }
+
     /// Draws the live stroke `ms` milliseconds ahead of the pen (0 = off).
     pub fn set_prediction(&mut self, ms: f64) {
         self.predict_ms = ms.clamp(0.0, 60.0);
@@ -988,7 +1010,7 @@ impl Editor {
             // else near it is the hand or the frame seeing the pen twice.
             // A second pen well away from it is another writer.
             let near = self.pointers.iter().any(|(_, q)| q.dist(pos) < PALM_REACH);
-            if self.primary_pen && !self.pointers.is_empty() && !contact.stylus && (near || !contact.pen()) {
+            if self.primary_pen && !self.pointers.is_empty() && !contact.stylus && (near || !self.pen_sized(contact)) {
                 self.ignored.push(id);
                 return;
             }
@@ -1008,7 +1030,7 @@ impl Editor {
         if self.palm_rejection && !contact.stylus && self.writer_hand(id, pos, time) {
             return;
         }
-        if self.multi_ink && self.mode == Mode::Draw && !fingers_pan && !contact.nib() && self.extras.len() < 9 {
+        if self.multi_ink && self.mode == Mode::Draw && !fingers_pan && !self.erases(contact) && self.extras.len() < 9 {
             // Another writer: start a stroke of its own.
             let w = self.world(pos);
             let shape_id = self.next_id();
@@ -1052,13 +1074,13 @@ impl Editor {
         self.pointers.push((id, pos));
         self.primary = Some(id);
         self.primary_size = contact.size / self.dpr;
-        self.primary_pen = contact.pen();
+        self.primary_pen = self.pen_sized(contact);
         self.down_stamp = time;
         self.travel = 0.0;
         self.trail.clear();
         self.trail.push((pos, time));
         let draws = !matches!(self.tool, Tool::Select | Tool::Hand);
-        self.tool_override = if contact.nib() && draws {
+        self.tool_override = if self.erases(contact) && draws {
             Some(Tool::Eraser)
         } else if fingers_pan && draws {
             Some(Tool::Hand)
@@ -1250,7 +1272,7 @@ impl Editor {
         }
         // The back nib touches edge first and only shows its width a moment
         // later: turn the young stroke into an erase along the same path.
-        if contact.nib() && self.mode == Mode::Draw && self.tool_override.is_none()
+        if self.erases(contact) && self.mode == Mode::Draw && self.tool_override.is_none()
             && time.saturating_sub(self.down_stamp) < 250
         {
             let mut trail = std::mem::take(&mut self.trail);

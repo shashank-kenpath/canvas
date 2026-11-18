@@ -325,6 +325,8 @@ struct Settings {
     pen_priority: bool,
     /// Several fingers can write at once.
     multi_ink: bool,
+    /// A wide touch (finger or the pen's back nib) erases.
+    wide_erase: bool,
     lang: String,
     /// Secret part of the Claude (MCP) address.
     mcp_key: String,
@@ -411,6 +413,7 @@ impl Settings {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             multi_ink: v.get("multiInk").and_then(Value::as_bool).unwrap_or(false),
+            wide_erase: v.get("wideErase").and_then(Value::as_bool).unwrap_or(true),
             lang: v
                 .get("lang")
                 .and_then(Value::as_str)
@@ -433,7 +436,7 @@ impl Settings {
             "tidy": self.tidy, "typed": self.typed, "palm": self.palm, "grid": self.grid,
             "snap": self.snap, "font": self.font, "fullRes": self.full_res, "lang": self.lang,
             "fastInk": self.fast_ink, "predict": self.predict, "penPriority": self.pen_priority,
-            "multiInk": self.multi_ink, "smooth": self.smooth, "dock": self.dock as u8,
+            "multiInk": self.multi_ink, "wideErase": self.wide_erase, "smooth": self.smooth, "dock": self.dock as u8,
             "mcpKey": self.mcp_key, "relayId": self.relay_id, "relaySecret": self.relay_secret,
             "relayUrl": self.relay_url,
         });
@@ -456,6 +459,7 @@ enum Opt {
     FastInk,
     PenPriority,
     MultiInk,
+    WideErase,
     Smooth,
 }
 
@@ -1323,6 +1327,7 @@ impl App {
         self.ed.set_palm_rejection(s.palm, None);
         self.ed.set_pen_priority(s.pen_priority);
         self.ed.set_multi_ink(s.multi_ink);
+        self.ed.set_wide_erases(s.wide_erase);
         self.ed
             .set_prediction(PREDICT_MS[s.predict.min(3) as usize]);
         self.ed.set_grid(s.grid);
@@ -2686,6 +2691,7 @@ impl App {
                 Opt::FastInk => s.fast_ink = !s.fast_ink,
                 Opt::PenPriority => s.pen_priority = !s.pen_priority,
                 Opt::MultiInk => s.multi_ink = !s.multi_ink,
+                Opt::WideErase => s.wide_erase = !s.wide_erase,
                 Opt::Smooth => s.smooth = !s.smooth,
             }),
             Act::FontPanel => self.panel(PanelKind::Fonts),
@@ -4462,6 +4468,12 @@ impl App {
             None,
             s.multi_ink,
             Act::Toggle(Opt::MultiInk),
+        );
+        left.toggle(
+            "Finger and pen back erase",
+            None,
+            s.wide_erase,
+            Act::Toggle(Opt::WideErase),
         );
 
         let mut right = PanelRows::new(width, self.unit());

@@ -1146,3 +1146,24 @@ fn two_ir_pens_write_together_but_a_ghost_beside_one_does_not() {
     e.pointer_up(0, p(180., 100.), 450, false);
     assert_eq!(e.doc.shapes().len(), 2);
 }
+
+#[test]
+fn with_wide_erase_off_a_finger_draws_and_two_fingers_pinch() {
+    let mut e = editor();
+    e.set_wide_erases(false);
+    e.pointer_down_with(0, p(100., 100.), 0, ir(35.));
+    e.pointer_move_with(0, p(300., 100.), 50, ir(35.));
+    e.pointer_up(0, p(300., 100.), 60, false);
+    assert_eq!(e.doc.shapes().len(), 1, "the finger writes");
+    let zoom = e.zoom();
+    e.pointer_down_with(1, p(400., 300.), 1000, ir(35.));
+    e.pointer_down_with(2, p(500., 300.), 1010, ir(35.));
+    for i in 1..=10u64 {
+        e.pointer_move_with(1, p(400. - i as f64 * 10., 300.), 1010 + i * 16, ir(35.));
+        e.pointer_move_with(2, p(500. + i as f64 * 10., 300.), 1010 + i * 16, ir(35.));
+    }
+    e.pointer_up(1, p(300., 300.), 1200, false);
+    e.pointer_up(2, p(600., 300.), 1200, false);
+    assert!(e.zoom() > zoom * 1.5, "two fingers zoom");
+    assert_eq!(e.doc.shapes().len(), 1);
+}
