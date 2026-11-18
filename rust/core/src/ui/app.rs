@@ -117,6 +117,9 @@ pub trait Platform: Send {
     fn copy_text(&mut self, _text: &str) {}
     /// Saves a PNG picture to the device's Pictures.
     fn save_png(&mut self, _name: &str, _png: &[u8]) {}
+    /// Lets the user choose board files to bring in. The host answers with
+    /// [`App::import_boards`].
+    fn pick_boards(&mut self) {}
     fn exit(&mut self) {}
 }
 
@@ -185,10 +188,18 @@ enum Job {
         title: String,
         updated: String,
     },
+    /// The text of board files to copy in.
+    Import(Vec<String>),
 }
 
 enum Done {
     Listed(Vec<BoardMeta>),
+    Imported {
+        added: usize,
+        skipped: usize,
+        failed: usize,
+        list: Vec<BoardMeta>,
+    },
     Thumb {
         id: String,
         updated: String,
@@ -258,6 +269,22 @@ fn disk_worker(
             Job::Rename { id, title, updated } => {
                 let _ = store::rename(&dir, &id, &title, &updated);
                 Done::Listed(store::list(&dir))
+            }
+            Job::Import(files) => {
+                let (mut added, mut skipped, mut failed) = (0, 0, 0);
+                for (i, source) in files.iter().enumerate() {
+                    match store::import(&dir, source, || format!("{}{i}", App::new_board_id())) {
+                        Ok(Some(_)) => added += 1,
+                        Ok(None) => skipped += 1,
+                        Err(_) => failed += 1,
+                    }
+                }
+                Done::Imported {
+                    added,
+                    skipped,
+                    failed,
+                    list: store::list(&dir),
+                }
             }
         };
         if done.send(out).is_err() {
@@ -419,6 +446,7 @@ enum Act {
     CardMenu(String),
     NewBoard,
     Display,
+    Import,
     Updates,
     Back,
     Menu,
@@ -1023,6 +1051,15 @@ impl App {
         self.show_toast(text);
     }
 
+    /// Board files the user picked after [`Platform::pick_boards`].
+    pub fn import_boards(&mut self, files: Vec<String>) {
+        if files.is_empty() {
+            return;
+        }
+        self.show_toast("Importing boards…");
+        self.send(Job::Import(files));
+    }
+
     pub fn is_board_open(&self) -> bool {
         self.screen == Screen::Board
     }
@@ -1178,6 +1215,25 @@ impl App {
                     self.boards = list;
                     self.listed = true;
                     self.clamp_scroll();
+                }
+                Done::Imported {
+                    added,
+                    skipped,
+                    failed,
+                    list,
+                } => {
+                    self.boards = list;
+                    self.listed = true;
+                    self.clamp_scroll();
+                    let plural = |n: usize| if n == 1 { "board" } else { "boards" };
+                    let mut text = format!("Imported {added} {}", plural(added));
+                    if skipped > 0 {
+                        text += &format!(", {skipped} already here");
+                    }
+                    if failed > 0 {
+                        text += &format!(", {failed} not readable");
+                    }
+                    self.show_toast(&text);
                 }
                 Done::Thumb {
                     id,
@@ -1769,6 +1825,12 @@ impl App {
             Act::Display => {
                 let r = self.node_rect(&Act::Display);
                 self.menu(MenuKind::Display, r, true);
+            }
+            Act::Import => {
+                if in_menu {
+                    self.dismiss();
+                }
+                self.platform.pick_boards();
             }
             Act::Updates => {
                 if self.update.is_some() {
@@ -2621,6 +2683,8 @@ impl App {
                 {
                     v.push(item(name, Some(s.predict as usize == i), Act::Predict(i as u8)));
                 }
+                v.push(Entry::Rule);
+                v.push(item("Import boards…", None, Act::Import));
                 v
             }
             MenuKind::Card(id) => vec![

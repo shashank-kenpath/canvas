@@ -144,3 +144,73 @@ pub fn list_json(dir: &Path) -> String {
     )
     .to_string()
 }
+
+/// Copies a board file from another app (or another device) into `dir`.
+/// Sharing state is dropped, since it belongs to the original copy. A board
+/// already here with the same id and timestamp is skipped; one with the same
+/// id but other content gets `fresh_id()` so nothing is overwritten.
+/// Returns the board's title, or `None` when it was already here.
+pub fn import(dir: &Path, source: &str, fresh_id: impl Fn() -> String) -> Result<Option<String>, String> {
+    let board = parse(source)?;
+    let mut extra = board.extra;
+    for key in ["share", "synced", "lanShare"] {
+        extra.remove(key);
+    }
+    let mut id = board.id;
+    if valid_id(&id) {
+        if let Ok(existing) = load(dir, &id) {
+            if existing.updated == board.updated && existing.shapes.len() == board.shapes.len() {
+                return Ok(None);
+            }
+            id = fresh_id();
+        }
+    } else {
+        id = fresh_id();
+    }
+    let title = if board.title.trim().is_empty() { "Imported board".to_string() } else { board.title };
+    let shapes: Vec<Arc<Shape>> = board.shapes.into_iter().map(Arc::new).collect();
+    save_atomic(dir, &id, &encode(&id, &title, &board.updated, &shapes, &extra))?;
+    Ok(Some(title))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("inkboard-store-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    const BOARD: &str = r#"{"version":1,"id":"1794833531605072","title":"convv","updated":"2026-11-17T17:41:31.249460","shapes":[],"share":{"id":"x"},"synced":"2026"}"#;
+
+    #[test]
+    fn import_keeps_id_and_drops_sharing() {
+        let dir = temp_dir("keep");
+        assert_eq!(import(&dir, BOARD, || "fresh".into()).unwrap().as_deref(), Some("convv"));
+        let board = load(&dir, "1794833531605072").unwrap();
+        assert_eq!(board.title, "convv");
+        assert_eq!(board.updated, "2026-11-17T17:41:31.249460");
+        assert!(board.extra.get("share").is_none() && board.extra.get("synced").is_none());
+        // The same file again is skipped rather than duplicated.
+        assert_eq!(import(&dir, BOARD, || "fresh".into()).unwrap(), None);
+        assert_eq!(list(&dir).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_never_overwrites_a_different_board() {
+        let dir = temp_dir("clash");
+        import(&dir, BOARD, || "fresh".into()).unwrap();
+        let newer = BOARD.replace("2026-11-17T17:41:31", "2026-11-18T09:00:00");
+        import(&dir, &newer, || "fresh".into()).unwrap();
+        assert_eq!(list(&dir).len(), 2);
+        assert_eq!(load(&dir, "fresh").unwrap().updated, "2026-11-18T09:00:00.249460");
+        let bad = BOARD.replace("1794833531605072", "../evil");
+        import(&dir, &bad, || "other".into()).unwrap();
+        assert!(load(&dir, "other").is_ok());
+        assert!(import(&dir, "{\"nope\":1}", || "x".into()).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

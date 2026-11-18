@@ -127,6 +127,10 @@ impl Platform for AndroidUi {
                 });
         }
     }
+    fn pick_boards(&mut self) {
+        self.call("pickBoards", "()V", &[]);
+    }
+
     fn exit(&mut self) {
         self.call("finishApp", "()V", &[]);
     }
@@ -141,6 +145,7 @@ enum Event {
     Ink(u32, String),
     Update(Option<(String, String)>, bool, bool),
     Toast(String),
+    Import(Vec<String>),
     Pause(SyncSender<()>),
     Wake,
     Quit,
@@ -210,6 +215,7 @@ fn drive(mut app: App, rx: Receiver<Event>) {
                     app.update_result(release, failed, manual)
                 }
                 Event::Toast(text) => app.toast(&text),
+                Event::Import(files) => app.import_boards(files),
                 Event::Pause(ack) => app.pause(ack),
                 Event::Wake => {}
                 Event::Quit => quit = true,
@@ -431,6 +437,18 @@ pub extern "system" fn Java_com_canvasstudio_rust_RustApp_toast(
 ) {
     let t = string(&mut e, &t);
     send(h, Event::Toast(t));
+}
+/// `files` is a JSON array holding the text of each picked board file.
+#[no_mangle]
+pub extern "system" fn Java_com_canvasstudio_rust_RustApp_importBoards(
+    mut e: JNIEnv,
+    _: JClass,
+    h: jlong,
+    files: JString,
+) {
+    let files = string(&mut e, &files);
+    let files: Vec<String> = serde_json::from_str(&files).unwrap_or_default();
+    send(h, Event::Import(files));
 }
 #[no_mangle]
 pub extern "system" fn Java_com_canvasstudio_rust_RustApp_pause(_: JNIEnv, _: JClass, h: jlong) {

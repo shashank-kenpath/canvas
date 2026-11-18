@@ -229,4 +229,53 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }.start()
     }
     private fun notifyRust(message: String) { val h = handle; if (h != 0L) RustApp.toast(h, message) }
+
+    /** Opens the system file picker for board files (for example ones copied from Canvas Studio). */
+    fun pickBoards() {
+        onMain {
+            val pick = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+                putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("application/json", "text/plain", "application/octet-stream"))
+                putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            }
+            try {
+                @Suppress("DEPRECATION")
+                startActivityForResult(pick, PICK_BOARDS)
+            } catch (e: Exception) {
+                notifyRust("No file picker on this device")
+            }
+        }
+    }
+
+    @Deprecated("Platform API")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != PICK_BOARDS || resultCode != RESULT_OK || data == null) return
+        val uris = ArrayList<android.net.Uri>()
+        data.clipData?.let { clip -> for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri) }
+        if (uris.isEmpty()) data.data?.let { uris.add(it) }
+        if (uris.isEmpty()) return
+        Thread {
+            val files = org.json.JSONArray()
+            for (uri in uris) {
+                try {
+                    contentResolver.openInputStream(uri)?.use { input ->
+                        val bytes = input.readBytes()
+                        files.put(if (bytes.size <= MAX_BOARD_BYTES) String(bytes, Charsets.UTF_8) else "")
+                    }
+                } catch (e: Exception) {
+                    files.put("")
+                }
+            }
+            val text = files.toString()
+            main.post { val h = handle; if (h != 0L) RustApp.importBoards(h, text) }
+        }.start()
+    }
+
+    private companion object {
+        const val PICK_BOARDS = 41
+        const val MAX_BOARD_BYTES = 32 * 1024 * 1024
+    }
 }

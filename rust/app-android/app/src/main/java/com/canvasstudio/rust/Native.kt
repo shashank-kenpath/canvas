@@ -27,6 +27,8 @@ object RustApp {
     @JvmStatic external fun inkResult(handle: Long, token: Int, text: String)
     @JvmStatic external fun updateResult(handle: Long, version: String, url: String, failed: Boolean, manual: Boolean)
     @JvmStatic external fun toast(handle: Long, text: String)
+    /** [files] is a JSON array with the text of each picked board file. */
+    @JvmStatic external fun importBoards(handle: Long, files: String)
     @JvmStatic external fun pause(handle: Long)
 }
 /** Measures and draws text for the engine, which calls in from its render thread. */
