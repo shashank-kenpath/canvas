@@ -22,10 +22,10 @@ fi
 version=$(grep '^version' web/Cargo.toml | head -1 | cut -d'"' -f2)
 cp web/www/index.html "$out/index.html"
 sed "s/__VERSION__/$version/" web/www/main.js > "$out/main.js"
-cp "$repo/branding/logo.svg" "$out/icon.svg"
+cp "$repo/branding/mark.svg" "$out/icon.svg"
 cp app-android/app/src/main/assets/fonts/*.ttf "$out/fonts/"
 cat > "$out/manifest.webmanifest" <<JSON
 { "name": "Inkboard", "short_name": "Inkboard", "start_url": "/app/", "scope": "/app/", "display": "standalone",
-  "background_color": "#f7f6fb", "theme_color": "#6750d8", "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }] }
+  "background_color": "#f7f6fb", "theme_color": "#2748e8", "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }] }
 JSON
 du -sh "$out" "$out/inkboard_web_bg.wasm"
