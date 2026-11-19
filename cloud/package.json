@@ -4,11 +4,12 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "(wrangler deploy || (sleep 10 && wrangler deploy)) && wrangler d1 migrations apply DB --remote",
+    "deploy": "npm run build:web && (wrangler deploy || (sleep 10 && wrangler deploy)) && wrangler d1 migrations apply DB --remote",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
-    "db:migrate": "wrangler d1 migrations apply DB --remote"
+    "db:migrate": "wrangler d1 migrations apply DB --remote",
+    "build:web": "if command -v cargo >/dev/null && [ -f ../rust/web/build.sh ]; then bash ../rust/web/build.sh; else echo 'Skipping the web app: needs the Rust repo and toolchain (rust/web/build.sh)'; fi"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.4",

@@ -15,6 +15,7 @@ pub mod recognize;
 pub mod render;
 pub mod shape;
 pub mod store;
+pub mod sys;
 pub mod table;
 pub mod text;
 pub mod ui;

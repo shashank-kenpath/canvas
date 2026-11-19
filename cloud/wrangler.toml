@@ -8,6 +8,13 @@ compatibility_date = "2026-11-01"
 routes = [{ pattern = "whiteboard.kenpathlabs.com", custom_domain = true }]
 workers_dev = true
 
+# The web app (rust/web/build.sh writes public/app), served at /app.
+# Everything else goes to the Worker.
+[assets]
+directory = "./public"
+html_handling = "auto-trailing-slash"
+not_found_handling = "none"
+
 [vars]
 # Comma-separated Google Workspace domains allowed to sign in, e.g. "example.com".
 # Sign-in is refused while this is empty.

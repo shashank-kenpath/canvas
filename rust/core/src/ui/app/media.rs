@@ -50,18 +50,13 @@ impl App {
         let prefix = self.ed.next_id();
         let done = self.file_done.clone();
         let wake = self.wake.clone();
-        let worker = std::thread::Builder::new().name("file-import".into()).spawn(move || {
+        self.show_toast("Importing file…");
+        crate::sys::spawn("file-import", move || {
             let result = import::parse(file, &prefix, current_page);
             if done.send(Done::File(token, result)).is_ok() {
                 wake();
             }
         });
-        if worker.is_ok() {
-            self.show_toast("Importing file…");
-        } else {
-            self.pending_file = None;
-            self.error_toast("Could not start file import");
-        }
     }
 
     pub(super) fn apply_file(&mut self, token: i32, result: Result<Imported, String>) {

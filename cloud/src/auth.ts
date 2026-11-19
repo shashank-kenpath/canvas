@@ -172,9 +172,19 @@ export async function createSession(env: Env, userId: string, device: string): P
 }
 
 /** The signed-in user for a request, from `Authorization: Bearer <token>`. */
+/**
+ * Browsers cannot send headers with a WebSocket, so the web app offers the
+ * subprotocols `inkboard` and `bearer.<token>`; the room answers `inkboard`.
+ */
+function socketToken(req: Request): string {
+  if (req.headers.get("upgrade") !== "websocket") return "";
+  const offered = (req.headers.get("sec-websocket-protocol") ?? "").split(",").map((p) => p.trim());
+  return offered.find((p) => p.startsWith("bearer."))?.slice(7) ?? "";
+}
+
 export async function authenticate(env: Env, req: Request): Promise<User & { tokenHash: string }> {
   const header = req.headers.get("authorization") ?? "";
-  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : socketToken(req);
   if (!token) throw new HttpError(401, "Sign in first", "signed_out");
   const tokenHash = await sha256Hex(token);
   const row = await env.DB.prepare(

@@ -252,6 +252,7 @@ dependencies = [
  "ab_glyph",
  "base64",
  "image",
+ "js-sys",
  "qrcode",
  "quick-xml 0.38.4",
  "resvg",
@@ -260,6 +261,9 @@ dependencies = [
  "sha2",
  "tiny-skia",
  "tungstenite",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "webpki-roots 0.26.11",
  "zip",
 ]
@@ -977,6 +981,17 @@ dependencies = [
  "serde_json",
  "softbuffer",
  "winit",
+]
+
+[[package]]
+name = "inkboard_web"
+version = "0.9.0"
+dependencies = [
+ "canvas_core",
+ "cosmic-text",
+ "js-sys",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

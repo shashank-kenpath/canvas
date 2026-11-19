@@ -8,6 +8,7 @@ The collaboration backend for Inkboard team boards, entirely on Cloudflare:
 | Durable Object `BoardRoom` (`src/room.ts`), one per board | The board's shapes in SQLite, live edits, cursors and presence |
 | D1 `inkboard-db` (`migrations/`) | Accounts, sessions, boards, members |
 | R2 `inkboard-assets` | Board images, named by SHA-256 |
+| Static assets (`public/`) | The web app at `/app` (built by `rust/web/build.sh`), and the website at `/` (`src/site.ts`) |
 
 Every device keeps its own copy of a board. A room gives each change the next revision number, stores it and sends it to everyone else; the last change to a shape wins. Presence (cursor, selection, page, tool, view) is relayed but never stored. Each stored shape remembers who created it and who changed it last.
 

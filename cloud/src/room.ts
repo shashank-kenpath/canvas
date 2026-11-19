@@ -107,7 +107,10 @@ export class BoardRoom extends DurableObject<Env> {
         "INSERT INTO people (id, name, color) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color",
         user.id, user.name, user.color,
       );
-      return new Response(null, { status: 101, webSocket: client });
+      // The web app sends its token as a subprotocol and needs one picked.
+      const offered = (req.headers.get("sec-websocket-protocol") ?? "").split(",").map((p) => p.trim());
+      const headers = offered.includes("inkboard") ? { "sec-websocket-protocol": "inkboard" } : undefined;
+      return new Response(null, { status: 101, webSocket: client, headers });
     }
     if (url.pathname === "/internal/revalidate" && req.method === "POST") {
       const { emails, all, code } = (await req.json()) as { emails?: string[]; all?: boolean; code?: number };

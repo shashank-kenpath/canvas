@@ -99,7 +99,7 @@ pub(super) fn ago(then_ms: i64) -> String {
 }
 
 fn device_name() -> String {
-    format!("Inkboard on {}", std::env::consts::OS)
+    if cfg!(target_arch = "wasm32") { "Inkboard on the web".into() } else { format!("Inkboard on {}", std::env::consts::OS) }
 }
 
 impl App {
@@ -122,7 +122,7 @@ impl App {
 
     fn sign_out(&mut self) {
         if let Some(a) = self.settings.account.clone() {
-            std::thread::spawn(move || cloud::sign_out(&a));
+            cloud::run(async move { cloud::sign_out(&a).await });
         }
         self.forget_account();
         self.dismiss();
@@ -138,15 +138,15 @@ impl App {
 
     pub(super) fn refresh_team(&mut self) {
         let Some(a) = self.account().cloned() else { return };
-        cloud::spawn(&self.cloud_tx, &self.wake, move || Reply::Boards(cloud::list_boards(&a)));
+        cloud::spawn(&self.cloud_tx, &self.wake, async move { Reply::Boards(cloud::list_boards(&a).await) });
     }
 
-    fn request(&mut self, job: impl FnOnce(&Account) -> Reply + Send + 'static) {
+    fn request<F: std::future::Future<Output = Reply> + cloud::MaybeSend + 'static>(&mut self, job: impl FnOnce(Account) -> F) {
         let Some(a) = self.account().cloned() else {
             self.start_sign_in();
             return;
         };
-        cloud::spawn(&self.cloud_tx, &self.wake, move || job(&a));
+        cloud::spawn(&self.cloud_tx, &self.wake, job(a));
     }
 
     fn api_error(&mut self, e: &cloud::http::ApiError) {
@@ -833,6 +833,9 @@ impl App {
                 content.y += 8.0;
                 content.qr(url);
                 content.copy_code(url);
+                if cfg!(target_arch = "wasm32") {
+                    content.push(72.0, Look::Button { icon: None, text: "Open the sign-in page".into(), kind: ButtonKind::Primary, pill: false, level: 0 }, Some(Act::OpenUrl(url.clone())));
+                }
                 content.status("Waiting for you to approve…", true);
             }
         }
@@ -910,7 +913,7 @@ impl App {
     pub(super) fn share_panel(&mut self) {
         if let Some(live) = &self.live {
             let id = live.cloud_id.clone();
-            self.request(move |a| Reply::Members(id.clone(), cloud::members(a, &id)));
+            self.request(move |a| async move { Reply::Members(id.clone(), cloud::members(&a, &id).await) });
         }
         self.panel(PanelKind::Share);
     }
@@ -965,7 +968,7 @@ impl App {
                 self.dismiss();
                 self.copying = Some(id);
                 self.show_toast("Copying to Team boards…");
-                self.request(move |a| Reply::Created(cloud::create_board(a, &title)));
+                self.request(move |a| async move { Reply::Created(cloud::create_board(&a, &title).await) });
             }
             Act::AddPerson => self.ask("Invite someone", "", "name@company.com", false, AskFor::AddPerson),
             Act::MemberMenu(email) => self.menu(MenuKind::Member(email.clone()), act),
@@ -986,7 +989,7 @@ impl App {
             Act::OrgAccess(level) => {
                 let Some(id) = self.live.as_ref().map(|l| l.cloud_id.clone()) else { return true };
                 let level = level.to_string();
-                self.request(move |a| Reply::Board(id.clone(), cloud::update_board(a, &id, json!({ "orgAccess": level }))));
+                self.request(move |a| async move { Reply::Board(id.clone(), cloud::update_board(&a, &id, json!({ "orgAccess": level })).await) });
             }
             _ => return false,
         }
@@ -995,24 +998,24 @@ impl App {
 
     pub(super) fn invite(&mut self, email: String, role: Role) {
         let Some(id) = self.live.as_ref().map(|l| l.cloud_id.clone()) else { return };
-        self.request(move |a| Reply::Members(id.clone(), cloud::add_member(a, &id, &email, role)));
+        self.request(move |a| async move { Reply::Members(id.clone(), cloud::add_member(&a, &id, &email, role).await) });
     }
 
     pub(super) fn remove_member(&mut self, email: String) {
         let Some(id) = self.live.as_ref().map(|l| l.cloud_id.clone()) else { return };
-        self.request(move |a| Reply::Members(id.clone(), cloud::remove_member(a, &id, &email)));
+        self.request(move |a| async move { Reply::Members(id.clone(), cloud::remove_member(&a, &id, &email).await) });
     }
 
     pub(super) fn create_team_board(&mut self, title: String) {
-        self.request(move |a| Reply::Created(cloud::create_board(a, &title)));
+        self.request(move |a| async move { Reply::Created(cloud::create_board(&a, &title).await) });
     }
 
     pub(super) fn rename_team(&mut self, id: String, title: String) {
-        self.request(move |a| Reply::Board(id.clone(), cloud::update_board(a, &id, json!({ "title": title }))));
+        self.request(move |a| async move { Reply::Board(id.clone(), cloud::update_board(&a, &id, json!({ "title": title })).await) });
     }
 
     pub(super) fn delete_team(&mut self, id: String) {
-        self.request(move |a| Reply::Deleted(id.clone(), cloud::delete_board(a, &id)));
+        self.request(move |a| async move { Reply::Deleted(id.clone(), cloud::delete_board(&a, &id).await) });
     }
 
     /// A team board renamed from inside it goes to the server too.
@@ -1146,7 +1149,7 @@ mod tests {
     fn signed_in(server: &str, token: &str) -> (App, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("inkboard-team-{}-{}", std::process::id(), random_token(8)));
         let mut app = App::new(Box::new(NoHost), dir.join("boards"), dir.join("settings.json"), "0.9.0".into(), 0, Arc::new(|| {}));
-        let me = cloud::User::from_json(&cloud::http::api(server, "GET", "/api/me", Some(token), None).unwrap()).unwrap();
+        let me = cloud::User::from_json(&cloud::http::api_blocking(server, "GET", "/api/me", Some(token), None).unwrap()).unwrap();
         app.settings.server = server.to_string();
         app.settings.account = Some(Account { server: server.to_string(), token: token.to_string(), user: me });
         app.resize(1280, 800, 1.5);
@@ -1224,7 +1227,7 @@ mod tests {
         let cloud_id = ana.live.as_ref().unwrap().cloud_id.clone();
         assert_eq!(ana.live.as_ref().unwrap().role, Role::Owner);
         let account = ana.account().unwrap().clone();
-        cloud::add_member(&account, &cloud_id, &ben.me().unwrap().email, Role::Editor).unwrap();
+        cloud::block_on(cloud::add_member(&account, &cloud_id, &ben.me().unwrap().email, Role::Editor)).unwrap();
 
         ben.run(Act::Tab(true));
         pump(&mut [&mut ben], &mut t, |a| a[0].team_boards.iter().any(|b| b.id == cloud_id));
@@ -1286,7 +1289,7 @@ mod tests {
         pump(&mut [&mut ana], &mut t, |a| a[0].board.is_none() && a[0].team_listed);
         ana.frame(t + 20);
         snapshot(&ana, "ana-library");
-        cloud::delete_board(&account, &cloud_id).unwrap();
+        cloud::block_on(cloud::delete_board(&account, &cloud_id)).unwrap();
         let _ = std::fs::remove_dir_all(dir_a);
         let _ = std::fs::remove_dir_all(dir_b);
     }

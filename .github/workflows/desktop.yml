@@ -1,4 +1,4 @@
-# Builds Inkboard for macOS (universal), Windows, Linux and Android.
+# Builds Inkboard for macOS (universal), Windows, Linux, Android and the web.
 # Every run keeps the files as workflow artifacts. On main, when the version
 # in rust/desktop/Cargo.toml has no release yet, it publishes GitHub release
 # v<version> with stable file names, which whiteboard.kenpathlabs.com links to
@@ -98,6 +98,20 @@ jobs:
       - run: tar -C target/release -czf Inkboard-Linux-x64.tar.gz inkboard
       - uses: actions/upload-artifact@v4
         with: { name: Inkboard-Linux, path: rust/Inkboard-Linux-x64.tar.gz }
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: rust }
+      - name: wasm-bindgen CLI
+        run: cargo install wasm-bindgen-cli --locked --version "$(grep -A1 '^name = "wasm-bindgen"$' rust/Cargo.lock | grep version | cut -d'"' -f2)"
+      - run: bash rust/web/build.sh
+      - uses: actions/upload-artifact@v4
+        with: { name: Inkboard-Web, path: cloud/public/app }
 
   android:
     runs-on: ubuntu-24.04

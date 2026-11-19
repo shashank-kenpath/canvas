@@ -4,6 +4,10 @@
 
 pub mod http;
 pub mod replica;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod room;
+#[cfg(target_arch = "wasm32")]
+#[path = "room_web.rs"]
 pub mod room;
 
 use crate::import::ImageAsset;
@@ -13,8 +17,8 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// The server built into release builds. Settings can point elsewhere.
 pub const DEFAULT_SERVER: &str = "https://whiteboard.kenpathlabs.com";
@@ -178,11 +182,62 @@ pub enum SignInStep {
     Failed(String),
 }
 
-/// Runs a request on a short-lived thread and posts the result.
-pub fn spawn(tx: &Sender<Reply>, wake: &Arc<dyn Fn() + Send + Sync>, job: impl FnOnce() -> Reply + Send + 'static) {
+/// `Send` where requests run on their own threads; anything in a browser,
+/// where they run on the page's event loop.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send> MaybeSend for T {}
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSend for T {}
+
+/// Runs `work` in the background: on a short-lived thread, or on the page's
+/// event loop in a browser.
+pub fn run(work: impl Future<Output = ()> + MaybeSend + 'static) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = std::thread::Builder::new().name("cloud-request".into()).spawn(move || block_on(work));
+    }
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(work);
+}
+
+/// Native requests block inside their future, so a future here is only ever
+/// waiting on [`sleep`], which also blocks; polling until ready is enough.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn block_on<F: Future>(work: F) -> F::Output {
+    let mut work = std::pin::pin!(work);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(out) = work.as_mut().poll(&mut cx) {
+            return out;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Waits `ms` milliseconds.
+pub async fn sleep(ms: u32) {
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+    #[cfg(target_arch = "wasm32")]
+    {
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            if let Some(w) = web_sys::window() {
+                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms as i32);
+            }
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+}
+
+/// Runs a request in the background and posts the result.
+pub fn spawn(tx: &Sender<Reply>, wake: &Arc<dyn Fn() + Send + Sync>, job: impl Future<Output = Reply> + MaybeSend + 'static) {
     let (tx, wake) = (tx.clone(), wake.clone());
-    let _ = std::thread::Builder::new().name("cloud-request".into()).spawn(move || {
-        let reply = job();
+    run(async move {
+        let reply = job.await;
         if tx.send(reply).is_ok() {
             wake();
         }
@@ -192,12 +247,12 @@ pub fn spawn(tx: &Sender<Reply>, wake: &Arc<dyn Fn() + Send + Sync>, job: impl F
 /// Starts Google sign-in. Steps arrive as [`Reply::SignIn`] until done,
 /// failed, or `cancel` is set.
 pub fn sign_in(server: String, device: String, cancel: Arc<AtomicBool>, tx: Sender<Reply>, wake: Arc<dyn Fn() + Send + Sync>) {
-    let _ = std::thread::Builder::new().name("sign-in".into()).spawn(move || {
+    run(async move {
         let send = |step: SignInStep| {
             let _ = tx.send(Reply::SignIn(step));
             wake();
         };
-        let start = match api(&server, "POST", "/api/auth/device", None, Some(&json!({ "device": device }))) {
+        let start = match api(&server, "POST", "/api/auth/device", None, Some(&json!({ "device": device }))).await {
             Ok(v) => v,
             Err(e) => return send(SignInStep::Failed(e.message)),
         };
@@ -207,16 +262,16 @@ pub fn sign_in(server: String, device: String, cancel: Arc<AtomicBool>, tx: Send
             url: start["verificationUrl"].as_str().unwrap_or("https://www.google.com/device").to_string(),
         });
         let mut interval = start["interval"].as_u64().unwrap_or(5).max(2);
-        let deadline = std::time::Instant::now() + Duration::from_secs(start["expiresIn"].as_u64().unwrap_or(1800));
+        let deadline = crate::sys::now_ms() + 1000 * start["expiresIn"].as_i64().unwrap_or(1800);
         let mut failures = 0;
-        while std::time::Instant::now() < deadline {
+        while crate::sys::now_ms() < deadline {
             for _ in 0..interval * 10 {
                 if cancel.load(Ordering::SeqCst) {
                     return;
                 }
-                std::thread::sleep(Duration::from_millis(100));
+                sleep(100).await;
             }
-            match api(&server, "POST", "/api/auth/device/poll", None, Some(&json!({ "handle": handle }))) {
+            match api(&server, "POST", "/api/auth/device/poll", None, Some(&json!({ "handle": handle }))).await {
                 Ok(v) if v["token"].is_string() => {
                     let user = User::from_json(&v["user"]).unwrap_or_default();
                     let token = v["token"].as_str().unwrap_or_default().to_string();
@@ -231,41 +286,42 @@ pub fn sign_in(server: String, device: String, cancel: Arc<AtomicBool>, tx: Send
     });
 }
 
-pub fn list_boards(a: &Account) -> Result<Vec<CloudBoard>, ApiError> {
-    let v = api(&a.server, "GET", "/api/boards", Some(&a.token), None)?;
+pub async fn list_boards(a: &Account) -> Result<Vec<CloudBoard>, ApiError> {
+    let v = api(&a.server, "GET", "/api/boards", Some(&a.token), None).await?;
     Ok(v["boards"].as_array().into_iter().flatten().filter_map(CloudBoard::from_json).collect())
 }
 
-pub fn create_board(a: &Account, title: &str) -> Result<CloudBoard, ApiError> {
-    let v = api(&a.server, "POST", "/api/boards", Some(&a.token), Some(&json!({ "title": title })))?;
+pub async fn create_board(a: &Account, title: &str) -> Result<CloudBoard, ApiError> {
+    let v = api(&a.server, "POST", "/api/boards", Some(&a.token), Some(&json!({ "title": title }))).await?;
     CloudBoard::from_json(&v).ok_or_else(|| ApiError::offline("Bad response"))
 }
 
-pub fn update_board(a: &Account, id: &str, change: Value) -> Result<CloudBoard, ApiError> {
-    let v = api(&a.server, "PATCH", &format!("/api/boards/{id}"), Some(&a.token), Some(&change))?;
+pub async fn update_board(a: &Account, id: &str, change: Value) -> Result<CloudBoard, ApiError> {
+    let v = api(&a.server, "PATCH", &format!("/api/boards/{id}"), Some(&a.token), Some(&change)).await?;
     CloudBoard::from_json(&v).ok_or_else(|| ApiError::offline("Bad response"))
 }
 
-pub fn delete_board(a: &Account, id: &str) -> Result<(), ApiError> {
-    api(&a.server, "DELETE", &format!("/api/boards/{id}"), Some(&a.token), None).map(|_| ())
+pub async fn delete_board(a: &Account, id: &str) -> Result<(), ApiError> {
+    api(&a.server, "DELETE", &format!("/api/boards/{id}"), Some(&a.token), None).await.map(|_| ())
 }
 
-pub fn members(a: &Account, id: &str) -> Result<Members, ApiError> {
-    api(&a.server, "GET", &format!("/api/boards/{id}/members"), Some(&a.token), None).map(|v| Members::from_json(&v))
+pub async fn members(a: &Account, id: &str) -> Result<Members, ApiError> {
+    api(&a.server, "GET", &format!("/api/boards/{id}/members"), Some(&a.token), None).await.map(|v| Members::from_json(&v))
 }
 
-pub fn add_member(a: &Account, id: &str, email: &str, role: Role) -> Result<Members, ApiError> {
+pub async fn add_member(a: &Account, id: &str, email: &str, role: Role) -> Result<Members, ApiError> {
     api(&a.server, "PUT", &format!("/api/boards/{id}/members"), Some(&a.token), Some(&json!({ "email": email, "role": role.name() })))
+        .await
         .map(|v| Members::from_json(&v))
 }
 
-pub fn remove_member(a: &Account, id: &str, email: &str) -> Result<Members, ApiError> {
+pub async fn remove_member(a: &Account, id: &str, email: &str) -> Result<Members, ApiError> {
     let email: String = email.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
-    api(&a.server, "DELETE", &format!("/api/boards/{id}/members/{email}"), Some(&a.token), None).map(|v| Members::from_json(&v))
+    api(&a.server, "DELETE", &format!("/api/boards/{id}/members/{email}"), Some(&a.token), None).await.map(|v| Members::from_json(&v))
 }
 
-pub fn sign_out(a: &Account) {
-    let _ = api(&a.server, "POST", "/api/auth/logout", Some(&a.token), None);
+pub async fn sign_out(a: &Account) {
+    let _ = api(&a.server, "POST", "/api/auth/logout", Some(&a.token), None).await;
 }
 
 // ------------------------------------------------------------- records

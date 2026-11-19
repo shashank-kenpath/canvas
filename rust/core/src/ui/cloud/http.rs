@@ -1,14 +1,23 @@
-//! HTTPS requests to the Inkboard server, with the session token.
+//! HTTPS requests to the Inkboard server, with the session token. Desktop
+//! and Android speak HTTP over their own TLS sockets (blocking, on worker
+//! threads); in a browser the page's `fetch` does the work.
 
 use serde_json::Value;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{Read, Write};
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Arc;
 
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_RESPONSE: usize = 40 << 20;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) trait Stream: Read + Write + Send {}
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: Read + Write + Send> Stream for T {}
 
 /// A failed request: the HTTP status (0 when the server was not reached),
@@ -30,6 +39,7 @@ impl ApiError {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
     CONFIG
@@ -84,6 +94,7 @@ impl Origin {
     }
 
     /// Opens a connection. The second value is a handle for changing timeouts.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn connect(&self, timeout: Duration) -> Result<(Box<dyn Stream>, TcpStream), String> {
         let addrs: Vec<SocketAddr> = (self.host.as_str(), self.port)
             .to_socket_addrs()
@@ -111,11 +122,13 @@ impl Origin {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Decodes a chunked body; `None` while incomplete.
+#[cfg(not(target_arch = "wasm32"))]
 fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     loop {
@@ -135,6 +148,7 @@ fn dechunk(mut data: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// One request. `body` is (content type, bytes).
+#[cfg(not(target_arch = "wasm32"))]
 pub fn call(
     base: &str,
     method: &str,
@@ -198,18 +212,9 @@ pub fn call(
     Ok((status, buf[end + 4..].to_vec()))
 }
 
-/// A JSON request; errors carry the server's message.
-pub fn api(base: &str, method: &str, path: &str, token: Option<&str>, body: Option<&Value>) -> Result<Value, ApiError> {
-    let text = body.map(|b| b.to_string());
-    let (status, bytes) = call(
-        base,
-        method,
-        path,
-        token,
-        text.as_ref().map(|t| ("application/json", t.as_bytes())),
-        Duration::from_secs(15),
-    )?;
-    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+/// Turns a response into the JSON value, or an error carrying the server's message.
+fn json_result(status: u16, bytes: &[u8]) -> Result<Value, ApiError> {
+    let value: Value = serde_json::from_slice(bytes).unwrap_or(Value::Null);
     if (200..300).contains(&status) {
         return Ok(value);
     }
@@ -218,6 +223,54 @@ pub fn api(base: &str, method: &str, path: &str, token: Option<&str>, body: Opti
         message: value["error"].as_str().map(str::to_string).unwrap_or_else(|| format!("The server answered {status}")),
         code: value["code"].as_str().unwrap_or("error").to_string(),
     })
+}
+
+/// A JSON request, blocking until the answer arrives.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn api_blocking(base: &str, method: &str, path: &str, token: Option<&str>, body: Option<&Value>) -> Result<Value, ApiError> {
+    let text = body.map(|b| b.to_string());
+    let (status, bytes) = call(base, method, path, token, text.as_ref().map(|t| ("application/json", t.as_bytes())), Duration::from_secs(15))?;
+    json_result(status, &bytes)
+}
+
+/// A JSON request; errors carry the server's message.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn api(base: &str, method: &str, path: &str, token: Option<&str>, body: Option<&Value>) -> Result<Value, ApiError> {
+    api_blocking(base, method, path, token, body)
+}
+
+/// One request through the page's `fetch`. `body` is (content type, bytes).
+#[cfg(target_arch = "wasm32")]
+pub async fn call(base: &str, method: &str, path: &str, token: Option<&str>, body: Option<(&str, &[u8])>) -> Result<(u16, Vec<u8>), ApiError> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    let offline = |e: wasm_bindgen::JsValue| ApiError::offline(format!("No connection to the server ({})", e.as_string().unwrap_or_else(|| "network error".into())));
+    let init = web_sys::RequestInit::new();
+    init.set_method(method);
+    let headers = web_sys::Headers::new().map_err(offline)?;
+    headers.set("Accept", "application/json").map_err(offline)?;
+    if let Some(token) = token {
+        headers.set("Authorization", &format!("Bearer {token}")).map_err(offline)?;
+    }
+    if let Some((ctype, bytes)) = body {
+        headers.set("Content-Type", ctype).map_err(offline)?;
+        init.set_body(&js_sys::Uint8Array::from(bytes).into());
+    }
+    init.set_headers(&headers);
+    let url = format!("{}{path}", base.trim_end_matches('/'));
+    let request = web_sys::Request::new_with_str_and_init(&url, &init).map_err(offline)?;
+    let window = web_sys::window().ok_or_else(|| ApiError::offline("No window"))?;
+    let response: web_sys::Response = JsFuture::from(window.fetch_with_request(&request)).await.map_err(offline)?.dyn_into().map_err(offline)?;
+    let buffer = JsFuture::from(response.array_buffer().map_err(offline)?).await.map_err(offline)?;
+    Ok((response.status(), js_sys::Uint8Array::new(&buffer).to_vec()))
+}
+
+/// A JSON request; errors carry the server's message.
+#[cfg(target_arch = "wasm32")]
+pub async fn api(base: &str, method: &str, path: &str, token: Option<&str>, body: Option<&Value>) -> Result<Value, ApiError> {
+    let text = body.map(|b| b.to_string());
+    let (status, bytes) = call(base, method, path, token, text.as_ref().map(|t| ("application/json", t.as_bytes()))).await?;
+    json_result(status, &bytes)
 }
 
 #[cfg(test)]
