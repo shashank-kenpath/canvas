@@ -61,12 +61,13 @@ class Updater(private val activity: Activity, private val message: (String) -> U
                 for (i in 0 until releases.length()) {
                     val release = releases.getJSONObject(i)
                     val tag = release.optString("tag_name")
-                    if (!tag.startsWith(PREFIX) || release.optBoolean("draft") || release.optBoolean("prerelease")) continue
+                    val prefix = PREFIXES.firstOrNull { tag.startsWith(it) } ?: continue
+                    if (release.optBoolean("draft") || release.optBoolean("prerelease")) continue
                     val assets = release.getJSONArray("assets")
                     for (a in 0 until assets.length()) {
                         val asset = assets.getJSONObject(a)
-                        if (asset.optString("name") == "canvas-studio-rust.apk") {
-                            version = tag.removePrefix(PREFIX)
+                        if (asset.optString("name").endsWith(".apk")) {
+                            version = tag.removePrefix(prefix)
                             url = asset.getString("browser_download_url")
                             break
                         }
@@ -107,7 +108,7 @@ class Updater(private val activity: Activity, private val message: (String) -> U
 
     fun download(url: String) {
         if (busy) { report("An update operation is already running"); return }
-        if (!url.startsWith("https://github.com/tejasgowda0012/canvas/releases/download/") && !url.startsWith(LAN_BASE)) { report("This update address is invalid"); return }
+        if (DOWNLOADS.none { url.startsWith(it) } && !url.startsWith(LAN_BASE)) { report("This update address is invalid"); return }
         busy = true
         report("Downloading the update…")
         Thread({
@@ -203,9 +204,13 @@ class Updater(private val activity: Activity, private val message: (String) -> U
     companion object {
         const val ACTION = "com.canvasstudio.rust.UPDATE_RESULT"
         private const val NONCE = "com.canvasstudio.rust.UPDATE_NONCE"
-        const val PREFIX = "rust-v"
+        val PREFIXES = listOf("rust-v", "v")
+        val DOWNLOADS = listOf(
+            "https://github.com/tejasgowda0012/inkboard/releases/download/",
+            "https://github.com/tejasgowda0012/canvas/releases/download/",
+        )
         const val LAN_BASE = "http://192.168.88.67:8790/"
         const val LAN_FEED = LAN_BASE + "latest.json"
-        const val RELEASES = "https://api.github.com/repos/tejasgowda0012/canvas/releases?per_page=30"
+        const val RELEASES = "https://api.github.com/repos/tejasgowda0012/inkboard/releases?per_page=30"
     }
 }

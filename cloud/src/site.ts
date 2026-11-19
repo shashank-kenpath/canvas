@@ -2,7 +2,7 @@
 // demo, and where to download it. Downloads redirect to the newest GitHub release, so the page
 // never needs updating for a new version.
 
-export const RELEASES = "https://github.com/tejasgowda0012/canvas/releases";
+export const RELEASES = "https://github.com/tejasgowda0012/inkboard/releases";
 
 /** Asset names in every release, made by .github/workflows/desktop.yml. */
 export const DOWNLOADS: Record<string, string> = {
@@ -578,7 +578,7 @@ const HTML = String.raw`<!doctype html>
     <span>by Kenpath Labs</span>
     <a href="/app">Open in your browser</a>
     <a href="${RELEASES}">Releases</a>
-    <a href="https://github.com/tejasgowda0012/canvas">Source</a>
+    <a href="https://github.com/tejasgowda0012/inkboard">Source</a>
     <span class="sp">Draw something nice.</span>
   </div>
 </footer>

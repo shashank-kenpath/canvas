@@ -17,7 +17,7 @@ describe("website", () => {
   it("sends downloads to the newest release", async () => {
     const res = await get("/download/mac");
     expect(res.status).toBe(302);
-    expect(res.headers.get("location")).toBe("https://github.com/tejasgowda0012/canvas/releases/latest/download/Inkboard-macOS.dmg");
+    expect(res.headers.get("location")).toBe("https://github.com/tejasgowda0012/inkboard/releases/latest/download/Inkboard-macOS.dmg");
     expect((await get("/download/amiga")).status).toBe(404);
   });
 });

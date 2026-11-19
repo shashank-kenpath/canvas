@@ -22,7 +22,7 @@ Roles per board: **owner**, **editor**, **viewer**. Owners invite people by emai
 
 Live at **https://whiteboard.kenpathlabs.com**, the apps' default server (`DEFAULT_SERVER` in `rust/core/src/ui/cloud/mod.rs`).
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/tejasgowda0012/canvas/tree/main/cloud)
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/tejasgowda0012/inkboard/tree/main/cloud)
 
 The button deploys into the Cloudflare account you choose, which must hold the `kenpathlabs.com` zone for the custom domain. It creates the D1 database and R2 bucket, asks for `GOOGLE_CLIENT_SECRET`, and runs `npm run deploy`, which also creates the database tables.
 
