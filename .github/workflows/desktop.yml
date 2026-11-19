@@ -1,4 +1,5 @@
-# Builds the Inkboard desktop app (rust/desktop) for macOS, Windows and Linux.
+# Builds the Inkboard desktop app (rust/desktop) for Windows and Linux.
+# macOS builds are made on a Mac, not here.
 # Artifacts are attached to the run; tagged `desktop-v*` pushes also make a release.
 name: Desktop apps
 
@@ -17,12 +18,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            name: Inkboard-macOS-AppleSilicon
-          - os: macos-13
-            target: x86_64-apple-darwin
-            name: Inkboard-macOS-Intel
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             name: Inkboard-Windows
