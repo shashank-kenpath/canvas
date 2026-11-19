@@ -9,7 +9,7 @@ compatibility_date = "2026-11-01"
 # Sign-in is refused while this is empty.
 ALLOWED_DOMAINS = "kenpath.io,kenpathlabs.com"
 # OAuth client of type "TVs and Limited Input devices" from Google Cloud Console.
-GOOGLE_CLIENT_ID = ""
+GOOGLE_CLIENT_ID = "408611563084-8js2vfhlk5sl4opmk6udr7eotioihvgr.apps.googleusercontent.com"
 # GOOGLE_CLIENT_SECRET is a secret: `npx wrangler secret put GOOGLE_CLIENT_SECRET`
 
 [[durable_objects.bindings]]
