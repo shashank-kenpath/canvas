@@ -107,6 +107,12 @@ pub trait Platform: Send {
     fn copy_text(&mut self, _text: &str) {}
     /// Opens `url` in a browser. Hosts that cannot leave it alone.
     fn open_url(&mut self, _url: &str) {}
+    /// Starts "Sign in with Google" in a browser against `server` and
+    /// answers with [`App::finish_sign_in`] (or [`App::sign_in_failed`]).
+    /// Returns false when the host can't, and the app shows a code instead.
+    fn sign_in_in_browser(&mut self, _server: &str) -> bool {
+        false
+    }
     /// Saves a PNG picture to the device's Pictures.
     fn save_png(&mut self, _name: &str, _png: &[u8]) {}
     /// Lets the user choose board files to bring in. The host answers with
@@ -167,6 +173,8 @@ pub mod keys {
 // ---------------------------------------------------------------- disk
 
 enum Job {
+    /// Moves a board that now lives in the person's account out of the list.
+    Archive(String),
     List,
     Thumb {
         id: String,
@@ -320,6 +328,10 @@ fn disk_job(dir: &Path, job: Job) -> Option<Done> {
                 };
                 let ok = copy().is_ok();
                 Done::Created(to, ok)
+            }
+            Job::Archive(id) => {
+                let _ = store::archive(&dir, &id);
+                Done::Listed(store::list(&dir))
             }
             Job::Delete(id) => {
                 let _ = store::delete(&dir, &id);
@@ -543,8 +555,9 @@ enum InsertKind {
 /// What a control does.
 #[derive(Clone, PartialEq, Debug)]
 enum Act {
+    /// Opens a board on this device (tests, and boards not yet moved to the account).
+    #[cfg_attr(not(test), allow(dead_code))]
     Open(String),
-    CardMenu(String),
     NewBoard,
     Settings,
     Import,
@@ -591,6 +604,7 @@ enum Act {
     Predict(u8),
     Dock(Dock),
     Rename(String),
+    #[cfg_attr(not(test), allow(dead_code))]
     AskDelete(String),
     Field,
     Cancel,
@@ -601,12 +615,18 @@ enum Act {
     SignIn,
     SignOut,
     Account,
-    Tab(bool),
+    /// The avatar's menu on the library.
+    AccountMenu,
+    /// Chooses which boards the library lists.
+    Filter(Tab),
     OpenTeam(String),
     TeamMenu(String),
+    /// Opens a team board with its share panel on top.
+    ShareTeam(String),
+    /// Copies the web address that opens a team board.
+    CopyBoardLink(String),
     RenameTeam(String),
     DeleteTeam(String),
-    CopyToTeam(String),
     AddPerson,
     MemberMenu(String),
     SetRole(String, Role),
@@ -619,6 +639,8 @@ enum Act {
     Copy(String),
     /// Opens a web address in the system browser (web: a new tab).
     OpenUrl(String),
+    /// Sign in with a code entered on another device instead of a browser.
+    SignInCode,
     /// A surface that takes touches so they do not fall through.
     Nothing,
     Outside,
@@ -720,6 +742,10 @@ enum Look {
     /// A box around shapes someone else selected or changed.
     Outline { color: u32, label: String, below: bool },
     Avatar { text: String, color: u32 },
+    /// Who can open a board, on its card.
+    Badge { access: team::Access },
+    /// Someone with access to a board, with their role.
+    Person { name: String, email: String, role: String, menu: bool },
     StatusDot {
         text: String,
         online: bool,
@@ -811,6 +837,7 @@ struct Card {
     subtitle: String,
     /// The local board file whose picture to show.
     thumb: Option<String>,
+    access: team::Access,
 }
 
 #[derive(Clone, Copy)]
@@ -968,10 +995,11 @@ fn scale_rect(r: Rf, scale: f32) -> Rf {
 #[derive(Clone, Debug)]
 enum MenuKind {
     Main,
-    Card(String),
     Pages,
     TeamCard(String),
     Member(String),
+    /// The avatar's menu on the library.
+    Account,
 }
 
 #[derive(Clone, Debug)]
@@ -1230,10 +1258,22 @@ pub struct App {
     team_boards: Vec<CloudBoard>,
     team_listed: bool,
     tab: Tab,
+    /// Team boards known to have been shared with named people.
+    invited: HashSet<String>,
+    /// A team board to show the share panel for once it opens.
+    share_on_open: Option<String>,
+    /// When New board was last tapped, so a second tap waits.
+    new_board_at: Option<u64>,
     /// Who can open the team board whose share panel is showing.
     members: Option<(String, Members)>,
     /// A local board being copied to Team boards.
     copying: Option<String>,
+    /// A board on this device being moved into the person's account: (from, to).
+    moving: Option<(String, String)>,
+    /// Boards that could not be moved this session, so they are not retried.
+    move_failed: Vec<String>,
+    /// A board link to open once signed in.
+    pending_link: Option<String>,
     lan_ip: Option<std::net::Ipv4Addr>,
     font_tiles: RefCell<HashMap<(u8, u32), Option<text::TextBitmap>>>,
 }
@@ -1330,7 +1370,6 @@ impl App {
         let (net_tx, net_rx) = mpsc::channel();
         let server = if cfg!(test) { None } else { net::serve(net_tx.clone(), wake.clone()).ok() };
         let (cloud_tx, cloud_rx) = mpsc::channel();
-        let signed_in = settings.account.is_some();
         let mut app = App {
             ed: Editor::new(),
             platform,
@@ -1407,9 +1446,15 @@ impl App {
             sign_in: None,
             team_boards: Vec::new(),
             team_listed: false,
-            tab: if signed_in { Tab::Team } else { Tab::Device },
+            tab: Tab::All,
+            invited: HashSet::new(),
+            share_on_open: None,
+            new_board_at: None,
             members: None,
             copying: None,
+            moving: None,
+            move_failed: Vec::new(),
+            pending_link: None,
             lan_ip: None,
             font_tiles: RefCell::new(HashMap::new()),
         };
@@ -1749,6 +1794,7 @@ impl App {
                     self.boards = list;
                     self.listed = true;
                     self.clamp_scroll();
+                    self.move_next_local_board();
                 }
                 Done::Imported {
                     added,
@@ -1863,6 +1909,15 @@ impl App {
                                 );
                             }
                         }
+                    }
+                }
+                Done::Created(id, ok) if self.moving.as_ref().is_some_and(|(_, to)| *to == id) => {
+                    let (from, _) = self.moving.take().unwrap();
+                    if ok {
+                        self.send(Job::Archive(from));
+                    } else {
+                        self.move_failed.push(from);
+                        self.move_next_local_board();
                     }
                 }
                 Done::Created(id, ok) => {
@@ -2708,8 +2763,14 @@ impl App {
         }
         match act {
             Act::Open(id) => self.open(id),
-            Act::CardMenu(id) => self.menu(MenuKind::Card(id.clone()), &Act::CardMenu(id)),
-            Act::NewBoard => self.ask("New board", "", "Board name", false, AskFor::NewBoard),
+            Act::NewBoard => {
+                if self.account().is_some() {
+                    // Figma-style: the board exists at once and is renamed later.
+                    self.create_team_board("Untitled board".into());
+                } else {
+                    self.ask("New board", "", "Board name", false, AskFor::NewBoard);
+                }
+            }
             Act::Settings => self.panel(PanelKind::Settings),
             Act::Import => {
                 self.dismiss();
@@ -2970,13 +3031,14 @@ impl App {
                 }
             }
             Act::OpenUrl(url) => self.platform.open_url(&url),
+            Act::SignInCode => self.sign_in_with_code(),
             Act::Copy(text) => {
                 self.platform.copy_text(&text);
                 self.show_toast("Copied");
             }
             Act::Nothing => {}
-            Act::SignIn | Act::SignOut | Act::Account | Act::Tab(_) | Act::OpenTeam(_) | Act::TeamMenu(_) | Act::RenameTeam(_)
-            | Act::DeleteTeam(_) | Act::CopyToTeam(_) | Act::AddPerson | Act::MemberMenu(_) | Act::SetRole(..)
+            Act::SignIn | Act::SignOut | Act::Account | Act::AccountMenu | Act::Filter(_) | Act::OpenTeam(_) | Act::TeamMenu(_)
+            | Act::ShareTeam(_) | Act::CopyBoardLink(_) | Act::RenameTeam(_) | Act::DeleteTeam(_) | Act::AddPerson | Act::MemberMenu(_) | Act::SetRole(..)
             | Act::RemoveMember(_) | Act::OrgAccess(_) => unreachable!("team actions run above"),
         }
     }
@@ -3024,7 +3086,7 @@ impl App {
                         } else {
                             name.to_string()
                         };
-                        if self.team_tab() && self.account().is_some() {
+                        if self.account().is_some() {
                             self.create_team_board(title);
                             return;
                         }
@@ -3232,38 +3294,24 @@ impl App {
         }
     }
 
-    /// The boards the library shows on the current tab.
+    /// The boards the library shows: the signed-in person's team boards,
+    /// narrowed by the filter chips. Signed out there are none; the welcome
+    /// screen takes the library's place.
     fn cards(&self) -> Vec<Card> {
-        if self.team_tab() {
-            return team::team_cards(self)
-                .into_iter()
-                .map(|c| {
-                    let local = team::cache_id(&c.board.id);
-                    Card {
-                        open: Act::OpenTeam(c.board.id.clone()),
-                        menu: Act::TeamMenu(c.board.id.clone()),
-                        title: c.board.title.clone(),
-                        subtitle: c.subtitle,
-                        thumb: self.boards.iter().any(|b| b.id == local).then_some(local),
-                    }
-                })
-                .collect();
+        if self.me().is_none() {
+            return Vec::new();
         }
-        let stamp = self.timestamp();
-        let today = stamp.get(..10).unwrap_or("");
-        self.boards
-            .iter()
-            .filter(|meta| !meta.id.starts_with(team::CACHE_PREFIX))
-            .map(|meta| {
-                let date = meta.updated.get(..10).unwrap_or(&meta.updated);
-                let date = if date == today { "Today" } else { date };
-                let marks = if meta.shapes == 1 { "mark" } else { "marks" };
+        team::team_cards(self)
+            .into_iter()
+            .map(|c| {
+                let local = team::cache_id(&c.board.id);
                 Card {
-                    open: Act::Open(meta.id.clone()),
-                    menu: Act::CardMenu(meta.id.clone()),
-                    title: meta.title.clone(),
-                    subtitle: format!("{} {marks}  ·  {date}", meta.shapes),
-                    thumb: Some(meta.id.clone()),
+                    open: Act::OpenTeam(c.board.id.clone()),
+                    menu: Act::TeamMenu(c.board.id.clone()),
+                    title: c.board.title.clone(),
+                    subtitle: c.subtitle,
+                    thumb: self.boards.iter().any(|b| b.id == local).then_some(local),
+                    access: c.access,
                 }
             })
             .collect()
@@ -3275,9 +3323,9 @@ impl App {
         let header = 136.0;
         let avail = (w - 2.0 * margin).max(1.0);
         let columns = (((avail + 32.0) / 340.0).floor() as usize).clamp(1, 4);
-        let card_width = ((avail - 32.0 * (columns - 1) as f32) / columns as f32).min(408.0);
+        let card_width = ((avail - 32.0 * (columns - 1) as f32) / columns as f32).min(if columns == 1 { 640.0 } else { 408.0 });
         let card_height = card_width * 336.0 / 408.0;
-        let top = 376.0;
+        let top = 344.0;
         let rows = self.cards().len().div_ceil(columns);
         let content = if rows == 0 {
             0.0
@@ -3300,14 +3348,73 @@ impl App {
         self.scroll = self.scroll.clamp(0.0, max);
     }
 
+    /// The update button, drawn left of `right`; returns the new `right`.
+    fn update_button(&self, ui: &mut Ui, right: f32, wide: bool) -> f32 {
+        let Some((version, _)) = &self.update else { return right };
+        let width = if wide { 268.0 } else { 72.0 };
+        ui.button(
+            Rf::new(right - width, 40.0, width, 72.0),
+            Some(Ico::Update),
+            if wide { format!("Update {version}") } else { String::new() },
+            ButtonKind::AccentTint,
+            true,
+            Act::Updates,
+        );
+        right - width - 16.0
+    }
+
+    /// Signed out: the library has nothing to show, so it welcomes instead.
+    fn layout_welcome(&self, ui: &mut Ui) {
+        let (w, h) = self.extent();
+        let margin = if w >= 1200.0 { 96.0 } else { 24.0 };
+        let wide = w - 2.0 * margin >= 1030.0;
+        // Settings stay reachable, quietly.
+        ui.button(Rf::new(w - margin - 72.0, 40.0, 72.0, 72.0), Some(Ico::Gear), "", ButtonKind::White, true, Act::Settings);
+        self.update_button(ui, w - margin - 88.0, wide);
+
+        let col = (w - 2.0 * margin).clamp(240.0, 760.0);
+        let x = (w - col) / 2.0;
+        let headline = "Sketch ideas together.";
+        let line = "Every board you make is saved to your account and stays private until you share it.";
+        let u = ui.u;
+        let measured = font::measure(Face::Bold, 64.0 * u, headline).0 / u;
+        let size = (64.0 * 0.88 * col / measured.max(1.0)).min(64.0);
+        let line_count = paint::wrap(Face::Regular, 28.0 * u, line, col * u).len() as f32;
+        let button_w = 520.0_f32.min(col);
+        let total = 120.0 + 48.0 + 80.0 + 20.0 + line_count * 40.0 + 56.0 + 96.0 + 48.0 + 32.0;
+        let mut y = ((h - total) / 2.0 - 24.0).max(margin + 88.0);
+
+        ui.push(square((w - 120.0) / 2.0, y, 120.0), Look::Logo, None);
+        y += 120.0 + 48.0;
+        ui.label(Rf::new(x, y, col, 80.0), headline, Face::Bold, size, TEXT1, true);
+        y += 80.0 + 20.0;
+        for (i, text) in paint::wrap(Face::Regular, 28.0 * u, line, col * u).iter().enumerate() {
+            ui.label(Rf::new(x, y + 40.0 * i as f32, col, 40.0), text.as_str(), Face::Regular, 28.0, TEXT2, true);
+        }
+        y += line_count * 40.0 + 56.0;
+        ui.push(
+            Rf::new((w - button_w) / 2.0, y, button_w, 96.0),
+            Look::Button { icon: None, text: "Sign in with Google".into(), kind: ButtonKind::Primary, pill: true, level: 2 },
+            Some(Act::SignIn),
+        );
+        y += 96.0 + 48.0;
+        ui.label(Rf::new(x, y, col, 32.0), "For Kenpath Google Workspace accounts.", Face::Regular, 22.0, TEXT3, true);
+    }
+
     fn layout_library(&self, ui: &mut Ui) {
+        let Some(me) = self.me() else {
+            self.layout_welcome(ui);
+            return;
+        };
         let (w, h) = self.extent();
         let grid = self.library_metrics();
         let margin = grid.margin;
-        let wide = w - 2.0 * margin >= 1030.0;
-        let scroll = self.scroll / ui.u;
         let avail = w - 2.0 * margin;
-        let mut right = w - margin;
+        let wide = avail >= 1030.0;
+        let scroll = self.scroll / ui.u;
+        let listed = self.team_listed;
+        // Nothing at all yet: one friendly call to action instead of chips.
+        let nothing = listed && self.team_boards.is_empty();
 
         ui.push(
             Rf::new(0.0, 0.0, w, grid.header),
@@ -3320,123 +3427,51 @@ impl App {
             Some(Act::Nothing),
         );
         ui.push(square(margin, 40.0, 56.0), Look::Logo, None);
-        let actions = [
-            (
-                Ico::Gear,
-                "Settings".to_string(),
-                184.0,
-                Act::Settings,
-                ButtonKind::White,
-            ),
-            (
-                Ico::Claude,
-                "Claude".to_string(),
-                172.0,
-                Act::Claude,
-                ButtonKind::White,
-            ),
-            (
-                Ico::Hand,
-                "Phone".to_string(),
-                164.0,
-                Act::Remote,
-                ButtonKind::White,
-            ),
-            (
-                Ico::Join,
-                self.me().map_or_else(|| "Sign in".to_string(), |u| u.first_name().to_string()),
-                if self.me().is_some() { 200.0 } else { 164.0 },
-                Act::Account,
-                ButtonKind::White,
-            ),
-        ];
-        for (icon, text, width, act, kind) in
-            actions
-                .into_iter()
-                .chain(self.update.as_ref().map(|(v, _)| {
-                    (
-                        Ico::Update,
-                        format!("Update {v}"),
-                        268.0,
-                        Act::Updates,
-                        ButtonKind::AccentTint,
-                    )
-                }))
-        {
-            let width = if wide {
-                width
-            } else {
-                72.0_f32.min((avail / 6.0).max(44.0))
-            };
-            right -= width;
-            ui.button(
-                Rf::new(right, 40.0, width, 72.0),
-                Some(icon),
-                if wide { text } else { String::new() },
-                kind,
-                true,
-                act,
-            );
-            right -= if wide { 16.0 } else { 8.0 };
+        let mut right = w - margin - 72.0;
+        ui.push(
+            Rf::new(right, 40.0, 72.0, 72.0),
+            Look::Avatar { text: me.initials(), color: me.color },
+            Some(Act::AccountMenu),
+        );
+        right = self.update_button(ui, right - 16.0, wide);
+        if wide && !nothing {
+            right -= 232.0;
+            ui.button(Rf::new(right, 40.0, 232.0, 72.0), Some(Ico::Plus), "New board", ButtonKind::Primary, true, Act::NewBoard);
+            right -= 16.0;
         }
-        ui.label(
-            Rf::new(margin + 72.0, 40.0, right - margin - 72.0, 72.0),
-            "Inkboard",
-            Face::Bold,
-            32.0,
-            TEXT1,
-            false,
-        );
+        ui.label(Rf::new(margin + 72.0, 40.0, (right - margin - 72.0).max(0.0), 72.0), "Inkboard", Face::Bold, 32.0, TEXT1, false);
 
-        ui.clip = Some(
-            scale_rect(
-                Rf::new(0.0, grid.header, w, (h - grid.header).max(0.0)),
-                ui.u,
-            )
-            .covering(0.0),
-        );
+        ui.clip = Some(scale_rect(Rf::new(0.0, grid.header, w, (h - grid.header).max(0.0)), ui.u).covering(0.0));
         let cards = self.cards();
-        let team = self.team_tab();
-        let segments = segment(
-            Rf::new(margin, 280.0 - scroll, 520.0_f32.min(avail), 64.0),
-            [("On this device", Act::Tab(false)), ("Team boards", Act::Tab(true))],
-            usize::from(team),
-        );
-        let listed = if team { self.team_listed || self.me().is_none() } else { self.listed };
-        if cards.is_empty() && listed {
-            let y = place_in(h / 2.0 - 120.0, grid.header + 24.0, 420.0).max(380.0 - scroll);
-            ui.push(square(w / 2.0 - 80.0, y, 160.0), Look::EmptyLogo, None);
-            let (title, line) = match (team, self.me().is_some()) {
-                (false, _) => ("Make room for ideas.", "Tap New board to start."),
-                (true, false) => ("Work on boards together.", "Sign in with your work Google account to see team boards."),
-                (true, true) => ("No team boards yet.", "Tap New board, or copy a board here from its Share button."),
-            };
-            ui.label(Rf::new(margin, y + 184.0, avail, 48.0), title, Face::Bold, 36.0, TEXT1, true);
-            ui.label(Rf::new(margin, y + 240.0, avail, 32.0), line, Face::Regular, 24.0, TEXT2, true);
-            if team && self.me().is_none() {
-                let bw = 360.0_f32.min(avail);
-                ui.button(Rf::new((w - bw) / 2.0, y + 296.0, bw, 80.0), Some(Ico::Join), "Sign in with Google", ButtonKind::Primary, true, Act::SignIn);
+        ui.label(Rf::new(margin, 160.0 - scroll, avail, 64.0), "Boards", Face::Bold, 56.0, TEXT1, false);
+        if !nothing {
+            let mut x = margin;
+            for tab in Tab::ALL {
+                let text = tab.label();
+                let width = font::measure(Face::Bold, 24.0 * ui.u, text).0 / ui.u + 48.0;
+                let kind = if tab == self.tab { ButtonKind::AccentTint } else { ButtonKind::White };
+                ui.button(Rf::new(x, 244.0 - scroll, width, 64.0), None, text, kind, true, Act::Filter(tab));
+                x += width + 12.0;
             }
         }
-        ui.label(
-            Rf::new(margin, 168.0 - scroll, avail, 64.0),
-            if team { "Team boards" } else { "Your boards" },
-            Face::Bold,
-            56.0,
-            TEXT1,
-            false,
-        );
-        let count = cards.len();
-        let noun = if count == 1 { "board" } else { "boards" };
-        let subtitle = match (team, self.me()) {
-            (_, _) if !listed => "Loading boards…".to_string(),
-            (true, Some(me)) => format!("{count} {noun}  ·  Signed in as {}", me.email),
-            (true, None) => "Shared boards live on the Inkboard server and update live on every device.".to_string(),
-            (false, _) => format!("{count} {noun}  ·  Kept on this device only."),
-        };
-        ui.label(Rf::new(margin, 232.0 - scroll, avail, 40.0), subtitle, Face::Regular, 24.0, TEXT2, false);
-        for (r, look, act) in segments {
-            ui.push(r, look, act);
+        if !listed {
+            ui.label(Rf::new(margin, 352.0 - scroll, avail, 40.0), "Loading boards…", Face::Regular, 24.0, TEXT2, false);
+        } else if nothing {
+            let y = ((h - 392.0) / 2.0).max(220.0);
+            ui.push(square(w / 2.0 - 80.0, y, 160.0), Look::EmptyLogo, None);
+            ui.label(Rf::new(margin, y + 190.0, avail, 52.0), "Create your first board", Face::Bold, 40.0, TEXT1, true);
+            ui.label(Rf::new(margin, y + 250.0, avail, 32.0), "Boards are private to you until you share them.", Face::Regular, 24.0, TEXT2, true);
+            let bw = 320.0_f32.min(avail);
+            ui.button(Rf::new((w - bw) / 2.0, y + 312.0, bw, 80.0), Some(Ico::Plus), "New board", ButtonKind::Primary, true, Act::NewBoard);
+        } else if cards.is_empty() {
+            let (title, line) = match self.tab {
+                Tab::Shared => ("Nothing shared with you yet", "Boards other people share with you show up here."),
+                _ => ("No boards of yours yet", "Tap New board to start one."),
+            };
+            let y = grid.top + 40.0 - scroll;
+            ui.push(square(w / 2.0 - 56.0, y, 112.0), Look::EmptyLogo, None);
+            ui.label(Rf::new(margin, y + 136.0, avail, 44.0), title, Face::Bold, 32.0, TEXT1, true);
+            ui.label(Rf::new(margin, y + 184.0, avail, 32.0), line, Face::Regular, 22.0, TEXT2, true);
         }
 
         let cw = grid.card_width;
@@ -3464,6 +3499,9 @@ impl App {
                 Look::Thumb { id: card.thumb.clone().unwrap_or_default(), gen },
                 None,
             );
+            let label = card.access.label();
+            let badge_w = font::measure(Face::Bold, 20.0 * ui.u, &label).0 / ui.u + 60.0;
+            ui.push(Rf::new(x + 22.0, y + 22.0, badge_w.min(cw - 44.0), 40.0), Look::Badge { access: card.access }, None);
             let info_y = rect.bottom() - 92.0;
             let info_w = cw - 104.0;
             ui.label(Rf::new(x + 24.0, info_y + 6.0, info_w, 36.0), &card.title, Face::Bold, 26.0, TEXT1, false);
@@ -3475,18 +3513,14 @@ impl App {
             );
         }
         ui.clip = None;
-        let fw = 244.0_f32.min(avail);
-        ui.push(
-            Rf::new(w - margin - fw, h - 136.0, fw, 88.0),
-            Look::Button {
-                icon: Some(Ico::Plus),
-                text: "New board".into(),
-                kind: ButtonKind::Primary,
-                pill: true,
-                level: 2,
-            },
-            Some(Act::NewBoard),
-        );
+        if !wide && !nothing {
+            let fw = 244.0_f32.min(avail);
+            ui.push(
+                Rf::new(w - margin - fw, h - 136.0, fw, 88.0),
+                Look::Button { icon: Some(Ico::Plus), text: "New board".into(), kind: ButtonKind::Primary, pill: true, level: 2 },
+                Some(Act::NewBoard),
+            );
+        }
     }
 
     fn object_actions(&self) -> Vec<(&'static str, f32, Act, bool)> {
@@ -4357,33 +4391,7 @@ impl App {
                     ],
                 )
             }
-            MenuKind::Card(id) => (
-                400.0,
-                vec![
-                    row(
-                        Ico::Rename,
-                        "Rename",
-                        "",
-                        false,
-                        false,
-                        Act::Rename(id.clone()),
-                    ),
-                    if self.me().is_some() {
-                        row(Ico::Share, "Copy to Team boards", "", false, false, Act::CopyToTeam(id.clone()))
-                    } else {
-                        None
-                    },
-                    row(
-                        Ico::Trash,
-                        "Delete",
-                        "",
-                        false,
-                        true,
-                        Act::AskDelete(id.clone()),
-                    ),
-                ],
-            ),
-            MenuKind::TeamCard(_) | MenuKind::Member(_) => team::menu_rows(self, kind).unwrap_or((320.0, Vec::new())),
+            MenuKind::TeamCard(_) | MenuKind::Member(_) | MenuKind::Account => team::menu_rows(self, kind).unwrap_or((320.0, Vec::new())),
             MenuKind::Pages => (
                 320.0,
                 vec![row(
@@ -4397,7 +4405,10 @@ impl App {
             ),
         };
         let width = width.min(w - 32.0);
+        // The account menu opens with who is signed in.
+        let head = if matches!(kind, MenuKind::Account) && self.me().is_some() { 120.0 } else { 0.0 };
         let height = 24.0
+            + head
             + rows
                 .iter()
                 .map(|row| if row.is_some() { 72.0 } else { 16.0 })
@@ -4434,6 +4445,16 @@ impl App {
             k,
         );
         let mut y = y + 12.0 * k;
+        if let Some(me) = self.me().filter(|_| head > 0.0) {
+            ui.scaled(square(x + 24.0, y + 20.0, 72.0 * k), Look::Avatar { text: me.initials(), color: me.color }, None, k);
+            let text_x = x + 24.0 + 90.0 * k;
+            let text_w = (x + width - 24.0 - text_x).max(0.0);
+            let name = if me.name.is_empty() { me.email.as_str() } else { me.name.as_str() };
+            ui.scaled(Rf::new(text_x, y + 22.0 * k, text_w, 36.0 * k), Look::Label { text: name.into(), face: Face::Bold, size: 28.0, color: TEXT1, center: false }, None, k);
+            ui.scaled(Rf::new(text_x, y + 60.0 * k, text_w, 32.0 * k), Look::Label { text: me.email.clone(), face: Face::Regular, size: 22.0, color: TEXT3, center: false }, None, k);
+            y += head * k;
+            ui.push(Rf::new(x + 24.0, y - 6.0 * k, width - 48.0, 2.0 * k), Look::Rule, None);
+        }
         for row in rows {
             if let Some((look, act)) = row {
                 ui.scaled(
@@ -4664,7 +4685,7 @@ impl App {
             PanelKind::Claude => (960.0, 940.0),
             PanelKind::Remote => (760.0, 900.0),
             PanelKind::Fonts => (960.0, 760.0),
-            PanelKind::Share => (880.0, 820.0),
+            PanelKind::Share => (880.0, 980.0),
             PanelKind::Account => (720.0, 920.0),
         };
         let dw = width.min(w - 48.0).max(0.0);
@@ -4905,7 +4926,7 @@ impl App {
         let r = self.panel_frame(kind);
         let view = self.panel_viewport(kind, r);
         let title = match kind {
-            PanelKind::Share => "Share this board",
+            PanelKind::Share => "Share",
             PanelKind::Account => {
                 if self.me().is_some() {
                     "Your account"
@@ -4947,6 +4968,16 @@ impl App {
         if kind == PanelKind::Share {
             let y = r.bottom() - 120.0;
             let scale = (view.w / 632.0).min(1.0);
+            if let Some(live) = &self.live {
+                ui.button(
+                    Rf::new(view.x, y, (view.w - 176.0 * scale - 16.0).min(240.0), 72.0),
+                    Some(Ico::Link),
+                    "Copy link",
+                    ButtonKind::Secondary,
+                    false,
+                    Act::CopyBoardLink(live.cloud_id.clone()),
+                );
+            }
             ui.button(
                 Rf::new(view.right() - 176.0 * scale, y, 176.0 * scale, 72.0),
                 None,
@@ -5464,7 +5495,7 @@ impl App {
                     );
                 }
             }
-            Look::Cursor { .. } | Look::Outline { .. } | Look::Avatar { .. } => {
+            Look::Cursor { .. } | Look::Outline { .. } | Look::Avatar { .. } | Look::Badge { .. } | Look::Person { .. } => {
                 team::draw_look(p, &n.look, r, u);
             }
             Look::StatusDot { text, online, chip } => {
@@ -6161,15 +6192,13 @@ mod tests {
 
         // The old local-network sharing endpoints are gone.
         assert_eq!(req(&mut app, "GET", "/canvas/hello", &[("code", "123456")], Value::Null).0, 404);
-        // A board on this device offers to move to Team boards; signed out,
-        // that starts sign-in instead of failing.
+        // Signed out, the share panel asks to sign in instead of copying the
+        // board anywhere, and the library shows no boards.
         app.run(Act::Share);
         assert!(matches!(app.overlay, Some(Overlay::Panel { kind: PanelKind::Share, .. })));
         let (rows, _) = app.panel_rows(PanelKind::Share, 700.0);
-        assert!(rows.iter().any(|(_, _, act)| matches!(act, Some(Act::CopyToTeam(_)))));
+        assert!(rows.iter().any(|(_, _, act)| matches!(act, Some(Act::SignIn))));
         app.dismiss();
-        app.run(Act::Tab(true));
-        assert!(app.team_tab());
         assert!(app.cards().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6642,6 +6671,25 @@ mod tests {
         app.send(Job::List);
         settle(&mut app);
         assert_eq!(app.boards.len(), 9);
+        // The library lists the signed-in person's team boards.
+        app.settings.account = Some(Account {
+            server: "http://127.0.0.1:1".into(),
+            token: "t".into(),
+            user: cloud::User { id: "u".into(), email: "a@kenpath.com".into(), name: "A B".into(), color: 0xff2748e8 },
+        });
+        app.team_boards = (0..9)
+            .map(|i| CloudBoard {
+                id: format!("t{i}"),
+                title: format!("Team board {i}"),
+                role: Role::Owner,
+                org_access: "none".into(),
+                owner_name: "A B".into(),
+                owner_email: "a@kenpath.com".into(),
+                updated_at: 1_000 + i,
+                members: 0,
+            })
+            .collect();
+        app.team_listed = true;
         let s = Sample {
             id: 0,
             x: 300.0,

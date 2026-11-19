@@ -139,7 +139,7 @@ export async function verifyIdToken(env: Env, idToken: string): Promise<GoogleCl
   );
   if (!ok) throw new HttpError(401, "Invalid sign-in token");
   const c = JSON.parse(new TextDecoder().decode(fromBase64url(parts[1]))) as GoogleClaims;
-  if (!ISSUERS.has(c.iss) || c.aud !== env.GOOGLE_CLIENT_ID || c.exp * 1000 < now() - 60_000) {
+  if (!ISSUERS.has(c.iss) || ![env.GOOGLE_CLIENT_ID, env.GOOGLE_WEB_CLIENT_ID].includes(c.aud) || c.exp * 1000 < now() - 60_000) {
     throw new HttpError(401, "Sign-in token is not valid for this app");
   }
   // `hd` is only present for Workspace accounts, so personal Gmail is refused.
@@ -150,7 +150,7 @@ export async function verifyIdToken(env: Env, idToken: string): Promise<GoogleCl
   return c;
 }
 
-async function upsertUser(env: Env, c: GoogleClaims): Promise<User> {
+export async function upsertUser(env: Env, c: GoogleClaims): Promise<User> {
   const t = now();
   const email = c.email.toLowerCase();
   const name = (c.name || email.split("@")[0]).slice(0, 80);

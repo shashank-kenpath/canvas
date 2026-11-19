@@ -3,6 +3,7 @@
 //
 //   GET    /                             the website (src/site.ts)
 //   GET    /download/:platform           mac|windows|linux|android -> newest release
+//   GET    /auth/google                  browser sign-in (src/weblogin.ts)
 //
 //   POST   /api/auth/device              start a Google sign-in, returns a code to show
 //   POST   /api/auth/device/poll         {handle} -> 202 pending | 200 {token, user}
@@ -22,6 +23,7 @@
 import { authenticate, emailAllowed, pollDeviceLogin, revokeSession, startDeviceLogin } from "./auth";
 import type { Env, Person, Role, User } from "./env";
 import { download, homePage } from "./site";
+import { finishWebLogin, startWebLogin } from "./weblogin";
 import { HttpError, colorFor, error, json, now, readJson, sha256Hex } from "./util";
 
 export { BoardRoom } from "./room";
@@ -60,6 +62,8 @@ async function route(req: Request, env: Env): Promise<Response> {
   if (path === "/health") return json({ app: "Inkboard", ok: true });
   if (method === "GET" || method === "HEAD") {
     if (path === "/") return homePage();
+    if (path === "/auth/google") return startWebLogin(env, url);
+    if (path === "/auth/google/callback") return finishWebLogin(env, url);
     const dl = /^\/download\/([a-z]+)$/.exec(path);
     if (dl) return download(dl[1]) ?? error(404, "No download for that platform");
   }
@@ -198,17 +202,18 @@ function boardJson(b: BoardRow, role: Role, _user: User, owner?: { name: string;
 
 async function listBoards(env: Env, user: User) {
   const { results } = await env.DB.prepare(
-    `SELECT b.*, m.role AS member_role, u.name AS owner_name, u.email AS owner_email
+    `SELECT b.*, m.role AS member_role, u.name AS owner_name, u.email AS owner_email,
+            (SELECT COUNT(*) FROM members mc WHERE mc.board_id = b.id) AS member_count
      FROM boards b
      JOIN users u ON u.id = b.owner_id
      LEFT JOIN members m ON m.board_id = b.id AND m.email = ?
      WHERE b.archived = 0 AND (b.owner_id = ? OR m.email IS NOT NULL OR b.org_access != 'none')
      ORDER BY b.updated_at DESC LIMIT 500`,
-  ).bind(user.email, user.id).all<BoardRow & { member_role: Role | null; owner_name: string; owner_email: string }>();
+  ).bind(user.email, user.id).all<BoardRow & { member_role: Role | null; owner_name: string; owner_email: string; member_count: number }>();
   return results.map((b) => {
     const fromOrg: Role | null = b.org_access === "edit" ? "editor" : b.org_access === "view" ? "viewer" : null;
     const role: Role = b.owner_id === user.id ? "owner" : b.member_role === "editor" || fromOrg === "editor" ? "editor" : (b.member_role ?? fromOrg ?? "viewer");
-    return boardJson(b, role, user, { name: b.owner_name, email: b.owner_email });
+    return { ...boardJson(b, role, user, { name: b.owner_name, email: b.owner_email }), members: b.member_count };
   });
 }
 

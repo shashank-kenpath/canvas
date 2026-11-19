@@ -111,6 +111,8 @@ pub struct CloudBoard {
     pub owner_email: String,
     /// Milliseconds since the Unix epoch.
     pub updated_at: i64,
+    /// People invited besides the owner.
+    pub members: u32,
 }
 
 impl CloudBoard {
@@ -123,6 +125,7 @@ impl CloudBoard {
             owner_name: v["owner"]["name"].as_str().unwrap_or_default().to_string(),
             owner_email: v["owner"]["email"].as_str().unwrap_or_default().to_string(),
             updated_at: v["updatedAt"].as_i64().unwrap_or_default(),
+            members: v["members"].as_u64().unwrap_or_default() as u32,
         })
     }
 }

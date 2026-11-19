@@ -113,6 +113,12 @@ impl Platform for WebPlatform {
         request(json!({ "t": "open", "url": url }));
     }
 
+    fn sign_in_in_browser(&mut self, _server: &str) -> bool {
+        // The page goes to Google and comes back to /app/#signin=…
+        request(json!({ "t": "signin" }));
+        true
+    }
+
     fn save_png(&mut self, name: &str, png: &[u8]) {
         request(json!({ "t": "png", "name": name, "data": base64(png) }));
     }
@@ -261,6 +267,20 @@ impl Inkboard {
 
     pub fn text_input(&mut self, value: &str, submit: bool) {
         self.app.text_input(value, submit);
+    }
+
+    /// The page came back from Google with a session token.
+    pub fn finish_sign_in(&mut self, token: &str) {
+        self.app.finish_sign_in(token);
+    }
+
+    pub fn sign_in_failed(&mut self, message: &str) {
+        self.app.sign_in_failed(message);
+    }
+
+    /// Opens a board from a `#board=<id>` link.
+    pub fn open_board_link(&mut self, id: &str) {
+        self.app.open_board_link(id);
     }
 
     pub fn toast(&mut self, text: &str) {

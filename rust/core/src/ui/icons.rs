@@ -59,9 +59,14 @@ pub enum Ico {
     Palette,
     Dock,
     Graph,
+    Lock,
+    People,
+    Globe,
+    Link,
+    Exit,
 }
 
-pub const ALL: [Ico; 54] = [
+pub const ALL: [Ico; 59] = [
     Ico::Back,
     Ico::More,
     Ico::Kebab,
@@ -116,10 +121,15 @@ pub const ALL: [Ico; 54] = [
     Ico::Palette,
     Ico::Dock,
     Ico::Graph,
+    Ico::Lock,
+    Ico::People,
+    Ico::Globe,
+    Ico::Link,
+    Ico::Exit,
 ];
 
 impl Ico {
-    pub const ALL: [Ico; 54] = ALL;
+    pub const ALL: [Ico; 59] = ALL;
 }
 
 fn outline(path: &mut PathBuilder, pts: &[(f32, f32)]) {
@@ -526,6 +536,39 @@ pub(super) fn paths(ico: Ico) -> (Option<Path>, Option<Path>) {
         Dock => {
             rounded_rect(&mut stroke, 3.0, 5.0, 18.0, 14.0, 2.5);
             push_polyline(&mut stroke, &[(8.5, 5.0), (8.5, 19.0)]);
+        }
+        Lock => {
+            rounded_rect(&mut stroke, 5.0, 11.0, 14.0, 9.0, 2.0);
+            stroke.move_to(8.0, 11.0);
+            stroke.line_to(8.0, 8.0);
+            stroke.cubic_to(8.0, 5.8, 9.8, 4.0, 12.0, 4.0);
+            stroke.cubic_to(14.2, 4.0, 16.0, 5.8, 16.0, 8.0);
+            stroke.line_to(16.0, 11.0);
+        }
+        People => {
+            stroke.push_circle(9.0, 8.0, 3.2);
+            stroke.move_to(3.0, 20.0);
+            stroke.cubic_to(3.0, 16.5, 5.7, 14.0, 9.0, 14.0);
+            stroke.cubic_to(12.3, 14.0, 15.0, 16.5, 15.0, 20.0);
+            stroke.push_circle(17.0, 8.5, 2.5);
+            stroke.move_to(17.5, 13.6);
+            stroke.cubic_to(19.6, 13.8, 21.0, 15.6, 21.0, 18.0);
+        }
+        Globe => {
+            stroke.push_circle(12.0, 12.0, 9.0);
+            if let Some(oval) = tiny_skia::Rect::from_xywh(8.0, 3.0, 8.0, 18.0) {
+                stroke.push_oval(oval);
+            }
+            push_polyline(&mut stroke, &[(3.0, 12.0), (21.0, 12.0)]);
+        }
+        Link => {
+            rounded_rect(&mut stroke, 2.5, 8.5, 10.5, 7.0, 3.5);
+            rounded_rect(&mut stroke, 11.0, 8.5, 10.5, 7.0, 3.5);
+        }
+        Exit => {
+            push_polyline(&mut stroke, &[(10.0, 4.0), (5.0, 4.0), (5.0, 20.0), (10.0, 20.0)]);
+            push_polyline(&mut stroke, &[(9.0, 12.0), (20.0, 12.0)]);
+            push_polyline(&mut stroke, &[(16.0, 8.0), (20.0, 12.0), (16.0, 16.0)]);
         }
     }
     (stroke.finish(), fill.finish())

@@ -320,6 +320,15 @@ function handleRequests() {
       case "open":
         window.open(r.url, "_blank", "noopener");
         break;
+      case "signin": {
+        // Google's account chooser in this tab; it comes back to /app/#signin=…
+        const state = Array.from(crypto.getRandomValues(new Uint8Array(18)), (b) => b.toString(16).padStart(2, "0")).join("");
+        try { sessionStorage.setItem("inkboard-signin", state); } catch {}
+        app.save_now();
+        persist();
+        location.href = `/auth/google?return=web&state=${state}`;
+        break;
+      }
       case "png": {
         const bytes = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0));
         download(`${(r.name || "Inkboard").replace(/[^\w \-]/g, "_")}.png`, new Blob([bytes], { type: "image/png" }));
@@ -345,6 +354,27 @@ function handleRequests() {
     }
   }
   if (list.length) wantFrame = true;
+}
+
+// ------------------------------------------------------------ links
+
+// Back from Google (#signin=<token>&state=…), or a shared board (#board=<id>).
+function handleHash() {
+  const q = new URLSearchParams(location.hash.slice(1));
+  if (![...q.keys()].length) return;
+  history.replaceState(history.state, "", location.pathname + location.search);
+  let expected = null;
+  try {
+    expected = sessionStorage.getItem("inkboard-signin");
+    sessionStorage.removeItem("inkboard-signin");
+  } catch {}
+  if (q.has("signin") || q.has("signin_error")) {
+    if (!expected || q.get("state") !== expected) app.sign_in_failed("Sign-in didn't start here. Try again.");
+    else if (q.has("signin")) app.finish_sign_in(q.get("signin"));
+    else app.sign_in_failed(q.get("signin_error"));
+  }
+  if (q.has("board")) app.open_board_link(q.get("board"));
+  after();
 }
 
 // ------------------------------------------------------------ start
@@ -389,6 +419,8 @@ async function start() {
     app.save_now();
     persist();
   });
+  handleHash();
+  window.addEventListener("hashchange", handleHash);
   requestAnimationFrame(tick);
   document.getElementById("splash").classList.add("gone");
   canvas.focus({ preventScroll: true });
