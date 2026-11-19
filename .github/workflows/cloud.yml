@@ -1,0 +1,47 @@
+# Tests the Cloudflare collaboration backend (cloud/), then the Rust apps
+# against it running locally.
+name: Cloud backend
+
+on:
+  push:
+    paths: ["cloud/**", "rust/core/src/ui/cloud/**", "rust/core/src/ui/app/team.rs", ".github/workflows/cloud.yml"]
+  pull_request:
+    paths: ["cloud/**", "rust/core/**"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+      - run: npm ci --legacy-peer-deps
+        working-directory: cloud
+      - run: npx tsc --noEmit && npx vitest run
+        working-directory: cloud
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: End-to-end against wrangler dev
+        working-directory: cloud
+        run: |
+          npx wrangler d1 migrations apply inkboard-db --local
+          node -e '
+            const c = require("crypto");
+            const rows = ["ana", "ben"].map(n => {
+              const h = c.createHash("sha256").update("tok-" + n + "-0123456789abcdefghij").digest("hex");
+              return `INSERT INTO users (id,email,name,created_at,last_seen_at) VALUES (\x27u-${n}\x27,\x27${n}@example.com\x27,\x27${n}\x27,0,0);
+                      INSERT INTO sessions (token_hash,user_id,created_at,expires_at) VALUES (\x27${h}\x27,\x27u-${n}\x27,0,9999999999999);`;
+            });
+            require("fs").writeFileSync("/tmp/seed.sql", rows.join("\n"));'
+          npx wrangler d1 execute inkboard-db --local --file /tmp/seed.sql
+          npx wrangler dev --port 8787 --ip 127.0.0.1 --var ALLOWED_DOMAINS:example.com &
+          for i in $(seq 60); do curl -sf 127.0.0.1:8787/health && break; sleep 1; done
+          cd ../rust && INKBOARD_TEST_SERVER=http://127.0.0.1:8787 \
+            INKBOARD_TEST_TOKEN_A=tok-ana-0123456789abcdefghij INKBOARD_TEST_TOKEN_B=tok-ben-0123456789abcdefghij \
+            cargo test -p canvas_core --lib -- live_test two_apps

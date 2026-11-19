@@ -226,6 +226,26 @@ impl Document {
         self.commit(changes)
     }
 
+    /// Removes `remove` and adds `add` for a change made by someone else.
+    /// It is not an undo step, and this person's own undo history forgets
+    /// the touched shapes so undoing never brings back an overwritten version.
+    pub fn apply_remote(&mut self, remove: Vec<String>, add: Vec<Shape>) -> Applied {
+        let mut changes: Changes =
+            remove.into_iter().filter(|id| self.contains(id)).map(|id| (id, None)).collect();
+        changes.extend(add.into_iter().map(|s| (s.id.clone(), Some(Arc::new(s)))));
+        let (applied, report) = self.apply(changes, &HashMap::new());
+        let touched: HashSet<&str> = applied.iter().map(|c| c.id.as_str()).collect();
+        if !touched.is_empty() {
+            for stack in [&mut self.past, &mut self.future] {
+                for step in stack.iter_mut() {
+                    step.retain(|c| !touched.contains(c.id.as_str()));
+                }
+                stack.retain(|step| !step.is_empty());
+            }
+        }
+        report
+    }
+
     /// Returns true when the selection changed.
     pub fn select_many<I: IntoIterator<Item = String>>(&mut self, ids: I) -> bool {
         let mut next: Vec<String> = Vec::new();

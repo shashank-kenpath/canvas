@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "android"]
+members = ["core", "android", "desktop"]
 
 [profile.release]
 opt-level = 3

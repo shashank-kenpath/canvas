@@ -3,6 +3,7 @@
 
 use super::font::{self, Face};
 use super::icons::Ico;
+use super::cloud::{self, Account, CloudBoard, Members, Role};
 use super::net;
 use super::paint::{self, Painter, Rf};
 use crate::editor::{Contact, Editor, PenMode, EV_DOC, EV_HAPTIC, EV_INK, EV_TEXT, EV_VIEW};
@@ -24,6 +25,8 @@ use tiny_skia::PixmapMut;
 mod board_objects;
 mod math_ui;
 mod media;
+mod team;
+use team::{Live, SignIn, Tab};
 use media::PendingFile;
 
 // ------------------------------------------------------------------ colours
@@ -76,7 +79,6 @@ const INSERT: &[(Ico, &str, InsertKind)] = &[
     (Ico::Formula, "Formula", InsertKind::Formula),
     (Ico::Graph, "Graph", InsertKind::Graph),
 ];
-const RELAY: &str = "https://inkboard.taila6db10.ts.net";
 const LANGS: [(&str, &str); 1] = [("en", "English")];
 
 // ----------------------------------------------------------- host side
@@ -138,6 +140,17 @@ pub enum Phase {
     Cancel,
 }
 
+/// Keyboard shortcuts a desktop host can send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shortcut {
+    Undo,
+    Redo,
+    Delete,
+    ZoomIn,
+    ZoomOut,
+    Fit,
+}
+
 /// Android key codes the app understands.
 pub mod keys {
     pub const UP: i32 = 19;
@@ -184,6 +197,13 @@ enum Job {
     },
     /// The text of board files to copy in.
     Import(Vec<String>),
+    /// Copies a board to a new file that caches team board `cloud`.
+    Copy {
+        from: String,
+        to: String,
+        title: String,
+        cloud: String,
+    },
 }
 
 enum Done {
@@ -271,6 +291,21 @@ fn disk_worker(
                 let ok = store::save_atomic(&dir, &id, &contents).is_ok();
                 Done::Created(id, ok)
             }
+            Job::Copy { from, to, title, cloud } => {
+                let copy = || -> Result<(), String> {
+                    let board = store::load(&dir, &from)?;
+                    let mut extra = board.extra;
+                    for key in ["lanHost", "lanShare", "share", "synced"] {
+                        extra.remove(key);
+                    }
+                    extra.insert("cloud".into(), json!({ "id": cloud }));
+                    let shapes: Vec<Arc<Shape>> = board.shapes.into_iter().map(Arc::new).collect();
+                    let contents = store::encode(&to, &title, &board.updated, &shapes, &extra);
+                    store::save_atomic(&dir, &to, &contents)
+                };
+                let ok = copy().is_ok();
+                Done::Created(to, ok)
+            }
             Job::Delete(id) => {
                 let _ = store::delete(&dir, &id);
                 Done::Listed(store::list(&dir))
@@ -334,10 +369,10 @@ struct Settings {
     mcp_key: String,
     /// Secret part of the phone remote address.
     remote_key: String,
-    /// This panel's name and password at the relay.
-    relay_id: String,
-    relay_secret: String,
-    relay_url: String,
+    /// The Inkboard server for team boards.
+    server: String,
+    /// The signed-in Google Workspace account, if any.
+    account: Option<Account>,
 }
 
 /// A random lowercase token, for keys that only need to be unguessable.
@@ -361,16 +396,6 @@ fn random_token(len: usize) -> String {
         round += 1;
     }
     out
-}
-
-/// The 6-digit code in what someone typed to join a board.
-fn share_code(input: &str) -> String {
-    input
-        .split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|p| p.len() == 6 && p.chars().all(|c| c.is_ascii_digit()))
-        .last()
-        .map(str::to_string)
-        .unwrap_or_else(|| input.chars().filter(|c| c.is_ascii_digit()).collect())
 }
 
 impl Settings {
@@ -426,13 +451,18 @@ impl Settings {
                 .to_string(),
             mcp_key: token("mcpKey", 24, 24),
             remote_key: token("remoteKey", 16, 16),
-            relay_id: token("relayId", 8, 16),
-            relay_secret: token("relaySecret", 16, 32),
-            relay_url: v
-                .get("relayUrl")
-                .and_then(Value::as_str)
-                .unwrap_or(RELAY)
-                .to_string(),
+            server: std::env::var("INKBOARD_SERVER")
+                .ok()
+                .or_else(|| v.get("server").and_then(Value::as_str).map(str::to_string))
+                .filter(|s| s.starts_with("https://") || s.starts_with("http://"))
+                .unwrap_or_else(|| cloud::DEFAULT_SERVER.to_string()),
+            account: v.get("account").and_then(|a| {
+                Some(Account {
+                    server: a["server"].as_str()?.to_string(),
+                    token: a["token"].as_str()?.to_string(),
+                    user: cloud::User::from_json(&a["user"])?,
+                })
+            }),
         }
     }
 
@@ -442,8 +472,8 @@ impl Settings {
             "snap": self.snap, "font": self.font, "fullRes": self.full_res, "lang": self.lang,
             "fastInk": self.fast_ink, "predict": self.predict, "penPriority": self.pen_priority,
             "multiInk": self.multi_ink, "wideErase": self.wide_erase, "smooth": self.smooth, "dock": self.dock as u8,
-            "mcpKey": self.mcp_key, "remoteKey": self.remote_key, "relayId": self.relay_id, "relaySecret": self.relay_secret,
-            "relayUrl": self.relay_url,
+            "mcpKey": self.mcp_key, "remoteKey": self.remote_key, "server": self.server,
+            "account": self.account.as_ref().map(|a| serde_json::json!({ "server": a.server, "token": a.token, "user": a.user.to_json() })),
         });
         let tmp = path.with_extension("tmp");
         if std::fs::write(&tmp, v.to_string()).is_ok() {
@@ -555,16 +585,27 @@ enum Act {
     Cancel,
     Done,
     Share,
-    StopShare,
-    Leave,
-    Join,
     Claude,
+    /// Team boards.
+    SignIn,
+    SignOut,
+    Account,
+    Tab(bool),
+    OpenTeam(String),
+    TeamMenu(String),
+    RenameTeam(String),
+    DeleteTeam(String),
+    CopyToTeam(String),
+    AddPerson,
+    MemberMenu(String),
+    SetRole(String, Role),
+    RemoveMember(String),
+    OrgAccess(&'static str),
     Remote,
     Export,
     /// Ends the phone pad and makes its link stop working.
     PadDisconnect,
     Copy(String),
-    CopyCode(String),
     /// A surface that takes touches so they do not fall through.
     Nothing,
     Outside,
@@ -661,7 +702,11 @@ enum Look {
         multiline: bool,
     },
     Code(String),
-    ShareCode(String),
+    /// Someone else's pointer, with their name.
+    Cursor { color: u32, name: String },
+    /// A box around shapes someone else selected or changed.
+    Outline { color: u32, label: String, below: bool },
+    Avatar { text: String, color: u32 },
     StatusDot {
         text: String,
         online: bool,
@@ -743,6 +788,16 @@ struct BoardChrome {
     dividers: [Rf; 2],
     pages: Rf,
     selection: Rf,
+}
+
+/// A board card in the library.
+struct Card {
+    open: Act,
+    menu: Act,
+    title: String,
+    subtitle: String,
+    /// The local board file whose picture to show.
+    thumb: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -902,13 +957,16 @@ enum MenuKind {
     Main,
     Card(String),
     Pages,
+    TeamCard(String),
+    Member(String),
 }
 
 #[derive(Clone, Debug)]
 enum AskFor {
     NewBoard,
     Rename(String),
-    Join,
+    RenameTeam(String),
+    AddPerson,
     Text { id: String, x: f64, y: f64 },
     Cell { id: String, cell: Cell },
     Math { id: String, tool: Tool },
@@ -917,6 +975,7 @@ enum AskFor {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PanelKind {
     Share,
+    Account,
     Claude,
     Remote,
     Fonts,
@@ -926,6 +985,8 @@ enum PanelKind {
 #[derive(Clone, Debug)]
 enum ConfirmFor {
     Delete(String),
+    DeleteTeam(String),
+    RemoveMember(String),
     DeletePage,
     Install(String),
 }
@@ -970,6 +1031,8 @@ enum PageChange {
 struct Page {
     shapes: Vec<Arc<Shape>>,
     view: Option<(Pt, f64)>,
+    /// Names the page on team boards.
+    key: String,
 }
 
 impl Page {
@@ -991,6 +1054,7 @@ impl Page {
         Ok(Self {
             shapes,
             view: Self::decode_view(value),
+            key: value["key"].as_str().filter(|k| !k.is_empty() && !k.contains('/')).map_or_else(App::new_page_key, str::to_string),
         })
     }
 
@@ -1004,7 +1068,7 @@ impl Page {
     fn encode(&self, images: &store::ImageRefs) -> Result<Value, String> {
         let (camera, zoom) = self.view.unwrap_or((Pt::ZERO, 1.0));
         let shapes = images.encode(&self.shapes)?;
-        Ok(json!({ "shapes": shapes, "camera": [camera.x, camera.y], "zoom": zoom }))
+        Ok(json!({ "shapes": shapes, "camera": [camera.x, camera.y], "zoom": zoom, "key": self.key }))
     }
 }
 
@@ -1129,7 +1193,6 @@ pub struct App {
     net_rx: Receiver<net::Req>,
     #[allow(dead_code)]
     server: Option<net::Server>,
-    relay: Option<net::Relay>,
     /// Counts changes to the open board; joiners poll by it.
     doc_gen: u64,
     /// Counts repaints of the output; the phone remote polls by it.
@@ -1140,12 +1203,21 @@ pub struct App {
     pad_area: [f32; 4],
     /// When the phone pad last spoke; its area shows on the board for a while.
     pad_seen: Option<u64>,
-    /// A board joined from another device.
-    link: Option<net::Link>,
-    known: HashMap<String, Value>,
-    ops_sent: u64,
-    link_online: Option<bool>,
-    joining: Option<Receiver<(String, net::Found)>>,
+    /// Replies from the team board server.
+    cloud_tx: Sender<cloud::Reply>,
+    cloud_rx: Receiver<cloud::Reply>,
+    /// Board images by SHA-256 name, shared with the room connection.
+    images: cloud::room::Images,
+    /// The open team board's live connection.
+    live: Option<Live>,
+    sign_in: Option<SignIn>,
+    team_boards: Vec<CloudBoard>,
+    team_listed: bool,
+    tab: Tab,
+    /// Who can open the team board whose share panel is showing.
+    members: Option<(String, Members)>,
+    /// A local board being copied to Team boards.
+    copying: Option<String>,
     lan_ip: Option<std::net::Ipv4Addr>,
     font_tiles: RefCell<HashMap<(u8, u32), Option<text::TextBitmap>>>,
 }
@@ -1237,20 +1309,9 @@ impl App {
         let settings = Settings::load(&settings_path);
         settings.save(&settings_path);
         let (net_tx, net_rx) = mpsc::channel();
-        let (server, relay) = if cfg!(test) {
-            (None, None)
-        } else {
-            let relay = (!settings.relay_url.is_empty()).then(|| {
-                net::relay(
-                    settings.relay_url.clone(),
-                    settings.relay_id.clone(),
-                    settings.relay_secret.clone(),
-                    net_tx.clone(),
-                    wake.clone(),
-                )
-            });
-            (net::serve(net_tx.clone(), wake.clone()).ok(), relay)
-        };
+        let server = if cfg!(test) { None } else { net::serve(net_tx.clone(), wake.clone()).ok() };
+        let (cloud_tx, cloud_rx) = mpsc::channel();
+        let signed_in = settings.account.is_some();
         let mut app = App {
             ed: Editor::new(),
             platform,
@@ -1313,17 +1374,21 @@ impl App {
             net_tx,
             net_rx,
             server,
-            relay,
             doc_gen: 1,
             out_gen: 1,
             remote_t: 0,
             pad_area: [0.25, 0.25, 0.5, 0.5],
             pad_seen: None,
-            link: None,
-            known: HashMap::new(),
-            ops_sent: 0,
-            link_online: None,
-            joining: None,
+            cloud_tx,
+            cloud_rx,
+            images: Default::default(),
+            live: None,
+            sign_in: None,
+            team_boards: Vec::new(),
+            team_listed: false,
+            tab: if signed_in { Tab::Team } else { Tab::Device },
+            members: None,
+            copying: None,
             lan_ip: None,
             font_tiles: RefCell::new(HashMap::new()),
         };
@@ -1338,6 +1403,7 @@ impl App {
         app.platform.set_fast_ink(app.settings.fast_ink);
         app.platform.check_updates(false);
         app.send(Job::List);
+        app.refresh_team();
         app
     }
 
@@ -1471,6 +1537,7 @@ impl App {
             self.hold_deadline(),
             self.animation_deadline(),
             self.pad_seen.filter(|_| self.pad_shown()).map(|t| t + PAD_TTL),
+            self.live_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1483,10 +1550,11 @@ impl App {
         self.now = self.now.max(now);
         self.take_disk();
         self.take_net();
-        self.take_link();
-        self.take_join();
+        self.take_cloud();
+        self.take_room();
         self.ed.tick(self.now);
         self.take_editor_events();
+        self.send_presence();
         if self.toast.as_ref().is_some_and(|t| self.now >= t.end) {
             self.toast = None;
         }
@@ -1699,6 +1767,11 @@ impl App {
                                 .remove("pageView")
                                 .as_ref()
                                 .and_then(Page::decode_view),
+                            key: board
+                                .extra
+                                .remove("pageKey")
+                                .and_then(|k| k.as_str().filter(|k| !k.is_empty()).map(str::to_string))
+                                .unwrap_or_else(App::new_page_key),
                         }];
                         if let Some(Value::Array(values)) = board.extra.remove("pages") {
                             for value in &values {
@@ -1724,8 +1797,7 @@ impl App {
                             self.focus = None;
                             self.full = true;
                             self.doc_gen += 1;
-                            self.start_link();
-                            self.sync_relay_codes();
+                            self.start_live();
                         }
                         Err(_) => self.error_toast("This board could not be opened"),
                     }
@@ -1785,8 +1857,13 @@ impl App {
             return;
         };
         self.store_page();
+        let cloud_state = self.cloud_state();
         let board = self.board.as_ref().unwrap();
         let mut extra = board.extra.clone();
+        extra.insert("pageKey".into(), Value::String(self.pages[0].key.clone()));
+        if let Some(state) = cloud_state {
+            extra.insert("cloud".into(), state);
+        }
         if let Some((camera, zoom)) = self.pages[0].view {
             extra.insert(
                 "pageView".into(),
@@ -1829,14 +1906,12 @@ impl App {
         self.save_due = Some(self.now + 1200);
     }
 
-    fn joined(&self) -> bool {
-        self.board
-            .as_ref()
-            .is_some_and(|b| b.extra.contains_key("lanShare"))
-    }
-
     fn change_page(&mut self, change: PageChange) {
-        if self.board.is_none() || self.joined() {
+        if self.board.is_none() {
+            return;
+        }
+        if !matches!(change, PageChange::Open(_)) && !self.can_change_pages() {
+            self.show_toast("You can view this board but not change it");
             return;
         }
         let len = self.pages.len();
@@ -1858,6 +1933,7 @@ impl App {
             PageChange::Add => self.pages.push(Page {
                 shapes: Vec::new(),
                 view: Some((Pt::ZERO, 1.0)),
+                key: App::new_page_key(),
             }),
             PageChange::Delete => {
                 self.pages.remove(self.page);
@@ -1875,6 +1951,7 @@ impl App {
         self.restore_view();
         self.doc_gen += 1;
         self.mark_unsaved();
+        self.after_page_change(&change);
     }
 
     /// The host is going to the background. `ack` is answered once the open
@@ -1917,14 +1994,13 @@ impl App {
         self.page = 0;
         self.ink.clear();
         self.tool_tip = None;
-        self.link = None;
-        self.known.clear();
-        self.link_online = None;
-        self.sync_relay_codes();
+        self.live = None;
+        self.members = None;
         self.screen = Screen::Library;
         self.dismiss();
         self.full = true;
         self.send(Job::List);
+        self.refresh_team();
         if let Some(id) = self.open_after_save.take() {
             self.open(id);
         }
@@ -1971,17 +2047,7 @@ impl App {
         }
         if events & EV_DOC != 0 && self.board.is_some() {
             self.doc_gen += 1;
-            if self.link.is_some() {
-                let now = self.shape_map();
-                let ops = net::diff(&self.known, &now);
-                if !ops.is_empty() {
-                    if let Some(link) = &self.link {
-                        let _ = link.ops.send(ops);
-                    }
-                    self.ops_sent += 1;
-                    self.known = now;
-                }
-            }
+            self.push_local();
         }
         if events & EV_TEXT != 0 {
             if let Some(request) = self.ed.take_text_request() {
@@ -2204,6 +2270,7 @@ impl App {
                 }
             }
             None if self.screen == Screen::Board => {
+                self.track_pointer(s.x, s.y);
                 self.ed.pointer_down_with(
                     s.id,
                     Pt::new(s.x as f64, s.y as f64),
@@ -2225,6 +2292,7 @@ impl App {
         let mut release = false;
         match self.captures.get_mut(&s.id) {
             Some(Capture::Editor) => {
+                self.track_pointer(s.x, s.y);
                 self.ed.pointer_move_with(
                     s.id,
                     Pt::new(s.x as f64, s.y as f64),
@@ -2330,6 +2398,62 @@ impl App {
         } else {
             false
         }
+    }
+
+    /// A mouse wheel or trackpad scroll at (`x`, `y`), in screen pixels.
+    /// On a board it pans, or zooms when `zoom` (Ctrl or pinch) is set; in
+    /// the library and panels it scrolls.
+    pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32, zoom: bool) {
+        if let Some(Overlay::Panel { .. }) = self.overlay {
+            let max = self.panel_max_scroll();
+            if let Some(Overlay::Panel { scroll, .. }) = &mut self.overlay {
+                *scroll = (*scroll + dy).clamp(0.0, max);
+            }
+            return;
+        }
+        if self.overlay.is_some() {
+            return;
+        }
+        match self.screen {
+            Screen::Library => {
+                self.scroll += dy;
+                self.clamp_scroll();
+            }
+            Screen::Board if zoom => {
+                let factor = (-(dy as f64) * 0.0025).exp().clamp(0.5, 2.0);
+                self.ed.pan_zoom(Pt::ZERO, factor, Pt::new(x as f64, y as f64));
+            }
+            Screen::Board => self.ed.pan_zoom(Pt::new(-dx as f64, -dy as f64), 1.0, Pt::new(x as f64, y as f64)),
+        }
+    }
+
+    /// Keyboard shortcuts from desktop hosts.
+    pub fn shortcut(&mut self, shortcut: Shortcut) {
+        if self.screen != Screen::Board || self.overlay.is_some() {
+            return;
+        }
+        let act = match shortcut {
+            Shortcut::Undo => Act::Undo,
+            Shortcut::Redo => Act::Redo,
+            Shortcut::Delete => Act::Delete,
+            Shortcut::ZoomIn => Act::ZoomIn,
+            Shortcut::ZoomOut => Act::ZoomOut,
+            Shortcut::Fit => Act::Fit,
+        };
+        self.run(act);
+    }
+
+    /// A mouse or hovering pen moved over the board without pressing, in
+    /// screen pixels. Others on a team board see it as this person's cursor.
+    pub fn hover(&mut self, x: f32, y: f32) {
+        if self.screen == Screen::Board && self.captures.is_empty() {
+            self.track_pointer(x, y);
+        }
+    }
+
+    /// The mouse left the window.
+    pub fn hover_exit(&mut self) {
+        self.forget_pointer();
     }
 
     pub fn request_back(&mut self) {
@@ -2544,6 +2668,9 @@ impl App {
     }
 
     fn run(&mut self, act: Act) {
+        if self.run_team(&act) {
+            return;
+        }
         match act {
             Act::Open(id) => self.open(id),
             Act::CardMenu(id) => self.menu(MenuKind::Card(id.clone()), &Act::CardMenu(id)),
@@ -2669,7 +2796,7 @@ impl App {
                 }
             }
             Act::InsertItem(kind) => match kind {
-                InsertKind::File(FileKind::Pdf) if !self.joined() => self.show_overlay(Overlay::Insert { pdf: true }),
+                InsertKind::File(FileKind::Pdf) if self.can_change_pages() => self.show_overlay(Overlay::Insert { pdf: true }),
                 InsertKind::File(kind) => self.pick_file(kind, true),
                 InsertKind::Table => self.show_overlay(Overlay::TableSize {
                     rows: table::DEFAULT_SIZE,
@@ -2696,7 +2823,7 @@ impl App {
             Act::PagePrev => self.change_page(PageChange::Open(self.page.saturating_sub(1))),
             Act::PageNext => self.change_page(PageChange::Open(self.page + 1)),
             Act::PageAdd => self.change_page(PageChange::Add),
-            Act::PageMenu if self.pages.len() > 1 && !self.joined() => {
+            Act::PageMenu if self.pages.len() > 1 && self.can_change_pages() => {
                 self.menu(MenuKind::Pages, &Act::PageMenu)
             }
             Act::AskDeletePage => self.show_overlay(Overlay::Confirm {
@@ -2781,22 +2908,7 @@ impl App {
             }
             Act::Cancel | Act::Outside => self.dismiss(),
             Act::Done => self.done(),
-            Act::Share => self.share(),
-            Act::StopShare => {
-                if let Some(b) = &mut self.board {
-                    b.extra.remove("lanHost");
-                    self.unsaved = true;
-                    self.save_due = Some(self.now + 300);
-                }
-                self.sync_relay_codes();
-                self.dismiss();
-                self.show_toast("Sharing stopped");
-            }
-            Act::Leave => {
-                self.dismiss();
-                self.close_board();
-            }
-            Act::Join => self.ask("Join a board", "", "6-digit code", false, AskFor::Join),
+            Act::Share => self.share_panel(),
             Act::Claude => {
                 self.lan_ip = net::local_ip();
                 self.panel(PanelKind::Claude);
@@ -2826,34 +2938,15 @@ impl App {
                 self.platform.copy_text(&text);
                 self.show_toast("Copied");
             }
-            Act::CopyCode(code) => {
-                self.platform.copy_text(&code);
-                self.show_toast("Code copied");
-            }
             Act::Nothing => {}
+            Act::SignIn | Act::SignOut | Act::Account | Act::Tab(_) | Act::OpenTeam(_) | Act::TeamMenu(_) | Act::RenameTeam(_)
+            | Act::DeleteTeam(_) | Act::CopyToTeam(_) | Act::AddPerson | Act::MemberMenu(_) | Act::SetRole(..)
+            | Act::RemoveMember(_) | Act::OrgAccess(_) => unreachable!("team actions run above"),
         }
     }
 
     fn panel(&mut self, kind: PanelKind) {
         self.show_overlay(Overlay::Panel { kind, scroll: 0.0 });
-    }
-
-    fn share(&mut self) {
-        let Some(board) = &mut self.board else {
-            return;
-        };
-        if !board.extra.contains_key("lanShare") && !board.extra.contains_key("lanHost") {
-            let n = random_token(12)
-                .bytes()
-                .fold(0u64, |a, b| a.wrapping_mul(37).wrapping_add(b as u64));
-            let code = format!("{:06}", 100_000 + n % 900_000);
-            board.extra.insert("lanHost".into(), Value::String(code));
-            self.unsaved = true;
-            self.save_due = Some(self.now + 300);
-            self.sync_relay_codes();
-        }
-        self.lan_ip = net::local_ip();
-        self.panel(PanelKind::Share);
     }
 
     fn new_board_id() -> String {
@@ -2895,6 +2988,10 @@ impl App {
                         } else {
                             name.to_string()
                         };
+                        if self.team_tab() && self.account().is_some() {
+                            self.create_team_board(title);
+                            return;
+                        }
                         let id = Self::new_board_id();
                         let updated = self.timestamp();
                         self.send(Job::Create {
@@ -2904,8 +3001,24 @@ impl App {
                             extra: Map::new(),
                         });
                     }
+                    AskFor::RenameTeam(id) => {
+                        if !name.is_empty() {
+                            self.rename_team(id, name.to_string());
+                        }
+                    }
+                    AskFor::AddPerson => {
+                        if name.contains('@') {
+                            self.invite(name.to_lowercase(), Role::Editor);
+                            self.share_panel();
+                        } else if !name.is_empty() {
+                            self.error_toast("Enter an email address");
+                        }
+                    }
                     AskFor::Rename(id) => {
                         if !name.is_empty() {
+                            if self.board.as_ref().is_some_and(|b| b.id == id) && self.rename_live(name) {
+                                return;
+                            }
                             if let Some(board) = self.board.as_mut().filter(|b| b.id == id) {
                                 board.title = name.to_string();
                                 self.mark_unsaved();
@@ -2928,19 +3041,6 @@ impl App {
                         self.take_editor_events();
                     }
                     AskFor::Math { .. } => unreachable!("handled above"),
-                    AskFor::Join => {
-                        let input = name.to_string();
-                        let relay = self.settings.relay_url.clone();
-                        let wake = self.wake.clone();
-                        let (tx, rx) = mpsc::channel();
-                        self.joining = Some(rx);
-                        std::thread::spawn(move || {
-                            let found = net::discover(&input, &relay);
-                            let _ = tx.send((share_code(&input), found));
-                            wake();
-                        });
-                        self.show_toast("Looking for the board…");
-                    }
                 }
             }
             Overlay::Confirm { purpose, .. } => match purpose {
@@ -2949,6 +3049,11 @@ impl App {
                     self.send(Job::Delete(id));
                 }
                 ConfirmFor::DeletePage => self.change_page(PageChange::Delete),
+                ConfirmFor::DeleteTeam(id) => self.delete_team(id),
+                ConfirmFor::RemoveMember(email) => {
+                    self.remove_member(email);
+                    self.share_panel();
+                }
                 ConfirmFor::Install(url) => {
                     self.show_toast("Downloading the update…");
                     self.platform.install_update(&url);
@@ -3091,6 +3196,43 @@ impl App {
         }
     }
 
+    /// The boards the library shows on the current tab.
+    fn cards(&self) -> Vec<Card> {
+        if self.team_tab() {
+            return team::team_cards(self)
+                .into_iter()
+                .map(|c| {
+                    let local = team::cache_id(&c.board.id);
+                    Card {
+                        open: Act::OpenTeam(c.board.id.clone()),
+                        menu: Act::TeamMenu(c.board.id.clone()),
+                        title: c.board.title.clone(),
+                        subtitle: c.subtitle,
+                        thumb: self.boards.iter().any(|b| b.id == local).then_some(local),
+                    }
+                })
+                .collect();
+        }
+        let stamp = self.timestamp();
+        let today = stamp.get(..10).unwrap_or("");
+        self.boards
+            .iter()
+            .filter(|meta| !meta.id.starts_with(team::CACHE_PREFIX))
+            .map(|meta| {
+                let date = meta.updated.get(..10).unwrap_or(&meta.updated);
+                let date = if date == today { "Today" } else { date };
+                let marks = if meta.shapes == 1 { "mark" } else { "marks" };
+                Card {
+                    open: Act::Open(meta.id.clone()),
+                    menu: Act::CardMenu(meta.id.clone()),
+                    title: meta.title.clone(),
+                    subtitle: format!("{} {marks}  ·  {date}", meta.shapes),
+                    thumb: Some(meta.id.clone()),
+                }
+            })
+            .collect()
+    }
+
     fn library_metrics(&self) -> LibraryGrid {
         let (w, _) = self.extent();
         let margin = if w >= 1200.0 { 96.0 } else { 24.0 };
@@ -3099,8 +3241,8 @@ impl App {
         let columns = (((avail + 32.0) / 340.0).floor() as usize).clamp(1, 4);
         let card_width = ((avail - 32.0 * (columns - 1) as f32) / columns as f32).min(408.0);
         let card_height = card_width * 336.0 / 408.0;
-        let top = 320.0;
-        let rows = self.boards.len().div_ceil(columns);
+        let top = 376.0;
+        let rows = self.cards().len().div_ceil(columns);
         let content = if rows == 0 {
             0.0
         } else {
@@ -3166,9 +3308,9 @@ impl App {
             ),
             (
                 Ico::Join,
-                "Join".to_string(),
-                148.0,
-                Act::Join,
+                self.me().map_or_else(|| "Sign in".to_string(), |u| u.first_name().to_string()),
+                if self.me().is_some() { 200.0 } else { 164.0 },
+                Act::Account,
                 ButtonKind::White,
             ),
         ];
@@ -3217,113 +3359,83 @@ impl App {
             )
             .covering(0.0),
         );
-        if self.boards.is_empty() && self.listed {
-            let y = place_in(h / 2.0 - 120.0, grid.header + 24.0, 420.0);
+        let cards = self.cards();
+        let team = self.team_tab();
+        let segments = segment(
+            Rf::new(margin, 280.0 - scroll, 520.0_f32.min(avail), 64.0),
+            [("On this device", Act::Tab(false)), ("Team boards", Act::Tab(true))],
+            usize::from(team),
+        );
+        let listed = if team { self.team_listed || self.me().is_none() } else { self.listed };
+        if cards.is_empty() && listed {
+            let y = place_in(h / 2.0 - 120.0, grid.header + 24.0, 420.0).max(380.0 - scroll);
             ui.push(square(w / 2.0 - 80.0, y, 160.0), Look::EmptyLogo, None);
-            ui.label(
-                Rf::new(margin, y + 184.0, avail, 48.0),
-                "Make room for ideas.",
-                Face::Bold,
-                36.0,
-                TEXT1,
-                true,
-            );
-            ui.label(
-                Rf::new(margin, y + 240.0, avail, 32.0),
-                "Tap New board to start.",
-                Face::Regular,
-                24.0,
-                TEXT2,
-                true,
-            );
-        } else {
-            ui.label(
-                Rf::new(margin, 168.0 - scroll, avail, 64.0),
-                "Your boards",
-                Face::Bold,
-                56.0,
-                TEXT1,
-                false,
-            );
-            let count = self.boards.len();
-            let subtitle = if !self.listed {
-                "Loading boards…".into()
-            } else {
-                let noun = if count == 1 { "board" } else { "boards" };
-                format!("{count} {noun}  ·  Pick one to keep working, or start a new one.")
+            let (title, line) = match (team, self.me().is_some()) {
+                (false, _) => ("Make room for ideas.", "Tap New board to start."),
+                (true, false) => ("Work on boards together.", "Sign in with your work Google account to see team boards."),
+                (true, true) => ("No team boards yet.", "Tap New board, or copy a board here from its Share button."),
             };
-            ui.label(
-                Rf::new(margin, 232.0 - scroll, avail, 40.0),
-                subtitle,
-                Face::Regular,
-                24.0,
-                TEXT2,
-                false,
-            );
+            ui.label(Rf::new(margin, y + 184.0, avail, 48.0), title, Face::Bold, 36.0, TEXT1, true);
+            ui.label(Rf::new(margin, y + 240.0, avail, 32.0), line, Face::Regular, 24.0, TEXT2, true);
+            if team && self.me().is_none() {
+                let bw = 360.0_f32.min(avail);
+                ui.button(Rf::new((w - bw) / 2.0, y + 296.0, bw, 80.0), Some(Ico::Join), "Sign in with Google", ButtonKind::Primary, true, Act::SignIn);
+            }
+        }
+        ui.label(
+            Rf::new(margin, 168.0 - scroll, avail, 64.0),
+            if team { "Team boards" } else { "Your boards" },
+            Face::Bold,
+            56.0,
+            TEXT1,
+            false,
+        );
+        let count = cards.len();
+        let noun = if count == 1 { "board" } else { "boards" };
+        let subtitle = match (team, self.me()) {
+            (_, _) if !listed => "Loading boards…".to_string(),
+            (true, Some(me)) => format!("{count} {noun}  ·  Signed in as {}", me.email),
+            (true, None) => "Shared boards live on the Inkboard server and update live on every device.".to_string(),
+            (false, _) => format!("{count} {noun}  ·  Kept on this device only."),
+        };
+        ui.label(Rf::new(margin, 232.0 - scroll, avail, 40.0), subtitle, Face::Regular, 24.0, TEXT2, false);
+        for (r, look, act) in segments {
+            ui.push(r, look, act);
         }
 
-        let stamp = self.timestamp();
-        let today = stamp.get(..10).unwrap_or("");
         let cw = grid.card_width;
         let ch = grid.card_height;
-        for (i, meta) in self.boards.iter().enumerate() {
+        for (i, card) in cards.iter().enumerate() {
             let x = margin + (i % grid.columns) as f32 * (cw + 32.0);
             let y = grid.top + (i / grid.columns) as f32 * (ch + 32.0) - scroll;
             // One row on each side of the viewport supports keyboard scrolling.
             if y + ch < grid.header - ch - 32.0 || y > h + ch + 32.0 {
                 continue;
             }
-            let card = Rf::new(x, y, cw, ch);
+            let rect = Rf::new(x, y, cw, ch);
             let factor = cw / 408.0;
-            ui.surface(card, 28.0, 1, Some(Act::Open(meta.id.clone())));
-            let gen = self
-                .thumbs
-                .get(&meta.id)
-                .filter(|t| t.updated == meta.updated)
-                .map_or(0, |t| t.gen);
+            ui.surface(rect, 28.0, 1, Some(card.open.clone()));
+            let gen = card
+                .thumb
+                .as_ref()
+                .and_then(|id| {
+                    let meta = self.boards.iter().find(|b| &b.id == id)?;
+                    self.thumbs.get(id).filter(|t| t.updated == meta.updated).map(|t| t.gen)
+                })
+                .unwrap_or(0);
             ui.push(
-                Rf::new(
-                    x + 8.0,
-                    y + 8.0,
-                    cw - 16.0,
-                    (236.0 * factor).min(ch - 100.0),
-                ),
-                Look::Thumb {
-                    id: meta.id.clone(),
-                    gen,
-                },
+                Rf::new(x + 8.0, y + 8.0, cw - 16.0, (236.0 * factor).min(ch - 100.0)),
+                Look::Thumb { id: card.thumb.clone().unwrap_or_default(), gen },
                 None,
             );
-            let info_y = card.bottom() - 92.0;
+            let info_y = rect.bottom() - 92.0;
             let info_w = cw - 104.0;
-            ui.label(
-                Rf::new(x + 24.0, info_y + 6.0, info_w, 36.0),
-                &meta.title,
-                Face::Bold,
-                26.0,
-                TEXT1,
-                false,
-            );
-            let date = meta.updated.get(..10).unwrap_or(&meta.updated);
-            let date = if date == today { "Today" } else { date };
-            let marks = if meta.shapes == 1 { "mark" } else { "marks" };
-            ui.label(
-                Rf::new(x + 24.0, info_y + 44.0, info_w, 28.0),
-                format!("{} {marks}  ·  {date}", meta.shapes),
-                Face::Regular,
-                20.0,
-                TEXT3,
-                false,
-            );
+            ui.label(Rf::new(x + 24.0, info_y + 6.0, info_w, 36.0), &card.title, Face::Bold, 26.0, TEXT1, false);
+            ui.label(Rf::new(x + 24.0, info_y + 44.0, info_w, 28.0), &card.subtitle, Face::Regular, 20.0, TEXT3, false);
             ui.push(
-                square(card.right() - 80.0, card.bottom() - 84.0, 72.0),
-                Look::IconBtn {
-                    ico: Ico::Kebab,
-                    size: 32.0,
-                    selected: false,
-                    enabled: true,
-                },
-                Some(Act::CardMenu(meta.id.clone())),
+                square(rect.right() - 80.0, rect.bottom() - 84.0, 72.0),
+                Look::IconBtn { ico: Ico::Kebab, size: 32.0, selected: false, enabled: true },
+                Some(card.menu.clone()),
             );
         }
         ui.clip = None;
@@ -3371,11 +3483,7 @@ impl App {
         let margin = 24.0_f32.min(w / 12.0).min(h / 12.0);
         let compact = (w / 460.0).min(h / 380.0).min(1.0);
         let bar_h = 88.0 * compact;
-        let share_chip = if w >= 760.0 && (self.host_code().is_some() || self.joined()) {
-            248.0
-        } else {
-            0.0
-        };
+        let share_chip = if w >= 760.0 && self.live.is_some() { 300.0 } else { 0.0 };
         let right_w = 160.0 * compact + share_chip;
         let left_w = 400.0_f32.min(w - 3.0 * margin - right_w);
         let left = Rf::new(margin, margin, left_w, bar_h);
@@ -3447,9 +3555,7 @@ impl App {
 
         let centered =
             |width: f32, y: f32| Rf::new((w - width * compact) / 2.0, y, width * compact, bar_h);
-        let mut pages = if self.joined() {
-            Rf::default()
-        } else if dock_side == Dock::Bottom {
+        let mut pages = if dock_side == Dock::Bottom {
             let mut r = centered(296.0, margin);
             if overlaps(r, left) || overlaps(r, right) {
                 r.y = top;
@@ -3503,6 +3609,7 @@ impl App {
     }
 
     fn layout_board(&self, ui: &mut Ui, c: &BoardChrome) {
+        self.layout_live(ui);
         if self.pad_shown() {
             let [x, y, w, h] = self.pad_area;
             let (sw, sh) = (self.w as f32, self.h as f32);
@@ -3574,28 +3681,8 @@ impl App {
         );
         ui.surface(c.right, 28.0, 1, Some(Act::Nothing));
         let chip_w = c.right.w - 160.0 * s;
-        let live = self.joined();
-        let code = self.host_code();
         if chip_w > 0.0 {
-            let text = code.as_deref().map_or_else(
-                || {
-                    if self.link_online == Some(true) {
-                        "Live board".into()
-                    } else {
-                        "Connecting…".into()
-                    }
-                },
-                |code| format!("Sharing {}", grouped_code(code)),
-            );
-            ui.push(
-                Rf::new(c.right.x + 8.0, c.right.y + 12.0, chip_w - 12.0, 64.0),
-                Look::StatusDot {
-                    text,
-                    online: !live || self.link_online == Some(true),
-                    chip: true,
-                },
-                Some(Act::Share),
-            );
+            self.layout_people(ui, Rf::new(c.right.x + 4.0, c.right.y + 8.0, chip_w - 4.0, c.right.h - 16.0));
         }
         ui.scaled_icon(
             bar_button(c.right, chip_w / s + 4.0),
@@ -3789,6 +3876,12 @@ impl App {
             let r = c.selection;
             let f = r.h / 88.0;
             let mut x = 8.0;
+            if let Some(line) = self.attribution_line() {
+                let tw = font::measure(Face::Medium, 20.0, &line).0 + 40.0;
+                let tag = Rf::new(r.cx() - tw / 2.0, r.bottom() + 10.0, tw, 44.0);
+                ui.push(tag, Look::Surface { color: SURFACE, radius: 22.0, level: 1, border: false }, None);
+                ui.label(tag, line, Face::Medium, 20.0, TEXT2, true);
+            }
             ui.surface(r, 28.0, 1, Some(Act::Nothing));
             ui.scaled(
                 relative(r, x, 8.0, 72.0, 72.0, f),
@@ -4111,8 +4204,8 @@ impl App {
                 );
                 let ok = match purpose {
                     AskFor::NewBoard => "Create",
-                    AskFor::Rename(_) => "Save",
-                    AskFor::Join => "Join",
+                    AskFor::Rename(_) | AskFor::RenameTeam(_) => "Save",
+                    AskFor::AddPerson => "Invite",
                     AskFor::Text { .. } | AskFor::Cell { .. } | AskFor::Math { .. } => "Done",
                 };
                 self.dialog_buttons(ui, r, inset, "Cancel", ok, ButtonKind::Primary);
@@ -4187,7 +4280,7 @@ impl App {
                 (
                     560.0_f32,
                     vec![
-                        row(Ico::Share, "Share board…", "", false, false, Act::Share),
+                        row(Ico::Share, if self.live.is_some() { "Share and people…" } else { "Share board…" }, "", false, false, Act::Share),
                         row(
                             Ico::Claude,
                             "Connect Claude…",
@@ -4199,7 +4292,14 @@ impl App {
                         row(Ico::Hand, "Phone remote…", "", false, false, Act::Remote),
                         row(Ico::Export, "Export as PNG", "", false, false, Act::Export),
                         row(Ico::Import, "Import boards…", "", false, false, Act::Import),
-                        row(Ico::Join, "Join a board…", "", false, false, Act::Join),
+                        row(
+                            Ico::Join,
+                            if self.me().is_some() { "Account…" } else { "Sign in…" },
+                            self.me().map_or("", |u| u.email.as_str()),
+                            false,
+                            false,
+                            Act::Account,
+                        ),
                         None,
                         row(Ico::Gear, "Settings…", "", true, false, Act::Settings),
                         row(
@@ -4222,7 +4322,7 @@ impl App {
                 )
             }
             MenuKind::Card(id) => (
-                360.0,
+                400.0,
                 vec![
                     row(
                         Ico::Rename,
@@ -4232,6 +4332,11 @@ impl App {
                         false,
                         Act::Rename(id.clone()),
                     ),
+                    if self.me().is_some() {
+                        row(Ico::Share, "Copy to Team boards", "", false, false, Act::CopyToTeam(id.clone()))
+                    } else {
+                        None
+                    },
                     row(
                         Ico::Trash,
                         "Delete",
@@ -4242,6 +4347,7 @@ impl App {
                     ),
                 ],
             ),
+            MenuKind::TeamCard(_) | MenuKind::Member(_) => team::menu_rows(self, kind).unwrap_or((320.0, Vec::new())),
             MenuKind::Pages => (
                 320.0,
                 vec![row(
@@ -4310,21 +4416,6 @@ impl App {
                 y += 16.0 * k;
             }
         }
-    }
-
-    fn host_code(&self) -> Option<String> {
-        self.board
-            .as_ref()?
-            .extra
-            .get("lanHost")?
-            .as_str()
-            .map(str::to_string)
-    }
-
-    fn relay_online(&self) -> bool {
-        self.relay
-            .as_ref()
-            .is_some_and(|r| r.online.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn remote_url(&self) -> Option<String> {
@@ -4530,16 +4621,6 @@ impl App {
         ))
     }
 
-    fn public_mcp(&self) -> Option<String> {
-        let base = self.settings.relay_url.trim_end_matches('/');
-        (!base.is_empty()).then(|| {
-            format!(
-                "{base}/d/{}/mcp/{}",
-                self.settings.relay_id, self.settings.mcp_key
-            )
-        })
-    }
-
     fn panel_frame(&self, kind: PanelKind) -> Rf {
         let (w, h) = self.extent();
         let (width, height) = match kind {
@@ -4547,8 +4628,8 @@ impl App {
             PanelKind::Claude => (960.0, 940.0),
             PanelKind::Remote => (760.0, 900.0),
             PanelKind::Fonts => (960.0, 760.0),
-            PanelKind::Share if self.joined() => (880.0, 380.0),
-            PanelKind::Share => (880.0, 700.0),
+            PanelKind::Share => (880.0, 820.0),
+            PanelKind::Account => (720.0, 920.0),
         };
         let dw = width.min(w - 48.0).max(0.0);
         let dh = height.min(h - 32.0).max(0.0);
@@ -4557,7 +4638,7 @@ impl App {
 
     fn panel_viewport(&self, kind: PanelKind, r: Rf) -> Rf {
         let inset = match kind {
-            PanelKind::Share => 48.0_f32,
+            PanelKind::Share | PanelKind::Account => 48.0_f32,
             PanelKind::Settings => 40.0,
             PanelKind::Claude | PanelKind::Fonts | PanelKind::Remote => 24.0,
         }
@@ -4639,19 +4720,6 @@ impl App {
             }
             PanelKind::Claude => {
                 content.para("Add Inkboard as an MCP connector so Claude can read and edit the open board, add diagrams and get a picture of it.", TEXT2);
-                content.heading("From anywhere");
-                let online = self.relay_online();
-                content.status(
-                    if online {
-                        "Relay online"
-                    } else {
-                        "Relay offline"
-                    },
-                    online,
-                );
-                if let Some(url) = self.public_mcp() {
-                    content.copy_code(&url);
-                }
                 content.heading("On this network");
                 if let Some(url) = self.lan_mcp() {
                     content.status("Local address available", true);
@@ -4663,47 +4731,17 @@ impl App {
                     );
                 }
                 content.heading("Claude Code");
-                if let Some(url) = self.public_mcp().or_else(|| self.lan_mcp()) {
+                if let Some(url) = self.lan_mcp() {
                     content.copy_code(&format!("claude mcp add --transport http inkboard {url}"));
                 }
-                content.para("In Claude, open Settings → Connectors → Add custom connector. Name it Inkboard and paste the address from anywhere.", TEXT2);
+                content.para("In Claude, open Settings → Connectors → Add custom connector. Name it Inkboard and paste the local address. The computer running Claude must be on the same network.", TEXT2);
                 content.para(
                     "Anyone with these addresses can change the open board. Keep them private.",
                     DANGER,
                 );
             }
-            PanelKind::Share => {
-                if let Some(code) = self.host_code() {
-                    content.para(
-                        "On another device open Inkboard, tap Join and enter this code.",
-                        TEXT2,
-                    );
-                    content.y = content.y.max(84.0);
-                    content.push(
-                        184.0,
-                        Look::ShareCode(code.clone()),
-                        Some(Act::CopyCode(code)),
-                    );
-                    content.y += 16.0;
-                    let online = self.relay_online();
-                    let route = if online {
-                        "Same network: direct. Other networks: via relay (online)"
-                    } else {
-                        "Same network: direct. Relay offline."
-                    };
-                    content.status(route, online);
-                    if let Some(ip) = self.lan_ip {
-                        content.heading(&format!("THIS PANEL  {ip}"));
-                    }
-                } else {
-                    let state = match self.link_online {
-                        Some(true) => "This board is live: changes appear on both devices.",
-                        Some(false) => "Reconnecting to the device sharing this board…",
-                        None => "Connecting to the device sharing this board…",
-                    };
-                    content.para(state, TEXT2);
-                }
-            }
+            PanelKind::Share => self.share_rows(&mut content),
+            PanelKind::Account => self.account_rows(&mut content),
         }
         (content.rows, content.y)
     }
@@ -4831,11 +4869,12 @@ impl App {
         let r = self.panel_frame(kind);
         let view = self.panel_viewport(kind, r);
         let title = match kind {
-            PanelKind::Share => {
-                if self.joined() {
-                    "Shared board"
+            PanelKind::Share => "Share this board",
+            PanelKind::Account => {
+                if self.me().is_some() {
+                    "Your account"
                 } else {
-                    "Share this board"
+                    "Sign in"
                 }
             }
             PanelKind::Claude => "Connect Claude",
@@ -4872,85 +4911,18 @@ impl App {
         if kind == PanelKind::Share {
             let y = r.bottom() - 120.0;
             let scale = (view.w / 632.0).min(1.0);
-            let end = view.right();
             ui.button(
-                Rf::new(end - 176.0 * scale, y, 176.0 * scale, 72.0),
+                Rf::new(view.right() - 176.0 * scale, y, 176.0 * scale, 72.0),
                 None,
                 "Done",
                 ButtonKind::Primary,
                 false,
                 Act::Done,
             );
-            if let Some(code) = self.host_code() {
-                ui.button(
-                    Rf::new(end - 368.0 * scale, y, 176.0 * scale, 72.0),
-                    Some(Ico::Copy),
-                    "Copy",
-                    ButtonKind::Secondary,
-                    false,
-                    Act::CopyCode(code),
-                );
-                ui.button(
-                    Rf::new(view.x, y, 248.0 * scale, 72.0),
-                    None,
-                    "Stop sharing",
-                    ButtonKind::DangerTint,
-                    false,
-                    Act::StopShare,
-                );
-            } else {
-                ui.button(
-                    Rf::new(view.x, y, 176.0 * scale, 72.0),
-                    None,
-                    "Leave",
-                    ButtonKind::DangerTint,
-                    false,
-                    Act::Leave,
-                );
-            }
         }
     }
 
-    // ------------------------------------------------------------ sharing
-
-    fn shape_map(&self) -> HashMap<String, Value> {
-        self.ed
-            .doc
-            .shapes()
-            .iter()
-            .map(|s| (s.id.clone(), s.to_json()))
-            .collect()
-    }
-
-    /// Joined boards remember where they came from; reopening reconnects.
-    fn start_link(&mut self) {
-        self.link = None;
-        self.known.clear();
-        self.link_online = None;
-        let Some(share) = self.board.as_ref().and_then(|b| b.extra.get("lanShare")) else {
-            return;
-        };
-        let (Some(host), Some(code)) = (share["host"].as_str(), share["code"].as_str()) else {
-            return;
-        };
-        self.known = self.shape_map();
-        self.ops_sent = 0;
-        self.link = Some(net::link(
-            host.to_string(),
-            code.to_string(),
-            self.wake.clone(),
-        ));
-    }
-
-    /// Tells the relay which share codes may be looked up.
-    fn sync_relay_codes(&mut self) {
-        let code = self.host_code().unwrap_or_default();
-        if let Some(relay) = &self.relay {
-            if let Ok(mut c) = relay.codes.lock() {
-                *c = code;
-            }
-        }
-    }
+    // ------------------------------------------------------------ network
 
     fn take_net(&mut self) {
         while let Ok(req) = self.net_rx.try_recv() {
@@ -4974,143 +4946,7 @@ impl App {
         if path == "/health" {
             return net::Resp::json(200, &json!({ "app": "Inkboard", "version": self.version }));
         }
-        let Some(what) = path.strip_prefix("/canvas/") else {
-            return net::Resp::empty(404);
-        };
-        let code = req.query.get("code").cloned().unwrap_or_default();
-        if code.is_empty() || self.host_code().as_deref() != Some(code.as_str()) {
-            return net::Resp::json(
-                404,
-                &json!({ "error": "No board is shared with that code" }),
-            );
-        }
-        match what {
-            "hello" => {
-                let name = self
-                    .board
-                    .as_ref()
-                    .map(|b| b.title.clone())
-                    .unwrap_or_default();
-                net::Resp::json(200, &json!({ "name": name }))
-            }
-            "board" => {
-                let since = req.query.get("since").and_then(|s| s.parse::<u64>().ok());
-                if let Some(offset) = req.query.get("offset").and_then(|s| s.parse::<usize>().ok()) {
-                    if offset == 0 && since == Some(self.doc_gen) {
-                        return net::Resp::json(200, &json!({ "revision": self.doc_gen }));
-                    }
-                    if offset > 0 && since != Some(self.doc_gen) {
-                        return net::Resp::empty(409);
-                    }
-                    return net::snapshot(self.ed.doc.shapes(), self.doc_gen, offset);
-                }
-                let mut v = json!({ "revision": self.doc_gen });
-                if since != Some(self.doc_gen) {
-                    v["shapes"] =
-                        Value::Array(self.ed.doc.shapes().iter().map(|s| s.to_json()).collect());
-                }
-                net::Resp::json(200, &v)
-            }
-            "ops" if req.method == "POST" => {
-                let ops = serde_json::from_slice::<Value>(&req.body)
-                    .ok()
-                    .and_then(|v| v["operations"].as_array().cloned())
-                    .unwrap_or_default();
-                match net::parse_ops(&ops) {
-                    Ok((put, remove)) => {
-                        if !put.is_empty() || !remove.is_empty() {
-                            self.ed.apply_remote(put, remove);
-                            self.take_editor_events();
-                        }
-                        net::Resp::json(200, &json!({ "revision": self.doc_gen }))
-                    }
-                    Err(e) => net::Resp::json(400, &json!({ "error": e })),
-                }
-            }
-            _ => net::Resp::empty(404),
-        }
-    }
-
-    fn take_link(&mut self) {
-        let mut snapshot = None;
-        let mut status = None;
-        if let Some(link) = &self.link {
-            while let Ok(ev) = link.events.try_recv() {
-                match ev {
-                    net::LinkEvent::Snapshot {
-                        shapes, batches, ..
-                    } => {
-                        if batches >= self.ops_sent {
-                            snapshot = Some(shapes);
-                        }
-                    }
-                    net::LinkEvent::Status(on) => status = Some(on),
-                }
-            }
-        }
-        if let Some(on) = status {
-            if self.link_online != Some(on) {
-                self.link_online = Some(on);
-                self.full = true;
-            }
-        }
-        let Some(shapes) = snapshot else {
-            return;
-        };
-        let theirs: HashMap<String, Value> = shapes
-            .into_iter()
-            .filter_map(|v| Some((v["id"].as_str()?.to_string(), v)))
-            .collect();
-        let mine = self.shape_map();
-        let mut put = Vec::new();
-        for (id, v) in &theirs {
-            if mine.get(id) != Some(v) {
-                if let Ok(s) = Shape::from_json(v) {
-                    put.push(s);
-                }
-            }
-        }
-        let remove: Vec<String> = mine
-            .keys()
-            .filter(|id| !theirs.contains_key(*id))
-            .cloned()
-            .collect();
-        // What the host has is now known, so these changes are not sent back.
-        self.known = theirs;
-        if !put.is_empty() || !remove.is_empty() {
-            self.ed.apply_remote(put, remove);
-            self.take_editor_events();
-        }
-    }
-
-    fn take_join(&mut self) {
-        let Some(rx) = &self.joining else {
-            return;
-        };
-        let Ok((code, found)) = rx.try_recv() else {
-            return;
-        };
-        self.joining = None;
-        match found {
-            Ok((host, name)) => {
-                let mut extra = Map::new();
-                extra.insert("lanShare".into(), json!({ "host": host, "code": code }));
-                let title = if name.is_empty() {
-                    "Shared board".to_string()
-                } else {
-                    name
-                };
-                let id = Self::new_board_id();
-                let updated = self.timestamp();
-                self.send(Job::Create {
-                    id,
-                    title,
-                    updated,
-                    extra,
-                });
-            }
-            Err(e) => self.error_toast(&e),
-        }
+        net::Resp::empty(404)
     }
 
     fn dialog_buttons(
@@ -5592,27 +5428,8 @@ impl App {
                     );
                 }
             }
-            Look::ShareCode(code) => {
-                p.rrect(r, 28.0 * u, if pressed { 0xffe3e6ee } else { SURFACE2 });
-                let scale = u.min((r.w - 24.0 * u) / 408.0);
-                let cell = 64.0 * scale;
-                let x = r.cx() - 204.0 * scale;
-                for (i, digit) in code.chars().enumerate() {
-                    let gap = if i >= 3 { 24.0 * scale } else { 0.0 };
-                    let rect = Rf::new(x + i as f32 * cell + gap, r.y, cell, r.h);
-                    let mut encoded = [0; 4];
-                    let digit = digit.encode_utf8(&mut encoded);
-                    let size = 112.0 * scale;
-                    let dx = font::measure(Face::Bold, size, digit).0 / 2.0;
-                    p.text(
-                        Face::Bold,
-                        size,
-                        digit,
-                        rect.cx() - dx,
-                        baseline(rect, Face::Bold, size),
-                        TEXT1,
-                    );
-                }
+            Look::Cursor { .. } | Look::Outline { .. } | Look::Avatar { .. } => {
+                team::draw_look(p, &n.look, r, u);
             }
             Look::StatusDot { text, online, chip } => {
                 let bg = if *chip { ACCENT_TINT } else { SURFACE2 };
@@ -5787,12 +5604,6 @@ fn line_text(p: &mut Painter, r: Rf, face: Face, size: f32, text: &str, color: u
     p.text_fit(face, size, text, x, baseline(r, face, size), r.w, color);
 }
 
-fn grouped_code(code: &str) -> String {
-    match (code.get(..3), code.get(3..)) {
-        (Some(a), Some(b)) => format!("{a} {b}"),
-        _ => code.to_string(),
-    }
-}
 
 type UiRow = (Rf, Look, Option<Act>);
 
@@ -6024,7 +5835,7 @@ impl net::Board for App {
             if put.is_empty() {
                 self.ed.delete_shapes(remove);
             } else {
-                self.ed.apply_remote(put, remove);
+                self.ed.apply_shapes(put, remove);
             }
             self.take_editor_events();
         }
@@ -6272,7 +6083,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_and_sharing_reach_the_open_board() {
+    fn claude_reaches_the_open_board_and_sharing_moves_to_team_boards() {
         let (mut app, dir) = app();
         app.resize(1280, 800, 1.5);
         settle(&mut app);
@@ -6312,71 +6123,18 @@ mod tests {
         let png = net::unbase64(image["result"]["content"][0]["data"].as_str().unwrap());
         assert_eq!(&png[1..4], b"PNG");
 
-        // Not shared yet: the canvas endpoints refuse.
-        assert_eq!(
-            req(
-                &mut app,
-                "GET",
-                "/canvas/hello",
-                &[("code", "123456")],
-                Value::Null
-            )
-            .0,
-            404
-        );
+        // The old local-network sharing endpoints are gone.
+        assert_eq!(req(&mut app, "GET", "/canvas/hello", &[("code", "123456")], Value::Null).0, 404);
+        // A board on this device offers to move to Team boards; signed out,
+        // that starts sign-in instead of failing.
         app.run(Act::Share);
-        let code = app.host_code().unwrap();
-        assert_eq!(code.len(), 6);
-        assert!(matches!(
-            app.overlay,
-            Some(Overlay::Panel {
-                kind: PanelKind::Share,
-                ..
-            })
-        ));
-        app.frame(5000);
-        let (_, hello) = req(
-            &mut app,
-            "GET",
-            "/canvas/hello",
-            &[("code", &code)],
-            Value::Null,
-        );
-        assert_eq!(hello["name"], "Team");
-        let (_, board) = req(
-            &mut app,
-            "GET",
-            "/canvas/board",
-            &[("code", &code), ("since", "0")],
-            Value::Null,
-        );
-        assert_eq!(board["shapes"].as_array().unwrap().len(), 2);
-        let rev = board["revision"].as_u64().unwrap().to_string();
-        let (_, same) = req(
-            &mut app,
-            "GET",
-            "/canvas/board",
-            &[("code", &code), ("since", &rev)],
-            Value::Null,
-        );
-        assert!(same.get("shapes").is_none());
-        let ops = json!({"operations":[{"type":"delete","id":"c2"}]});
-        let (status, _) = req(&mut app, "POST", "/canvas/ops", &[("code", &code)], ops);
-        assert_eq!(status, 200);
-        assert_eq!(app.ed.doc.shapes().len(), 1);
-        app.run(Act::StopShare);
-        assert!(app.host_code().is_none());
-        assert_eq!(
-            req(
-                &mut app,
-                "GET",
-                "/canvas/hello",
-                &[("code", &code)],
-                Value::Null
-            )
-            .0,
-            404
-        );
+        assert!(matches!(app.overlay, Some(Overlay::Panel { kind: PanelKind::Share, .. })));
+        let (rows, _) = app.panel_rows(PanelKind::Share, 700.0);
+        assert!(rows.iter().any(|(_, _, act)| matches!(act, Some(Act::CopyToTeam(_)))));
+        app.dismiss();
+        app.run(Act::Tab(true));
+        assert!(app.team_tab());
+        assert!(app.cards().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6409,7 +6167,6 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap())
                 .unwrap();
         assert_eq!(saved["mcpKey"], app.settings.mcp_key.as_str());
-        assert_eq!(share_code("join 654321 please"), "654321");
         assert_eq!(wrap_chars(14.0, "abcdefghij", 30.0).concat(), "abcdefghij");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6782,9 +6539,7 @@ mod tests {
         let pixel = exported.pixel(exported.width() / 2, exported.height() / 2).unwrap();
         assert_eq!((pixel.red(), pixel.green(), pixel.blue()), (255, 0, 0));
 
-        let response = net::snapshot(app.ed.doc.shapes(), app.doc_gen, 0);
-        let page: Value = serde_json::from_slice(&response.body).unwrap();
-        let shared = Shape::from_json(&page["shapes"][0]).unwrap();
+        let shared = Shape::from_json(&app.ed.doc.shapes()[0].to_json()).unwrap();
         assert_eq!(&shared, app.ed.doc.shapes()[0].as_ref());
         let _ = std::fs::remove_dir_all(dir);
     }

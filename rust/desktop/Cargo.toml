@@ -1,0 +1,20 @@
+[package]
+name = "inkboard_desktop"
+version = "0.9.0"
+edition = "2021"
+description = "Inkboard for macOS, Windows and Linux: the same Rust app as on Android, in a desktop window"
+
+[[bin]]
+name = "inkboard"
+path = "src/main.rs"
+
+[dependencies]
+canvas_core = { path = "../core" }
+winit = "0.30.13"
+softbuffer = "0.4.8"
+cosmic-text = { version = "0.19", default-features = false, features = ["std", "swash", "fontconfig"] }
+arboard = { version = "3.7", default-features = false }
+rfd = "0.18"
+dirs = "7"
+serde_json = "1"
+

@@ -17,3 +17,4 @@ resvg = { version = "0.45", default-features = false, features = ["text", "raste
 sha2 = "0.10"
 qrcode = { version = "0.14", default-features = false }
 zip = { version = "4.6", default-features = false, features = ["deflate-flate2"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

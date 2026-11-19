@@ -581,8 +581,18 @@ impl Editor {
     }
 
     /// Brings in shapes changed on another device: `put` adds or replaces,
-    /// `remove` deletes. It is one undo step, like any other change.
+    /// `remove` deletes. Others' changes are not undone by this person's undo.
     pub fn apply_remote(&mut self, put: Vec<Shape>, remove: Vec<String>) {
+        self.merge(put, remove, false);
+    }
+
+    /// Adds or replaces `put` and deletes `remove` as one undo step, for
+    /// shapes made outside the editor (imports, Claude).
+    pub fn apply_shapes(&mut self, put: Vec<Shape>, remove: Vec<String>) {
+        self.merge(put, remove, true);
+    }
+
+    fn merge(&mut self, put: Vec<Shape>, remove: Vec<String>, undoable: bool) {
         let mut drop: Vec<String> = remove;
         let mut add: Vec<Shape> = Vec::new();
         for s in put {
@@ -597,7 +607,7 @@ impl Editor {
         if drop.is_empty() && add.is_empty() {
             return;
         }
-        let applied = self.doc.swap(drop, add);
+        let applied = if undoable { self.doc.swap(drop, add) } else { self.doc.apply_remote(drop, add) };
         self.on_applied(applied);
     }
 

@@ -289,6 +289,11 @@ impl Shape {
     }
 
     pub fn from_json(v: &Value) -> Result<Shape, String> {
+        Self::from_json_with_images(v, &|_| None)
+    }
+
+    /// Like [`Shape::from_json`], finding `imageRef` images through `images`.
+    pub(crate) fn from_json_with_images(v: &Value, images: &dyn Fn(&str) -> Option<Arc<ImageAsset>>) -> Result<Shape, String> {
         let o = v.as_object().ok_or("Shape must be an object.")?;
         let id = o.get("id").and_then(Value::as_str).ok_or("Shape id missing.")?;
         let tool = o
@@ -340,9 +345,12 @@ impl Shape {
             if shape.points.len() != 2 || bounds.shortest_side() <= 0.0 || !bounds.longest_side().is_finite() {
                 return Err("Images need two opposite box corners.".into());
             }
-            let data = o.get("imageData").and_then(Value::as_str).ok_or("Image data missing.")?;
             let background = o.get("pageBackground").and_then(Value::as_bool).unwrap_or(false);
-            shape = shape.with_image(Arc::new(ImageAsset::from_base64(data)?), background);
+            let image = match o.get("imageData").and_then(Value::as_str) {
+                Some(data) => Arc::new(ImageAsset::from_base64(data)?),
+                None => o.get("imageRef").and_then(Value::as_str).and_then(images).ok_or("Image data missing.")?,
+            };
+            shape = shape.with_image(image, background);
         }
         if tool == Tool::MindNode {
             shape.parent_id = o.get("parentId").and_then(Value::as_str)
