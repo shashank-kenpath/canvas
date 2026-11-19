@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#f7f6fb">
+<title>Inkboard</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="manifest" href="manifest.webmanifest">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #f7f6fb; overscroll-behavior: none; }
+  body { font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: #1b1a22; }
+  #board { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block; touch-action: none; outline: none; cursor: default; }
+  /* Stands in for the on-screen keyboard: present and focusable, never seen. */
+  #field { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; resize: none; font-size: 16px; }
+  #splash { position: fixed; inset: 0; display: grid; place-items: center; background: #f7f6fb; transition: opacity .3s; z-index: 2; }
+  #splash.gone { opacity: 0; pointer-events: none; }
+  .card { display: grid; justify-items: center; gap: 14px; text-align: center; padding: 16px; }
+  .card img { width: 72px; height: 72px; }
+  .card strong { font-size: 22px; letter-spacing: -0.01em; }
+  .bar { width: 220px; height: 6px; border-radius: 3px; background: #e6e3ef; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: #6750d8; transition: width .2s; }
+  #status { color: #5f5d6b; font-size: 14px; min-height: 21px; }
+  #status a { color: #6750d8; }
+  @media (prefers-color-scheme: dark) {
+    html, body, #splash { background: #121118; color: #f1f0f6; }
+    .bar { background: #2d2b38; } #status { color: #a7a4b5; }
+  }
+</style>
+</head>
+<body>
+<canvas id="board" tabindex="0" aria-label="Inkboard whiteboard"></canvas>
+<textarea id="field" autocomplete="off" autocapitalize="sentences" spellcheck="true" aria-hidden="true"></textarea>
+<div id="splash" role="status">
+  <div class="card">
+    <img src="icon.svg" alt="">
+    <strong>Inkboard</strong>
+    <div class="bar"><i id="progress"></i></div>
+    <div id="status">Loading…</div>
+  </div>
+</div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

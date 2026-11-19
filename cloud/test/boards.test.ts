@@ -187,3 +187,22 @@ describe("assets", () => {
     expect((await api(null, "GET", `/api/assets/${digest}`)).status).toBe(401);
   });
 });
+
+describe("web app sockets", () => {
+  it("accepts the session token as a WebSocket subprotocol", async () => {
+    const { SELF } = await import("cloudflare:test");
+    const webby = await signIn("webby@example.com");
+    const board = await newBoard(webby);
+    const res = await SELF.fetch(`https://inkboard.test/api/boards/${board.id}/socket`, {
+      headers: { upgrade: "websocket", "sec-websocket-protocol": `inkboard, bearer.${webby.token}` },
+    });
+    expect(res.status).toBe(101);
+    expect(res.headers.get("sec-websocket-protocol")).toBe("inkboard");
+    res.webSocket?.accept();
+    res.webSocket?.close();
+    const bad = await SELF.fetch(`https://inkboard.test/api/boards/${board.id}/socket`, {
+      headers: { upgrade: "websocket", "sec-websocket-protocol": "inkboard, bearer.nope" },
+    });
+    expect(bad.status).toBe(401);
+  });
+});

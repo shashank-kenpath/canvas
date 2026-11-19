@@ -5,6 +5,7 @@
 use super::replica::Replica;
 use super::room::{open, Images, RoomEvent};
 use super::*;
+use std::time::Duration;
 use crate::import::ImageAsset;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
@@ -45,19 +46,19 @@ fn two_devices_edit_one_board_live() {
     let Some((server, ta, tb)) = env() else { return };
     let ana = Account { server: server.clone(), token: ta, user: User::default() };
     let ben = Account { server: server.clone(), token: tb, user: User::default() };
-    let me_a = User::from_json(&http::api(&server, "GET", "/api/me", Some(&ana.token), None).unwrap()).unwrap();
-    let me_b = User::from_json(&http::api(&server, "GET", "/api/me", Some(&ben.token), None).unwrap()).unwrap();
+    let me_a = User::from_json(&http::api_blocking(&server, "GET", "/api/me", Some(&ana.token), None).unwrap()).unwrap();
+    let me_b = User::from_json(&http::api_blocking(&server, "GET", "/api/me", Some(&ben.token), None).unwrap()).unwrap();
 
-    let board = create_board(&ana, "Live test").unwrap();
+    let board = block_on(create_board(&ana, "Live test")).unwrap();
     assert_eq!(board.role, Role::Owner);
     // Ben cannot get in until the board is shared.
     let images: Images = Default::default();
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
     let refused = open(server.clone(), ben.token.clone(), board.id.clone(), images.clone(), wake.clone());
     assert!(matches!(wait(&refused.events, |e| matches!(e, RoomEvent::Refused { .. })), RoomEvent::Refused { status: 403, .. }));
-    let shared = add_member(&ana, &board.id, &me_b.email, Role::Editor).unwrap();
+    let shared = block_on(add_member(&ana, &board.id, &me_b.email, Role::Editor)).unwrap();
     assert_eq!(shared.members.len(), 1);
-    assert!(list_boards(&ben).unwrap().iter().any(|b| b.id == board.id && b.role == Role::Editor));
+    assert!(block_on(list_boards(&ben)).unwrap().iter().any(|b| b.id == board.id && b.role == Role::Editor));
 
     let a = open(server.clone(), ana.token.clone(), board.id.clone(), images.clone(), wake.clone());
     let b_images: Images = Default::default();
@@ -107,7 +108,7 @@ fn two_devices_edit_one_board_live() {
     assert_eq!(changes.del, vec!["p1/s1".to_string()]);
 
     // Removing Ben from the board closes his room.
-    remove_member(&ana, &board.id, &me_b.email).unwrap();
+    block_on(remove_member(&ana, &board.id, &me_b.email)).unwrap();
     assert!(matches!(wait(&b.events, |e| matches!(e, RoomEvent::Refused { .. })), RoomEvent::Refused { status: 403, .. }));
-    delete_board(&ana, &board.id).unwrap();
+    block_on(delete_board(&ana, &board.id)).unwrap();
 }

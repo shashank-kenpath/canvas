@@ -326,10 +326,9 @@ fn base36(mut n: u128) -> String {
 }
 
 fn micros() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros())
-        .unwrap_or(0)
+    // Distinct even when called twice in the same millisecond.
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::sys::now_ms() as u128 * 1000 + (TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1000) as u128
 }
 
 fn corners(r: &Rect) -> [Pt; 4] {

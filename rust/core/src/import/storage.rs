@@ -2,7 +2,7 @@
 
 use super::{ImageAsset, MAX_ASSET_BYTES};
 use serde_json::Value;
-use std::fs;
+use crate::sys::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,7 +82,7 @@ fn write(dir: &Path, hash: &str, bytes: &[u8]) -> std::io::Result<()> {
         return Ok(());
     }
     fs::create_dir_all(dir)?;
-    let temp = dir.join(format!("{}-{}.tmp", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let temp = dir.join(format!("{}-{}.tmp", crate::sys::now_ms(), NEXT.fetch_add(1, Ordering::Relaxed)));
     let mut file = fs::File::create_new(&temp)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);

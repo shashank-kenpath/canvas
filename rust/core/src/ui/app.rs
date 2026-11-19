@@ -105,6 +105,8 @@ pub trait Platform: Send {
     fn set_fast_ink(&mut self, _on: bool) {}
     /// Puts `text` on the clipboard.
     fn copy_text(&mut self, _text: &str) {}
+    /// Opens `url` in a browser. Hosts that cannot leave it alone.
+    fn open_url(&mut self, _url: &str) {}
     /// Saves a PNG picture to the device's Pictures.
     fn save_png(&mut self, _name: &str, _png: &[u8]) {}
     /// Lets the user choose board files to bring in. The host answers with
@@ -230,6 +232,7 @@ enum Done {
     File(i32, Result<Imported, String>),
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn disk_worker(
     dir: PathBuf,
     jobs: Receiver<Job>,
@@ -237,7 +240,19 @@ fn disk_worker(
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
     while let Ok(job) = jobs.recv() {
-        let out = match job {
+        let Some(out) = disk_job(&dir, job) else { continue };
+        if done.send(out).is_err() {
+            return;
+        }
+        wake();
+    }
+}
+
+/// Does one piece of disk work. `None` when there is nothing to report.
+fn disk_job(dir: &Path, job: Job) -> Option<Done> {
+    let dir = dir.to_path_buf();
+    Some({
+        match job {
             Job::List => Done::Listed(store::list(&dir)),
             Job::Thumb { id, updated, w, h } => match store::load_pages(&dir, &id, false) {
                 Ok(board) => {
@@ -250,7 +265,7 @@ fn disk_worker(
                         rgba: render::thumbnail(&shapes, w, h),
                     }
                 }
-                Err(_) => continue,
+                Err(_) => return None,
             },
             Job::Load(id) => {
                 let result = store::load(&dir, &id);
@@ -330,12 +345,8 @@ fn disk_worker(
                     list: store::list(&dir),
                 }
             }
-        };
-        if done.send(out).is_err() {
-            return;
         }
-        wake();
-    }
+    })
 }
 
 // ------------------------------------------------------------ settings
@@ -400,7 +411,7 @@ fn random_token(len: usize) -> String {
 
 impl Settings {
     fn load(path: &Path) -> Settings {
-        let v: Value = std::fs::read_to_string(path)
+        let v: Value = crate::sys::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(Value::Null);
@@ -476,8 +487,8 @@ impl Settings {
             "account": self.account.as_ref().map(|a| serde_json::json!({ "server": a.server, "token": a.token, "user": a.user.to_json() })),
         });
         let tmp = path.with_extension("tmp");
-        if std::fs::write(&tmp, v.to_string()).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+        if crate::sys::fs::write(&tmp, v.to_string()).is_ok() {
+            let _ = crate::sys::fs::rename(&tmp, path);
         }
     }
 }
@@ -606,6 +617,8 @@ enum Act {
     /// Ends the phone pad and makes its link stop working.
     PadDisconnect,
     Copy(String),
+    /// Opens a web address in the system browser (web: a new tab).
+    OpenUrl(String),
     /// A surface that takes touches so they do not fall through.
     Nothing,
     Outside,
@@ -1136,6 +1149,9 @@ pub struct App {
     settings: Settings,
 
     jobs: Sender<Job>,
+    /// Without threads, disk work runs at the start of each frame.
+    #[cfg(target_arch = "wasm32")]
+    disk: (PathBuf, Receiver<Job>),
     done: Receiver<Done>,
     file_done: Sender<Done>,
 
@@ -1265,10 +1281,7 @@ fn civil(days: i64) -> (i64, u32, u32) {
 }
 
 fn wall_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    crate::sys::now_ms()
 }
 
 fn base36(mut v: u64) -> String {
@@ -1297,15 +1310,21 @@ impl App {
         utc_offset_min: i32,
         wake: Arc<dyn Fn() + Send + Sync>,
     ) -> App {
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = crate::sys::fs::create_dir_all(&dir);
         let (jobs, job_rx) = mpsc::channel();
         let (done_tx, done) = mpsc::channel();
         let file_done = done_tx.clone();
         let worker_dir = dir.clone();
         let disk_wake = wake.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = std::thread::Builder::new()
             .name("boards".into())
             .spawn(move || disk_worker(worker_dir, job_rx, done_tx, disk_wake));
+        #[cfg(target_arch = "wasm32")]
+        let disk = {
+            let _ = (done_tx, disk_wake);
+            (worker_dir, job_rx)
+        };
         let settings = Settings::load(&settings_path);
         settings.save(&settings_path);
         let (net_tx, net_rx) = mpsc::channel();
@@ -1320,6 +1339,8 @@ impl App {
             settings_path,
             settings,
             jobs,
+            #[cfg(target_arch = "wasm32")]
+            disk,
             done,
             file_done,
             w: 0,
@@ -1707,6 +1728,20 @@ impl App {
     // ------------------------------------------------------------- disk
 
     fn take_disk(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut worked = false;
+            while let Ok(job) = self.disk.1.try_recv() {
+                worked = true;
+                if let Some(out) = disk_job(&self.disk.0, job) {
+                    let _ = self.file_done.send(out);
+                }
+            }
+            // Results may queue more work; ask for another frame as the worker thread would.
+            if worked {
+                (self.wake)();
+            }
+        }
         while let Ok(done) = self.done.try_recv() {
             match done {
                 Done::File(token, result) => self.apply_file(token, result),
@@ -2934,6 +2969,7 @@ impl App {
                     None => self.error_toast("Could not make the picture"),
                 }
             }
+            Act::OpenUrl(url) => self.platform.open_url(&url),
             Act::Copy(text) => {
                 self.platform.copy_text(&text);
                 self.show_toast("Copied");

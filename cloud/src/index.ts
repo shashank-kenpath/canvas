@@ -1,6 +1,9 @@
 // HTTP API for the Inkboard apps. Everything except sign-in needs
 // `Authorization: Bearer <session token>`.
 //
+//   GET    /                             the website (src/site.ts)
+//   GET    /download/:platform           mac|windows|linux|android -> newest release
+//
 //   POST   /api/auth/device              start a Google sign-in, returns a code to show
 //   POST   /api/auth/device/poll         {handle} -> 202 pending | 200 {token, user}
 //   GET    /api/me                       the signed-in person
@@ -18,6 +21,7 @@
 
 import { authenticate, emailAllowed, pollDeviceLogin, revokeSession, startDeviceLogin } from "./auth";
 import type { Env, Person, Role, User } from "./env";
+import { download, homePage } from "./site";
 import { HttpError, colorFor, error, json, now, readJson, sha256Hex } from "./util";
 
 export { BoardRoom } from "./room";
@@ -54,6 +58,11 @@ async function route(req: Request, env: Env): Promise<Response> {
   const method = req.method;
 
   if (path === "/health") return json({ app: "Inkboard", ok: true });
+  if (method === "GET" || method === "HEAD") {
+    if (path === "/") return homePage();
+    const dl = /^\/download\/([a-z]+)$/.exec(path);
+    if (dl) return download(dl[1]) ?? error(404, "No download for that platform");
+  }
 
   if (path === "/api/auth/device" && method === "POST") {
     const body = await readJson<{ device?: string }>(req);

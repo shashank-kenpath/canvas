@@ -6,7 +6,7 @@ use crate::document::decode_shapes;
 use crate::import::storage;
 use crate::shape::Shape;
 use serde_json::{json, Map, Value};
-use std::fs;
+use crate::sys::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

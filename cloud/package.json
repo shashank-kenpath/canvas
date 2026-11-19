@@ -4,11 +4,12 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run build:web && (wrangler deploy || (sleep 10 && wrangler deploy)) && wrangler d1 migrations apply DB --remote",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "db:migrate:local": "wrangler d1 migrations apply inkboard-db --local",
-    "db:migrate": "wrangler d1 migrations apply inkboard-db --remote"
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate": "wrangler d1 migrations apply DB --remote",
+    "build:web": "if command -v cargo >/dev/null && [ -f ../rust/web/build.sh ]; then bash ../rust/web/build.sh; else echo 'Skipping the web app: needs the Rust repo and toolchain (rust/web/build.sh)'; fi"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.8.4",
@@ -17,5 +18,18 @@
     "vite": "^8.3.8",
     "vitest": "^5.1.1",
     "wrangler": "^4.164.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "GOOGLE_CLIENT_SECRET": {
+        "description": "Client secret of the Google OAuth client named in GOOGLE_CLIENT_ID (Google Cloud Console \u2192 Google Auth Platform \u2192 Clients)."
+      },
+      "ALLOWED_DOMAINS": {
+        "description": "Comma-separated Google Workspace domains allowed to sign in."
+      },
+      "GOOGLE_CLIENT_ID": {
+        "description": "Google OAuth client of type TVs and Limited Input devices."
+      }
+    }
   }
 }

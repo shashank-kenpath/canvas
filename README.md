@@ -1,6 +1,6 @@
 # Canvas Studio — native Android app
 
-Team boards (live multi-device collaboration on Cloudflare, [`cloud/`](cloud/README.md)) and native macOS/Windows/Linux apps ([`rust/desktop`](rust/README.md#desktop-macos-windows-linux)) are part of the Rust app. The Rust Android port is now in [`rust/`](rust/README.md), with its library, editor controls, menus and dialogs rendered in Rust. Download: [Rust APK](https://annotated-remedies-property-binding.trycloudflare.com/canvas-studio-rust.apk). The Flutter implementation below remains available alongside it.
+Team boards (live multi-device collaboration on Cloudflare, [`cloud/`](cloud/README.md)) and native macOS/Windows/Linux apps ([`rust/desktop`](rust/README.md#desktop-macos-windows-linux)) are part of the Rust app. The Rust Android port is now in [`rust/`](rust/README.md), with its library, editor controls, menus and dialogs rendered in Rust. Download for macOS, Windows, Android and Linux: **https://whiteboard.kenpathlabs.com**. The Flutter implementation below remains available alongside it.
 
 Version 2 is a native Flutter implementation. The editor uses Flutter CustomPainter, Canvas, TextPainter and native gestures. No WebView, React runtime, JavaScript editor or tldraw SDK is packaged into this APK.
 

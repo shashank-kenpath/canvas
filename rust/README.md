@@ -54,7 +54,26 @@ cargo run --release -p inkboard_desktop
 
 Mouse wheel pans, Ctrl/⌘ + wheel or pinch zooms, Ctrl/⌘+Z / Shift+Ctrl/⌘+Z undo and redo, Delete removes the selection, Esc goes back. `INKBOARD_UI_SCALE` (default 1.2) sizes the interface; `INKBOARD_SERVER` points at another team-board server. Boards and settings live in the platform data folder (`~/Library/Application Support/Inkboard`, `%APPDATA%\Inkboard`, `~/.local/share/Inkboard`).
 
-Not on desktop yet: handwriting-to-text (Android uses ML Kit; Windows Ink and macOS Vision are the planned replacements), PDF page import, and in-app updates. `.github/workflows/desktop.yml` builds a signed-ad-hoc macOS `.app` (Apple Silicon and Intel), a Windows `.exe` and a Linux binary; distribution needs an Apple Developer ID for notarisation and a Windows code-signing certificate.
+Not on desktop yet: handwriting-to-text (Android uses ML Kit; Windows Ink and macOS Vision are the planned replacements), PDF page import, and in-app updates. `.github/workflows/desktop.yml` builds a universal macOS `.dmg` (ad-hoc signed), a Windows `.exe`, a Linux binary and the Android `.apk`. When `version` in `rust/desktop/Cargo.toml` changes on `main`, it publishes GitHub release `v<version>`. https://whiteboard.kenpathlabs.com always links to the latest release. Silent installs need an Apple Developer ID for notarisation and a Windows code-signing certificate. Android release signing comes from the `ANDROID_KEYSTORE_B64`, `ANDROID_STORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` repository secrets; without them the APK uses a debug key.
+
+## Web
+
+`web/` runs the same app in a browser at **https://whiteboard.kenpathlabs.com/app**: `canvas_core` compiled to WebAssembly, drawing into a `<canvas>`. Team boards, live collaboration, sign-in, local boards, images, PDF import (pages rendered with pdf.js) and PNG export all work. Local boards are saved in the browser's IndexedDB.
+
+What differs in a browser (`core/src/sys.rs`, `core/src/ui/cloud/`):
+- The page's clock replaces the system clock.
+- Disk work runs at the start of a frame instead of on a thread.
+- Files live in memory and the page copies them to IndexedDB.
+- Server requests use `fetch`. The board room uses the page's WebSocket, with the session token sent as the `bearer.<token>` subprotocol.
+- Board fonts are fetched as separate files.
+- The phone pad and the local-network Claude connector are left out.
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version <the version in Cargo.lock>
+web/build.sh            # writes cloud/public/app, which the Worker serves at /app
+cd ../cloud && npx wrangler dev   # then open http://localhost:8787/app/
+```
 
 ## Build
 

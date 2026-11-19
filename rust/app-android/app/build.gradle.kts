@@ -18,8 +18,8 @@ android {
         applicationId = "com.canvasstudio.rust"
         minSdk = 24
         targetSdk = 36
-        versionCode = 19
-        versionName = "0.8.7"
+        versionCode = 20
+        versionName = "0.9.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
