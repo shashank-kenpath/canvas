@@ -54,7 +54,7 @@ cargo run --release -p inkboard_desktop
 
 Mouse wheel pans, Ctrl/⌘ + wheel or pinch zooms, Ctrl/⌘+Z / Shift+Ctrl/⌘+Z undo and redo, Delete removes the selection, Esc goes back. `INKBOARD_UI_SCALE` (default 1.2) sizes the interface; `INKBOARD_SERVER` points at another team-board server. Boards and settings live in the platform data folder (`~/Library/Application Support/Inkboard`, `%APPDATA%\Inkboard`, `~/.local/share/Inkboard`).
 
-Not on desktop yet: handwriting-to-text (Android uses ML Kit; Windows Ink and macOS Vision are the planned replacements), PDF page import, and in-app updates. `.github/workflows/desktop.yml` builds a signed-ad-hoc macOS `.app` (Apple Silicon and Intel), a Windows `.exe` and a Linux binary; distribution needs an Apple Developer ID for notarisation and a Windows code-signing certificate.
+Not on desktop yet: handwriting-to-text (Android uses ML Kit; Windows Ink and macOS Vision are the planned replacements), PDF page import, and in-app updates. `.github/workflows/desktop.yml` builds a universal macOS `.dmg` (ad-hoc signed), a Windows `.exe`, a Linux binary and the Android `.apk`. When `version` in `rust/desktop/Cargo.toml` changes on `main`, it publishes GitHub release `v<version>`. https://whiteboard.kenpathlabs.com always links to the latest release. Silent installs need an Apple Developer ID for notarisation and a Windows code-signing certificate. Android release signing comes from the `ANDROID_KEYSTORE_B64`, `ANDROID_STORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD` repository secrets; without them the APK uses a debug key.
 
 ## Build
 
