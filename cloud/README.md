@@ -19,14 +19,19 @@ Roles per board: **owner**, **editor**, **viewer**. Owners invite people by emai
 
 ## Deploy
 
-1. `npm ci --legacy-peer-deps`
-2. `npx wrangler login`
-3. `npx wrangler d1 create inkboard-db` and put the printed id in `wrangler.toml`.
-4. `npx wrangler r2 bucket create inkboard-assets`
-5. In Google Cloud Console → APIs & Services → Credentials, create an OAuth client of type **TVs and Limited Input devices**. Put its client id in `GOOGLE_CLIENT_ID` in `wrangler.toml`, then `npx wrangler secret put GOOGLE_CLIENT_SECRET`. Set the OAuth consent screen to **Internal** so only your Workspace can use it.
-6. Set `ALLOWED_DOMAINS` in `wrangler.toml` (comma-separated, e.g. `example.com,example.org`).
-7. `npm run db:migrate` then `npm run deploy`.
-8. Point the apps at the Worker: `DEFAULT_SERVER` in `rust/core/src/ui/cloud/mod.rs` for builds, or `INKBOARD_SERVER` / the `server` setting for testing.
+Live at **https://whiteboard.kenpathlabs.com**, the apps' default server (`DEFAULT_SERVER` in `rust/core/src/ui/cloud/mod.rs`).
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/tejasgowda0012/canvas/tree/main/cloud)
+
+The button deploys into the Cloudflare account you choose, which must hold the `kenpathlabs.com` zone for the custom domain. It creates the D1 database and R2 bucket, asks for `GOOGLE_CLIENT_SECRET`, and runs `npm run deploy`, which also creates the database tables.
+
+By hand:
+
+1. `npm ci`, then `npx wrangler login`.
+2. In Google Cloud Console → Google Auth Platform → Clients, create an OAuth client of type **TVs and Limited Input devices**. Put its id in `GOOGLE_CLIENT_ID` in `wrangler.toml`, then run `npx wrangler secret put GOOGLE_CLIENT_SECRET`.
+3. Set `ALLOWED_DOMAINS` in `wrangler.toml` (comma-separated). Only these Workspace domains can sign in.
+4. `npm run deploy`. It creates the database and bucket by name if they don't exist, deploys, and applies `migrations/`.
+5. To point an app at another server, set `INKBOARD_SERVER` or the app's `server` setting.
 
 ## Develop
 

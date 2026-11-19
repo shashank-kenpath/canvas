@@ -4,6 +4,10 @@ name = "inkboard"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 
+# Served at whiteboard.kenpathlabs.com; the zone must be in the same Cloudflare account.
+routes = [{ pattern = "whiteboard.kenpathlabs.com", custom_domain = true }]
+workers_dev = true
+
 [vars]
 # Comma-separated Google Workspace domains allowed to sign in, e.g. "example.com".
 # Sign-in is refused while this is empty.
@@ -11,6 +15,7 @@ ALLOWED_DOMAINS = "kenpath.io,kenpathlabs.com"
 # OAuth client of type "TVs and Limited Input devices" from Google Cloud Console.
 GOOGLE_CLIENT_ID = "408611563084-8js2vfhlk5sl4opmk6udr7eotioihvgr.apps.googleusercontent.com"
 # GOOGLE_CLIENT_SECRET is a secret: `npx wrangler secret put GOOGLE_CLIENT_SECRET`
+# (the Deploy to Cloudflare page asks for it, from .dev.vars.example).
 
 [[durable_objects.bindings]]
 name = "ROOMS"
@@ -23,8 +28,7 @@ new_sqlite_classes = ["BoardRoom"]
 [[d1_databases]]
 binding = "DB"
 database_name = "inkboard-db"
-# Created with `npx wrangler d1 create inkboard-db`.
-database_id = "f1d45c97-3d4a-4ea3-a017-c57140387f9c"
+# No database_id: `wrangler deploy` creates the database, or finds it by name.
 migrations_dir = "migrations"
 
 [[r2_buckets]]

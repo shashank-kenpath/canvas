@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The server built into release builds. Settings can point elsewhere.
-pub const DEFAULT_SERVER: &str = "https://inkboard.shashank-d98.workers.dev";
+pub const DEFAULT_SERVER: &str = "https://whiteboard.kenpathlabs.com";
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct User {
