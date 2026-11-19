@@ -1,7 +1,7 @@
 //! Local network features: a small HTTP server built into the app that
-//! serves board sharing (other Inkboard devices join with a 6-digit code)
-//! and a Model Context Protocol endpoint so Claude can read and draw on the
-//! open board. Nothing goes through an outside service.
+//! serves the phone pad and a Model Context Protocol endpoint so Claude can
+//! read and draw on the open board. Team boards live on the Inkboard server
+//! instead (see `cloud`).
 
 use crate::shape::Shape;
 use serde_json::{json, Map, Value};
@@ -9,12 +9,9 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::Duration;
-
-mod share;
-pub(crate) use share::snapshot;
 
 pub const PORT: u16 = 18763;
 const MAX_BODY: usize = 8 << 20;
@@ -330,189 +327,6 @@ pub fn local_ip() -> Option<Ipv4Addr> {
     None
 }
 
-/// What a join attempt found: the host address and the board's name.
-pub type Found = Result<(String, String), String>;
-
-/// Looks for the device sharing a board under `code`. `input` is either a
-/// 6-digit code (the local network is searched) or "address code".
-pub fn discover(input: &str, relay: &str) -> Found {
-    let parts: Vec<&str> = input.split(|c: char| c.is_whitespace() || c == ',').filter(|p| !p.is_empty()).collect();
-    let code: String = parts.iter().rev().find(|p| p.chars().all(|c| c.is_ascii_digit()) && p.len() == 6).map(|s| s.to_string())
-        .unwrap_or_else(|| input.chars().filter(|c| c.is_ascii_digit()).collect());
-    if code.len() != 6 {
-        return Err("Enter the 6-digit board code".into());
-    }
-    let hello = {
-        let code = code.clone();
-        move |host: &str| -> Option<String> {
-        let (status, body) = request("GET", host, &format!("/canvas/hello?code={code}"), None, Duration::from_millis(1500)).ok()?;
-        if status != 200 {
-            return None;
-        }
-        let v: Value = serde_json::from_slice(&body).ok()?;
-        Some(v.get("name").and_then(Value::as_str).unwrap_or("Shared board").to_string())
-        }
-    };
-    if let Some(addr) = parts.iter().find(|p| p.contains('.')) {
-        let host = if addr.contains(':') { addr.to_string() } else { format!("{addr}:{PORT}") };
-        return hello(&host).map(|name| (host, name)).ok_or_else(|| "No shared board there with that code".into());
-    }
-    let (tx, rx) = mpsc::channel();
-    let done = Arc::new(AtomicBool::new(false));
-    if !relay.is_empty() {
-        // Boards shared from another network are found through the relay.
-        let (tx, relay, code, hello) = (tx.clone(), relay.to_string(), code.clone(), hello.clone());
-        std::thread::spawn(move || {
-            let Ok((200, body)) = request("GET", &relay, &format!("/find?code={code}"), None, Duration::from_secs(6)) else { return };
-            let Some(id) = serde_json::from_slice::<Value>(&body).ok().and_then(|v| v["id"].as_str().map(str::to_string)) else { return };
-            let host = format!("{}/d/{id}", relay.trim_end_matches('/'));
-            if let Some(name) = hello(&host) {
-                let _ = tx.send((host, name));
-            }
-        });
-    }
-    let Some(me) = local_ip() else {
-        drop(tx);
-        return rx.recv_timeout(Duration::from_secs(12)).map_err(|_| "No board found with that code".into());
-    };
-    let [a, b, c, _] = me.octets();
-    let next = Arc::new(AtomicUsize::new(1));
-    let mut workers = Vec::new();
-    for _ in 0..48 {
-        let (next, tx, done, hello) = (next.clone(), tx.clone(), done.clone(), hello.clone());
-        workers.push(std::thread::spawn(move || loop {
-            let i = next.fetch_add(1, Ordering::SeqCst);
-            if i > 254 || done.load(Ordering::SeqCst) {
-                return;
-            }
-            let ip = Ipv4Addr::new(a, b, c, i as u8);
-            let addr = SocketAddr::new(IpAddr::V4(ip), PORT);
-            if TcpStream::connect_timeout(&addr, Duration::from_millis(350)).is_err() {
-                continue;
-            }
-            let host = addr.to_string();
-            if let Some(name) = hello(&host) {
-                done.store(true, Ordering::SeqCst);
-                let _ = tx.send((host, name));
-                return;
-            }
-        }));
-    }
-    drop(tx);
-    let found = rx.recv_timeout(Duration::from_secs(12)).ok();
-    done.store(true, Ordering::SeqCst);
-    found.ok_or_else(|| "No board found with that code on this network".into())
-}
-
-/// What a joined board hears from the device that shares it.
-pub enum LinkEvent {
-    /// `batches` is how many operation batches had reached the link when
-    /// this state was fetched; an older state misses local changes.
-    Snapshot { revision: u64, shapes: Vec<Value>, batches: u64 },
-    Status(bool),
-}
-
-/// Keeps a joined board in step with its host: sends local operations and
-/// polls for the shared state.
-pub struct Link {
-    pub ops: Sender<Vec<Value>>,
-    pub events: Receiver<LinkEvent>,
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for Link {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-    }
-}
-
-pub fn link(host: String, code: String, wake: Arc<dyn Fn() + Send + Sync>) -> Link {
-    let (ops_tx, ops_rx) = mpsc::channel::<Vec<Value>>();
-    let (ev_tx, events) = mpsc::channel();
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = stop.clone();
-    let _ = std::thread::Builder::new().name("lan-link".into()).spawn(move || {
-        let mut queued: Vec<Value> = Vec::new();
-        let mut batches = 0u64;
-        let mut revision = 0u64;
-        let mut online: Option<bool> = None;
-        let t = Duration::from_secs(8);
-        while !flag.load(Ordering::SeqCst) {
-            let pause = if host.starts_with("https://") { 900 } else { 500 };
-            match ops_rx.recv_timeout(Duration::from_millis(pause)) {
-                Ok(o) => {
-                    batches += 1;
-                    queued.extend(o)
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Err(_) => {}
-            }
-            while let Ok(o) = ops_rx.try_recv() {
-                batches += 1;
-                queued.extend(o);
-            }
-            let mut ok = true;
-            if !queued.is_empty() {
-                ok = share::send_ops(&host, &code, &mut queued, t).is_ok();
-                if ok {
-                    revision = 0;
-                }
-            }
-            if ok {
-                match share::fetch(&host, &code, revision, t) {
-                    Ok(Some((rev, shapes))) => {
-                        revision = rev;
-                        let _ = ev_tx.send(LinkEvent::Snapshot { revision: rev, shapes, batches });
-                        wake();
-                    }
-                    Ok(None) => {}
-                    Err(_) => ok = false,
-                }
-            }
-            if online != Some(ok) {
-                online = Some(ok);
-                let _ = ev_tx.send(LinkEvent::Status(ok));
-                wake();
-            }
-            if !ok {
-                std::thread::sleep(Duration::from_millis(1500));
-            }
-        }
-    });
-    Link { ops: ops_tx, events, stop }
-}
-
-/// Operations that turn `known` into `now`, both keyed by shape id.
-pub fn diff(known: &HashMap<String, Value>, now: &HashMap<String, Value>) -> Vec<Value> {
-    let mut ops = Vec::new();
-    for (id, v) in now {
-        if known.get(id) != Some(v) {
-            ops.push(json!({ "type": "put", "shape": v }));
-        }
-    }
-    for id in known.keys() {
-        if !now.contains_key(id) {
-            ops.push(json!({ "type": "delete", "id": id }));
-        }
-    }
-    ops
-}
-
-/// Splits operations into shapes to add or replace and ids to remove.
-pub fn parse_ops(ops: &[Value]) -> Result<(Vec<Shape>, Vec<String>), String> {
-    let (mut put, mut remove) = (Vec::new(), Vec::new());
-    for op in ops {
-        match op.get("type").and_then(Value::as_str) {
-            Some("put") => put.push(Shape::from_json(op.get("shape").ok_or("Missing shape")?)?),
-            Some("delete") => remove.push(op.get("id").and_then(Value::as_str).ok_or("Missing id")?.to_string()),
-            _ => return Err("Unknown operation".into()),
-        }
-    }
-    Ok((put, remove))
-}
-
-// ------------------------------------------------------------------- relay
-
 pub fn unbase64(s: &str) -> Vec<u8> {
     let val = |c: u8| match c {
         b'A'..=b'Z' => Some(c - b'A'),
@@ -533,78 +347,6 @@ pub fn unbase64(s: &str) -> Vec<u8> {
         }
     }
     out
-}
-
-/// Keeps this device reachable from the internet through a relay: the
-/// relay queues requests for `/d/<id>/...` and this loop fetches them.
-pub struct Relay {
-    pub online: Arc<AtomicBool>,
-    /// Comma-separated share codes the relay may hand out to joiners.
-    pub codes: Arc<std::sync::Mutex<String>>,
-    stop: Arc<AtomicBool>,
-}
-
-impl Drop for Relay {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-    }
-}
-
-pub fn relay(base: String, id: String, secret: String, tx: Sender<Req>, wake: Arc<dyn Fn() + Send + Sync>) -> Relay {
-    let online = Arc::new(AtomicBool::new(false));
-    let codes = Arc::new(std::sync::Mutex::new(String::new()));
-    let stop = Arc::new(AtomicBool::new(false));
-    let (on, cs, flag) = (online.clone(), codes.clone(), stop.clone());
-    let _ = std::thread::Builder::new().name("relay".into()).spawn(move || {
-        let mut backoff = 2u64;
-        while !flag.load(Ordering::SeqCst) {
-            let list = cs.lock().map(|c| c.clone()).unwrap_or_default();
-            let path = format!("/_dev/poll?id={id}&secret={secret}&codes={list}");
-            match request("POST", &base, &path, Some(b"[]"), Duration::from_secs(8)) {
-                Ok((200, body)) => {
-                    backoff = 2;
-                    if !on.swap(true, Ordering::SeqCst) {
-                        wake();
-                    }
-                    let Ok(Value::Array(list)) = serde_json::from_slice::<Value>(&body) else { continue };
-                    for r in list {
-                        let rid = r["rid"].clone();
-                        let (reply, answer) = mpsc::sync_channel(1);
-                        let req = Req {
-                            method: r["method"].as_str().unwrap_or("GET").to_string(),
-                            path: r["path"].as_str().unwrap_or("/").to_string(),
-                            query: parse_query(r["query"].as_str().unwrap_or("")),
-                            body: unbase64(r["body"].as_str().unwrap_or("")),
-                            reply,
-                        };
-                        if tx.send(req).is_err() {
-                            return;
-                        }
-                        wake();
-                        let (base, id, secret) = (base.clone(), id.clone(), secret.clone());
-                        std::thread::spawn(move || {
-                            let resp = answer.recv_timeout(Duration::from_secs(15)).unwrap_or(Resp::empty(503));
-                            let out = json!([{ "rid": rid, "status": resp.status, "ctype": resp.ctype, "body": base64(&resp.body) }]).to_string();
-                            let _ = request("POST", &base, &format!("/_dev/reply?id={id}&secret={secret}"), Some(out.as_bytes()), Duration::from_secs(8));
-                        });
-                    }
-                }
-                _ => {
-                    if on.swap(false, Ordering::SeqCst) {
-                        wake();
-                    }
-                    for _ in 0..backoff * 4 {
-                        if flag.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        std::thread::sleep(Duration::from_millis(250));
-                    }
-                    backoff = (backoff * 2).min(30);
-                }
-            }
-        }
-    });
-    Relay { online, codes, stop }
 }
 
 // --------------------------------------------------------------------- mcp
@@ -865,15 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_finds_changes() {
-        let mut a = HashMap::new();
-        a.insert("x".to_string(), json!(1));
-        a.insert("y".to_string(), json!(2));
-        let mut b = a.clone();
-        b.remove("x");
-        b.insert("y".into(), json!(3));
-        let ops = diff(&a, &b);
-        assert_eq!(ops.len(), 2);
+    fn encodes_and_parses() {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(unbase64("aGVsbG8="), b"hello");
         assert_eq!(parse_query("code=12%2034&x=a+b")["code"], "12 34");
@@ -899,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_and_share_ops_preserve_table_cells_and_mind_map_links() {
+    fn mcp_and_json_preserve_table_cells_and_mind_map_links() {
         let data = json!({ "shapes": [
             { "id": "table", "tool": "table", "points": [[0, 0], [400, 200]],
                 "rows": 2, "columns": 3, "cells": ["Monday", "", "", "", "", "Friday"] },
@@ -914,9 +648,7 @@ mod tests {
         let mut board = Fake(Vec::new());
         call_tool(&mut board, "add_shapes", &data).unwrap();
 
-        let snapshot = board.0.iter().map(|s| (s.id.clone(), s.to_json())).collect();
-        let (mut put, remove) = parse_ops(&diff(&HashMap::new(), &snapshot)).unwrap();
-        assert!(remove.is_empty());
+        let mut put: Vec<Shape> = board.0.iter().map(|s| Shape::from_json(&s.to_json()).unwrap()).collect();
         put.sort_by(|a, b| a.id.cmp(&b.id));
         board.0.sort_by(|a, b| a.id.cmp(&b.id));
         assert_eq!(put, board.0);

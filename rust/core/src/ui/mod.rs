@@ -3,3 +3,4 @@ pub mod font;
 mod icons;
 pub mod paint;
 pub mod net;
+pub mod cloud;

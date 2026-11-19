@@ -71,8 +71,8 @@ impl App {
         self.pending_file = None;
         match result {
             Err(error) => self.error_toast(&error),
-            Ok(Imported::Pages(_)) if self.joined() => {
-                self.error_toast("Open a board you own to import a presentation");
+            Ok(Imported::Pages(_)) if !self.can_change_pages() => {
+                self.error_toast("You can view this board but not add pages to it");
             }
             Ok(Imported::Pages(pages)) => {
                 let count = pages.len();
@@ -80,6 +80,7 @@ impl App {
                 self.pages.extend(pages.into_iter().map(|shapes| Page {
                     shapes: shapes.into_iter().map(Arc::new).collect(),
                     view: None,
+                    key: super::App::new_page_key(),
                 }));
                 self.change_page(super::PageChange::Open(first));
                 self.show_toast(&format!("Inserted {count} {}", if count == 1 { "page" } else { "pages" }));
@@ -100,7 +101,7 @@ impl App {
                 }).collect();
                 let image = (shapes.len() == 1 && shapes[0].tool == Tool::Image)
                     .then(|| shapes[0].id.clone());
-                self.ed.apply_remote(shapes, Vec::new());
+                self.ed.apply_shapes(shapes, Vec::new());
                 if let Some(id) = image {
                     self.choose_tool(Tool::Select, PenMode::Ink, false);
                     self.ed.doc.select(Some(&id));
@@ -147,7 +148,7 @@ impl App {
                     icon: Some(icon),
                     text: label.into(),
                     value: detail.into(),
-                    chevron: !self.joined() && act == Act::InsertItem(InsertKind::File(FileKind::Pdf)),
+                    chevron: self.can_change_pages() && act == Act::InsertItem(InsertKind::File(FileKind::Pdf)),
                     danger: false,
                 },
                 Some(act),

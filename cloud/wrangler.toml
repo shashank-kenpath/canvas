@@ -1,0 +1,32 @@
+# Inkboard collaboration backend: one Worker, one Durable Object per board,
+# D1 for accounts/boards/permissions and R2 for images.
+name = "inkboard"
+main = "src/index.ts"
+compatibility_date = "2026-11-01"
+
+[vars]
+# Comma-separated Google Workspace domains allowed to sign in, e.g. "example.com".
+# Sign-in is refused while this is empty.
+ALLOWED_DOMAINS = ""
+# OAuth client of type "TVs and Limited Input devices" from Google Cloud Console.
+GOOGLE_CLIENT_ID = ""
+# GOOGLE_CLIENT_SECRET is a secret: `npx wrangler secret put GOOGLE_CLIENT_SECRET`
+
+[[durable_objects.bindings]]
+name = "ROOMS"
+class_name = "BoardRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BoardRoom"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "inkboard-db"
+# Replace with the id printed by `npx wrangler d1 create inkboard-db`.
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "inkboard-assets"

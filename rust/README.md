@@ -8,8 +8,8 @@ The library screen, floating editor toolbars, style panel, menus, dialogs, text/
 - Automatic shape tidying and handwriting-to-typed-text conversion, with separate persisted settings. English and Hindi. There is no keyboard: board text comes from handwriting or from Claude.
 - 36 board fonts (31 bundled open-licence families, see `assets/licenses`) with a font picker that previews each one; colour, width and fill controls.
 - Export as PNG to Pictures/Inkboard.
-- Share a board with a 6-digit code. Devices on the same network connect directly; other networks go through the relay (`server/relay.mjs`).
-- Claude connector: the panel is a Streamable HTTP MCP server (`/mcp/<key>` on port 18763, and `<relay>/d/<id>/mcp/<key>` from anywhere). Claude can read the open board, add and update shapes, text and diagrams, delete with confirmation and get a PNG picture of the board. Suggested models: Claude Opus 5.5 for diagrams, Claude Sonnet 5.5 for quick edits.
+- Team boards: sign in with a Google Workspace account and edit the same board from many devices at once, like Figma. Everyone keeps their own view; changes, cursors and selections appear live, and each shape records who added it and who changed it last. See [Team boards](#team-boards).
+- Claude connector: the panel is a Streamable HTTP MCP server (`/mcp/<key>` on port 18763, on the local network). Claude can read the open board, add and update shapes, text and diagrams, delete with confirmation and get a PNG picture of the board. Suggested models: Claude Opus 5.5 for diagrams, Claude Sonnet 5.5 for quick edits.
 - Palm rejection, bounded multi-touch forwarding (five contacts), historical/unbuffered input.
 - 1920-pixel maximum drawing-buffer side by default for 4K panels. Full-resolution mode is optional. Only dirty screen rectangles are copied while writing.
 - Atomic saved board files, rename/delete, thumbnails, undo/redo, zoom/fit. Leaving a dirty board waits for the write; a failed write keeps the board open. Backgrounding preserves a stroke already in progress.
@@ -30,9 +30,31 @@ The Android picker accepts files up to 32 MiB. PDF import accepts up to 80 pages
 
 Local board JSON stores an `imageRef` for each image. The matching SHA-256-named PNG or JPEG bytes live in the board's sibling `<id>.assets` directory, which belongs with the JSON when copying the app-private files. Board sharing sends the image bytes as base64 `imageData` inline, so a joined device needs only the normal sharing connection. Sharing and PNG export use the open page.
 
-## Relay
+## Team boards
 
-`server/relay.mjs` (Node 18+) holds nothing on disk. Panels long-poll `/_dev/poll` with their id and secret; requests to `/d/<id>/...` are queued for that panel, and `/find?code=` maps a share code to the panel sharing it. It listens on 127.0.0.1:18780 and is published over HTTPS (Tailscale Funnel at `https://inkboard.taila6db10.ts.net`, the address built into the app).
+Team boards live on the Inkboard server in [`cloud/`](../cloud/README.md): a Cloudflare Worker with one Durable Object per board, D1 for accounts, boards and permissions, and R2 for images. There is no Tailscale relay or peer hosting any more.
+
+- **Sign in**: Library → *Sign in* (or the menu → *Sign in…*). The app shows a code and a QR link; approve it in any browser with your Workspace Google account. Personal Gmail and other organisations are refused.
+- **Make or move a board**: on the *Team boards* tab, *New board* makes a team board. A board on this device moves with its menu → *Copy to Team boards*, or the board's Share button.
+- **Share**: the board's Share button lists who is on the board now, who has access (owner, can edit, can view) and lets the owner invite people by email or open the board to everyone in the organisation.
+- **Live editing**: every device keeps its own copy, camera and tools. Changes go to the board's room, which orders them; the last change to a shape wins. Others' cursors (with names), selections and fresh edits are drawn on the board; their avatars sit in the top-right bar. Select a shape to see *Added by … · edited by …*.
+- **Offline**: a team board is cached as `cloud-<id>` in the boards directory and keeps working offline; changes made while away are sent on reconnect.
+- **Undo** only undoes your own changes.
+- **View-only** people can watch, see cursors and export, but changes are put back.
+
+The client code is `core/src/ui/cloud/` (HTTP, WebSocket room connection, sync engine) and `core/src/ui/app/team.rs` (screens, presence, sharing). End-to-end tests run two apps against `wrangler dev`; see `.github/workflows/cloud.yml`.
+
+## Desktop (macOS, Windows, Linux)
+
+`desktop/` is a native window host for the same `canvas_core` app: winit for the window and input (mouse, pen, touch, trackpad pinch, keyboard), softbuffer to present the frames, cosmic-text for board text with the same bundled typefaces (with Devanagari shaping), and system file dialogs.
+
+```sh
+cargo run --release -p inkboard_desktop
+```
+
+Mouse wheel pans, Ctrl/⌘ + wheel or pinch zooms, Ctrl/⌘+Z / Shift+Ctrl/⌘+Z undo and redo, Delete removes the selection, Esc goes back. `INKBOARD_UI_SCALE` (default 1.2) sizes the interface; `INKBOARD_SERVER` points at another team-board server. Boards and settings live in the platform data folder (`~/Library/Application Support/Inkboard`, `%APPDATA%\Inkboard`, `~/.local/share/Inkboard`).
+
+Not on desktop yet: handwriting-to-text (Android uses ML Kit; Windows Ink and macOS Vision are the planned replacements), PDF page import, and in-app updates. `.github/workflows/desktop.yml` builds a signed-ad-hoc macOS `.app` (Apple Silicon and Intel), a Windows `.exe` and a Linux binary; distribution needs an Apple Developer ID for notarisation and a Windows code-signing certificate.
 
 ## Build
 
