@@ -136,6 +136,15 @@ pub fn save_atomic(dir: &Path, id: &str, contents: &str) -> Result<(), String> {
     })
 }
 
+/// Moves a board out of the list into `moved/`, keeping the file. Used once a
+/// board on this device has been copied to the person's account.
+pub fn archive(dir: &Path, id: &str) -> Result<(), String> {
+    let path = board_path(dir, id)?;
+    let moved = dir.join("moved");
+    fs::create_dir_all(&moved).map_err(|e| e.to_string())?;
+    fs::rename(&path, moved.join(format!("{id}.json"))).map_err(|e| e.to_string())
+}
+
 pub fn delete(dir: &Path, id: &str) -> Result<(), String> {
     let path = board_path(dir, id)?;
     if let Err(error) = fs::remove_file(&path) {

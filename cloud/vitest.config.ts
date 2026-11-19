@@ -14,6 +14,8 @@ export default defineConfig(async () => {
             GOOGLE_CLIENT_ID: "test-client",
             GOOGLE_CLIENT_SECRET: "test-secret",
             GOOGLE_BASE: "https://google.test",
+            GOOGLE_WEB_CLIENT_ID: "web-client",
+            GOOGLE_WEB_CLIENT_SECRET: "web-secret",
           },
         },
       }),

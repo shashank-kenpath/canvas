@@ -172,7 +172,10 @@ jobs:
           fi
       - uses: actions/download-artifact@v4
         if: steps.v.outputs.exists != 'true'
-        with: { path: dist, merge-multiple: true }
+        with: { path: dist, pattern: "Inkboard-*", merge-multiple: true }
+      # Only the installable apps go in the release; the web build is deployed to the Worker.
+      - if: steps.v.outputs.exists != 'true'
+        run: find dist -mindepth 1 -not -name 'Inkboard-*' -delete && ls -la dist
       - uses: softprops/action-gh-release@v2
         if: steps.v.outputs.exists != 'true'
         with:

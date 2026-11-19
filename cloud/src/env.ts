@@ -5,6 +5,9 @@ export interface Env {
   ALLOWED_DOMAINS: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET?: string;
+  /** OAuth client of type "Web application", for signing in through a browser. */
+  GOOGLE_WEB_CLIENT_ID?: string;
+  GOOGLE_WEB_CLIENT_SECRET?: string;
   /** Tests point this at a fake; production leaves it unset. */
   GOOGLE_BASE?: string;
 }

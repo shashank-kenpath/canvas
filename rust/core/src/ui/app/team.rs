@@ -9,7 +9,7 @@
 
 use super::{
     random_token, Act, App, AskFor, ButtonKind, ConfirmFor, Face, Ico, Job, Look, MenuKind, Overlay, Page, PageChange, PanelKind,
-    PanelRows, Rf, Ui, ACCENT, DANGER, TEXT1, TEXT2, TEXT3,
+    PanelRows, Rf, Ui, ACCENT, ACCENT_TINT, BORDER, DANGER, OK, SURFACE, SURFACE2, TEXT1, TEXT2, TEXT3,
 };
 use crate::geom::Pt;
 use crate::import::ImageAsset;
@@ -33,16 +33,71 @@ const FLASH_MS: u64 = 1_800;
 /// Smallest gap between presence messages.
 const PRESENCE_MS: u64 = 50;
 
+/// Which boards the library lists.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Tab {
-    Device,
-    Team,
+    All,
+    /// Boards the signed-in person owns.
+    Yours,
+    /// Boards other people made and shared with them.
+    Shared,
+}
+
+impl Tab {
+    pub(super) const ALL: [Tab; 3] = [Tab::All, Tab::Yours, Tab::Shared];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Tab::All => "All",
+            Tab::Yours => "Yours",
+            Tab::Shared => "Shared with you",
+        }
+    }
+
+    fn keeps(self, board: &CloudBoard) -> bool {
+        match self {
+            Tab::All => true,
+            Tab::Yours => board.role == Role::Owner,
+            Tab::Shared => board.role != Role::Owner,
+        }
+    }
+}
+
+/// The name of everyone who can be given access to all of a person's boards.
+const ORG: &str = "Kenpath";
+
+/// Who can open a board, as the library's badge says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Access {
+    Private,
+    Shared,
+    Org,
+}
+
+impl Access {
+    pub(super) fn label(self) -> String {
+        match self {
+            Access::Private => "Private".into(),
+            Access::Shared => "Shared".into(),
+            Access::Org => format!("Everyone at {ORG}"),
+        }
+    }
+
+    pub(super) fn icon(self) -> Ico {
+        match self {
+            Access::Private => Ico::Lock,
+            Access::Shared => Ico::People,
+            Access::Org => Ico::Globe,
+        }
+    }
 }
 
 pub(super) struct SignIn {
     cancel: Arc<AtomicBool>,
     pub code: Option<(String, String)>,
     pub error: Option<String>,
+    /// Waiting for the browser instead of showing a code.
+    pub browser: bool,
 }
 
 impl Drop for SignIn {
@@ -98,6 +153,17 @@ pub(super) fn ago(then_ms: i64) -> String {
     }
 }
 
+fn person_name(name: &str, email: &str) -> String {
+    if name.is_empty() { email.to_string() } else { name.to_string() }
+}
+
+/// A steady colour for someone whose profile colour is not known here.
+pub(super) fn person_color(email: &str) -> u32 {
+    const COLORS: [u32; 8] = [0xff2748e8, 0xffe8590c, 0xff1e8e5a, 0xff9c36b5, 0xffd6336c, 0xff0b7285, 0xff7048e8, 0xffc92a2a];
+    let hash = email.bytes().fold(7u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    COLORS[hash as usize % COLORS.len()]
+}
+
 fn device_name() -> String {
     if cfg!(target_arch = "wasm32") { "Inkboard on the web".into() } else { format!("Inkboard on {}", std::env::consts::OS) }
 }
@@ -115,9 +181,75 @@ impl App {
 
     pub(super) fn start_sign_in(&mut self) {
         let cancel = Arc::new(AtomicBool::new(false));
-        self.sign_in = Some(SignIn { cancel: cancel.clone(), code: None, error: None });
+        let server = self.settings.server.clone();
+        // A browser does it in one step; panels without one show a code to enter elsewhere.
+        let browser = self.platform.sign_in_in_browser(&server);
+        self.sign_in = Some(SignIn { cancel: cancel.clone(), code: None, error: None, browser });
+        if !browser {
+            cloud::sign_in(server, device_name(), cancel, self.cloud_tx.clone(), self.wake.clone());
+        }
+        self.panel(PanelKind::Account);
+    }
+
+    /// Starts signing in with a code on another device, when the browser
+    /// isn't an option (or didn't work).
+    pub(super) fn sign_in_with_code(&mut self) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.sign_in = Some(SignIn { cancel: cancel.clone(), code: None, error: None, browser: false });
         cloud::sign_in(self.settings.server.clone(), device_name(), cancel, self.cloud_tx.clone(), self.wake.clone());
         self.panel(PanelKind::Account);
+    }
+
+    /// The host finished "Sign in with Google" in a browser with this
+    /// session token; the app looks up who it belongs to.
+    pub fn finish_sign_in(&mut self, token: &str) {
+        let (server, token) = (self.settings.server.clone(), token.to_string());
+        cloud::spawn(&self.cloud_tx, &self.wake, async move {
+            match cloud::http::api(&server, "GET", "/api/me", Some(&token), None).await.map(|v| cloud::User::from_json(&v)) {
+                Ok(Some(user)) => Reply::SignIn(SignInStep::Done(Account { server, token, user })),
+                Ok(None) => Reply::SignIn(SignInStep::Failed("Sign-in failed. Try again.".into())),
+                Err(e) => Reply::SignIn(SignInStep::Failed(e.message)),
+            }
+        });
+    }
+
+    /// The browser sign-in failed or was cancelled.
+    pub fn sign_in_failed(&mut self, message: &str) {
+        match &mut self.sign_in {
+            Some(s) => s.error = Some(message.to_string()),
+            None => self.error_toast(message),
+        }
+    }
+
+    /// Opens a board from a link (`/app/#board=<id>`), signing in first if needed.
+    pub fn open_board_link(&mut self, cloud_id: &str) {
+        let valid = cloud_id.len() == 36 && cloud_id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+        if !valid {
+            return;
+        }
+        if self.account().is_none() {
+            self.pending_link = Some(cloud_id.to_string());
+            self.start_sign_in();
+            return;
+        }
+        self.open_team(cloud_id);
+    }
+
+    /// Moves the next board that only lives on this device into the
+    /// person's account, one at a time, once signed in.
+    pub(super) fn move_next_local_board(&mut self) {
+        if self.account().is_none() || !self.listed || self.moving.is_some() || self.copying.is_some() {
+            return;
+        }
+        let open = self.board.as_ref().map(|b| b.id.clone());
+        let Some(meta) = self.boards.iter().find(|m| {
+            !m.id.starts_with(CACHE_PREFIX) && Some(&m.id) != open.as_ref() && !self.move_failed.contains(&m.id)
+        }) else {
+            return;
+        };
+        let (from, title) = (meta.id.clone(), meta.title.clone());
+        self.moving = Some((from, String::new()));
+        self.request(move |a| async move { Reply::Created(cloud::create_board(&a, &title).await) });
     }
 
     fn sign_out(&mut self) {
@@ -172,7 +304,7 @@ impl App {
                         self.sign_in = None;
                         let name = account.user.first_name().to_string();
                         self.set(|s| s.account = Some(account));
-                        self.tab = Tab::Team;
+                        self.tab = Tab::All;
                         self.refresh_team();
                         if matches!(self.overlay, Some(Overlay::Panel { kind: PanelKind::Account, .. })) {
                             self.dismiss();
@@ -181,6 +313,10 @@ impl App {
                         if self.live.as_ref().is_some_and(|l| l.refused.is_some()) {
                             self.start_live();
                         }
+                        if let Some(id) = self.pending_link.take() {
+                            self.open_team(&id);
+                        }
+                        self.move_next_local_board();
                     }
                     SignInStep::Failed(message) => {
                         if let Some(s) = &mut self.sign_in {
@@ -200,6 +336,20 @@ impl App {
                         self.api_error(&e);
                     }
                 }
+                Reply::Created(Ok(board)) if self.moving.as_ref().is_some_and(|(_, to)| to.is_empty()) => {
+                    self.team_boards.insert(0, board.clone());
+                    let from = self.moving.as_ref().unwrap().0.clone();
+                    let to = cache_id(&board.id);
+                    self.moving = Some((from.clone(), to.clone()));
+                    self.send(Job::Copy { from, to, title: board.title.clone(), cloud: board.id.clone() });
+                }
+                Reply::Created(Err(e)) if self.moving.as_ref().is_some_and(|(_, to)| to.is_empty()) => {
+                    let (from, _) = self.moving.take().unwrap();
+                    self.move_failed.push(from);
+                    if e.signed_out() {
+                        self.api_error(&e);
+                    }
+                }
                 Reply::Created(Ok(board)) => {
                     self.team_boards.insert(0, board.clone());
                     if let Some(copy) = self.copying.take() {
@@ -215,6 +365,11 @@ impl App {
                 Reply::Members(id, Ok(m)) => {
                     if let Some(b) = self.team_boards.iter_mut().find(|b| b.id == id) {
                         b.org_access = m.org_access.clone();
+                    }
+                    if m.members.is_empty() {
+                        self.invited.remove(&id);
+                    } else {
+                        self.invited.insert(id.clone());
                     }
                     self.members = Some((id, m));
                 }
@@ -330,6 +485,11 @@ impl App {
             refused: None,
             view_only_notice: 0,
         });
+        // "Share…" on a card opens the board with the share panel on top.
+        if self.share_on_open.as_deref() == self.live.as_ref().map(|l| l.cloud_id.as_str()) {
+            self.share_on_open = None;
+            self.share_panel();
+        }
     }
 
     /// What the board file keeps about its server copy.
@@ -798,43 +958,62 @@ impl App {
 
     // ------------------------------------------------------------ library
 
-    pub(super) fn team_tab(&self) -> bool {
-        self.tab == Tab::Team
+    /// Who can open one of the signed-in person's boards.
+    pub(super) fn access_of(&self, b: &CloudBoard) -> Access {
+        if b.org_access == "view" || b.org_access == "edit" {
+            Access::Org
+        } else if b.role != Role::Owner || b.members > 0 || self.invited.contains(&b.id) {
+            Access::Shared
+        } else {
+            Access::Private
+        }
     }
 
     // -------------------------------------------------------------- panels
 
     pub(super) fn account_rows(&self, content: &mut PanelRows) {
+        let button = |text: &str, kind: ButtonKind, act: Act| (72.0, Look::Button { icon: None, text: text.into(), kind, pill: false, level: 0 }, Some(act));
         if let Some(a) = self.account() {
             content.push(84.0, Look::Avatar { text: a.user.initials(), color: a.user.color }, None);
             content.y += 8.0;
             content.push(40.0, Look::Label { text: a.user.name.clone(), face: Face::Bold, size: 28.0, color: TEXT1, center: true }, None);
             content.push(36.0, Look::Label { text: a.user.email.clone(), face: Face::Regular, size: 22.0, color: TEXT2, center: true }, None);
             content.y += 24.0;
-            content.para("Team boards you make or that are shared with you show under Team boards, on every device where you sign in.", TEXT2);
-            content.push(72.0, Look::Button { icon: None, text: "Sign out".into(), kind: ButtonKind::DangerTint, pill: false, level: 0 }, Some(Act::SignOut));
+            content.para("Your boards are saved to your account and open on every device where you sign in.", TEXT2);
+            let (h, look, act) = button("Sign out", ButtonKind::DangerTint, Act::SignOut);
+            content.push(h, look, act);
             return;
         }
         let Some(s) = &self.sign_in else {
-            content.para("Sign in with your work Google account to make team boards and edit them together.", TEXT2);
-            content.push(72.0, Look::Button { icon: None, text: "Sign in with Google".into(), kind: ButtonKind::Primary, pill: false, level: 0 }, Some(Act::SignIn));
+            content.para(&format!("Sign in with your {ORG} Google Workspace account. Every board you make is saved to it, and stays private until you share it."), TEXT2);
+            let (h, look, act) = button("Sign in with Google", ButtonKind::Primary, Act::SignIn);
+            content.push(h, look, act);
             return;
         };
         if let Some(error) = &s.error {
             content.para(error, DANGER);
-            content.push(72.0, Look::Button { icon: None, text: "Try again".into(), kind: ButtonKind::Primary, pill: false, level: 0 }, Some(Act::SignIn));
+            let (h, look, act) = button("Try again", ButtonKind::Primary, Act::SignIn);
+            content.push(h, look, act);
+            return;
+        }
+        if s.browser {
+            content.para("Continue in your browser: choose your Google account there, then come back here.", TEXT2);
+            content.status("Waiting for Google…", true);
+            let (h, look, act) = button("Use a code instead", ButtonKind::White, Act::SignInCode);
+            content.push(h, look, act);
             return;
         }
         match &s.code {
             None => content.status("Contacting Google…", true),
             Some((code, url)) => {
-                content.para("On your phone or computer, open the address below (or scan the code) and enter this code. Use your work Google account.", TEXT2);
+                content.para(&format!("On your phone or computer, open the address below (or scan the code) and enter this code. Use your {ORG} Google account."), TEXT2);
                 content.push(120.0, Look::Label { text: code.clone(), face: Face::Bold, size: 72.0, color: TEXT1, center: true }, Some(Act::Copy(code.clone())));
                 content.y += 8.0;
                 content.qr(url);
                 content.copy_code(url);
                 if cfg!(target_arch = "wasm32") {
-                    content.push(72.0, Look::Button { icon: None, text: "Open the sign-in page".into(), kind: ButtonKind::Primary, pill: false, level: 0 }, Some(Act::OpenUrl(url.clone())));
+                    let (h, look, act) = button("Open the sign-in page", ButtonKind::Primary, Act::OpenUrl(url.clone()));
+                    content.push(h, look, act);
                 }
                 content.status("Waiting for you to approve…", true);
             }
@@ -843,9 +1022,12 @@ impl App {
 
     pub(super) fn share_rows(&self, content: &mut PanelRows) {
         let Some(live) = &self.live else {
-            content.para("This board is only on this device. Copy it to Team boards to edit it with others: everyone sees each other's cursors and changes as they happen.", TEXT2);
-            let id = self.board.as_ref().map(|b| b.id.clone()).unwrap_or_default();
-            content.push(72.0, Look::Button { icon: Some(Ico::Share), text: "Copy to Team boards".into(), kind: ButtonKind::Primary, pill: false, level: 0 }, Some(Act::CopyToTeam(id)));
+            if self.me().is_none() {
+                content.para("Sign in to share this board. Everyone you invite sees each other's cursors and changes as they happen.", TEXT2);
+                content.push(72.0, Look::Button { icon: Some(Ico::Join), text: "Sign in to share".into(), kind: ButtonKind::Primary, pill: false, level: 0 }, Some(Act::SignIn));
+            } else {
+                content.status("Getting this board ready to share…", true);
+            }
             return;
         };
         if let Some(msg) = &live.refused {
@@ -854,7 +1036,50 @@ impl App {
         }
         let owner = live.role == Role::Owner;
         let members = self.members.as_ref().filter(|(id, _)| *id == live.cloud_id).map(|(_, m)| m);
-        let domain = self.me().and_then(|m| m.email.split('@').nth(1)).unwrap_or("your organisation").to_string();
+        if owner {
+            // Like Figma's share dialog: invite first, then who has access.
+            content.push(72.0, Look::Button { icon: Some(Ico::Plus), text: "Invite by email".into(), kind: ButtonKind::Primary, pill: false, level: 0 }, Some(Act::AddPerson));
+            content.y += 28.0;
+        }
+        let Some(m) = members else {
+            content.status("Loading who has access…", true);
+            return;
+        };
+        content.heading("PEOPLE WITH ACCESS");
+        if let Some(o) = &m.owner {
+            content.push(84.0, Look::Person { name: person_name(&o.name, &o.email), email: o.email.clone(), role: "Owner".into(), menu: false }, None);
+        }
+        for member in &m.members {
+            let role = if member.role == Role::Editor { "Can edit" } else { "Can view" };
+            let act = owner.then(|| Act::MemberMenu(member.email.clone()));
+            content.push(84.0, Look::Person { name: person_name(&member.name, &member.email), email: member.email.clone(), role: role.into(), menu: owner }, act);
+        }
+        if m.members.is_empty() {
+            content.para(if owner { "Only you for now. Invite people above, or give everyone at Kenpath access below." } else { "Nobody else has been invited yet." }, TEXT3);
+        }
+        content.y += 12.0;
+
+        content.heading("GENERAL ACCESS");
+        let (access, level) = match m.org_access.as_str() {
+            "edit" => (2, "can edit"),
+            "view" => (1, "can view"),
+            _ => (0, ""),
+        };
+        let (icon, title) = if access == 0 { (Ico::Lock, "Only people invited".to_string()) } else { (Ico::Globe, format!("Everyone at {ORG}")) };
+        content.push(72.0, Look::Row { icon: Some(icon), text: title, value: level.into(), chevron: false, danger: false }, None);
+        if owner {
+            content.y += 4.0;
+            let track = Rf::new(0.0, content.y, content.width, 64.0);
+            content.rows.extend(super::segment(
+                track,
+                [("Only invited", Act::OrgAccess("none")), ("Can view", Act::OrgAccess("view")), ("Can edit", Act::OrgAccess("edit"))],
+                access,
+            ));
+            content.y += 80.0;
+        } else {
+            content.y += 12.0;
+        }
+
         if !live.peers.is_empty() {
             content.heading("ON THIS BOARD NOW");
             let mut seen = Vec::new();
@@ -865,46 +1090,6 @@ impl App {
                 seen.push(p.user.id.clone());
                 content.push(72.0, Look::Row { icon: None, text: p.user.name.clone(), value: p.role.name().into(), chevron: false, danger: false }, None);
             }
-            content.y += 16.0;
-        }
-        let Some(m) = members else {
-            content.status("Loading who has access…", true);
-            return;
-        };
-        let access = match m.org_access.as_str() {
-            "edit" => 2,
-            "view" => 1,
-            _ => 0,
-        };
-        if owner {
-            content.segments(
-                &format!("Everyone at {domain}"),
-                420.0,
-                [("No access", Act::OrgAccess("none")), ("Can view", Act::OrgAccess("view")), ("Can edit", Act::OrgAccess("edit"))],
-                access,
-            );
-            content.y += 8.0;
-        } else {
-            let text = ["Only invited people", "Everyone in the organisation can view", "Everyone in the organisation can edit"][access];
-            content.status(text, true);
-        }
-        content.heading("PEOPLE WITH ACCESS");
-        if let Some(o) = &m.owner {
-            let name = if o.name.is_empty() { o.email.clone() } else { format!("{} · {}", o.name, o.email) };
-            content.push(72.0, Look::Row { icon: None, text: name, value: "owner".into(), chevron: false, danger: false }, None);
-        }
-        for member in &m.members {
-            let name = if member.name.is_empty() { member.email.clone() } else { format!("{} · {}", member.name, member.email) };
-            let value = if member.role == Role::Editor { "can edit" } else { "can view" };
-            let act = owner.then(|| Act::MemberMenu(member.email.clone()));
-            content.push(72.0, Look::Row { icon: None, text: name, value: value.into(), chevron: owner, danger: false }, act);
-        }
-        if m.members.is_empty() {
-            content.para("Nobody else has been invited yet.", TEXT3);
-        }
-        if owner {
-            content.y += 8.0;
-            content.push(72.0, Look::Button { icon: Some(Ico::Plus), text: "Invite someone".into(), kind: ButtonKind::Secondary, pill: false, level: 0 }, Some(Act::AddPerson));
         }
     }
 
@@ -930,15 +1115,23 @@ impl App {
                 }
             }
             Act::SignOut => self.sign_out(),
-            Act::Tab(team) => {
-                self.tab = if *team { Tab::Team } else { Tab::Device };
+            Act::AccountMenu => self.menu(MenuKind::Account, act),
+            Act::Filter(tab) => {
+                self.tab = *tab;
                 self.scroll = 0.0;
-                if *team {
-                    self.refresh_team();
-                }
             }
             Act::OpenTeam(id) => self.open_team(id),
             Act::TeamMenu(id) => self.menu(MenuKind::TeamCard(id.clone()), act),
+            Act::ShareTeam(id) => {
+                self.dismiss();
+                self.share_on_open = Some(id.clone());
+                self.open_team(id);
+            }
+            Act::CopyBoardLink(id) => {
+                let link = format!("{}/app/#board={id}", self.settings.server.trim_end_matches('/'));
+                self.platform.copy_text(&link);
+                self.show_toast("Link copied");
+            }
             Act::RenameTeam(id) => {
                 let title = self.team_boards.iter().find(|b| &b.id == id).map(|b| b.title.clone()).unwrap_or_default();
                 self.ask("Rename board", &title, "Board name", false, AskFor::RenameTeam(id.clone()));
@@ -953,24 +1146,7 @@ impl App {
                     purpose: ConfirmFor::DeleteTeam(id.clone()),
                 });
             }
-            Act::CopyToTeam(id) => {
-                let id = id.clone();
-                let title = if self.board.as_ref().is_some_and(|b| b.id == id) {
-                    self.board.as_ref().map(|b| b.title.clone())
-                } else {
-                    self.boards.iter().find(|b| b.id == id).map(|b| b.title.clone())
-                }
-                .unwrap_or_else(|| "Untitled board".into());
-                if self.board.as_ref().is_some_and(|b| b.id == id) {
-                    // Saved first so the copy has the latest changes.
-                    self.queue_save(None);
-                }
-                self.dismiss();
-                self.copying = Some(id);
-                self.show_toast("Copying to Team boards…");
-                self.request(move |a| async move { Reply::Created(cloud::create_board(&a, &title).await) });
-            }
-            Act::AddPerson => self.ask("Invite someone", "", "name@company.com", false, AskFor::AddPerson),
+            Act::AddPerson => self.ask("Invite by email", "", "name@company.com", false, AskFor::AddPerson),
             Act::MemberMenu(email) => self.menu(MenuKind::Member(email.clone()), act),
             Act::SetRole(email, role) => {
                 self.dismiss();
@@ -1006,7 +1182,14 @@ impl App {
         self.request(move |a| async move { Reply::Members(id.clone(), cloud::remove_member(&a, &id, &email).await) });
     }
 
+    /// A new board in the signed-in person's account, opened as soon as the
+    /// server has made it. No name is asked for: it is renamed later.
     pub(super) fn create_team_board(&mut self, title: String) {
+        if self.new_board_at.is_some_and(|t| self.now < t + 2000) {
+            return;
+        }
+        self.new_board_at = Some(self.now);
+        self.show_toast("Creating your board…");
         self.request(move |a| async move { Reply::Created(cloud::create_board(&a, &title).await) });
     }
 
@@ -1069,6 +1252,57 @@ pub(super) fn draw_look(p: &mut Painter, look: &Look, r: Rf, u: f32) -> bool {
             p.text(Face::Medium, 18.0 * u, label, t.x + 10.0 * u, super::baseline(t, Face::Medium, 18.0 * u), 0xffffffff);
             true
         }
+        Look::Badge { access } => {
+            let (bg, fg, border) = match access {
+                Access::Private => (SURFACE, TEXT2, true),
+                Access::Shared => (ACCENT_TINT, ACCENT, false),
+                Access::Org => (0xffdff3e8, OK, false),
+            };
+            p.rrect(r, r.h / 2.0, bg);
+            if border {
+                p.rrect_line(r, r.h / 2.0, BORDER, 1.5 * u);
+            }
+            p.ico(access.icon(), 22.0 * u, r.x + 25.0 * u, r.cy(), fg);
+            let text = Rf::new(r.x + 44.0 * u, r.y, (r.w - 58.0 * u).max(0.0), r.h);
+            super::line_text(p, text, Face::Bold, 20.0 * u, &access.label(), fg, false);
+            true
+        }
+        Look::Person { name, email, role, menu } => {
+            let side = (r.h - 20.0 * u).min(60.0 * u);
+            let color = person_color(email);
+            let (cx, cy) = (r.x + side / 2.0, r.cy());
+            p.circle(cx, cy, side / 2.0, color);
+            let initials = cloud::initials(name);
+            let size = side * 0.38;
+            let w = font::measure(Face::Bold, size, &initials).0;
+            let box_ = Rf::new(cx - side / 2.0, cy - side / 2.0, side, side);
+            p.text(Face::Bold, size, &initials, cx - w / 2.0, super::baseline(box_, Face::Bold, size), 0xffffffff);
+            // The role, as a pill with an arrow when it can be changed.
+            let mut right = r.right();
+            if !role.is_empty() {
+                let tw = font::measure(Face::Medium, 22.0 * u, role).0;
+                let pw = tw + if *menu { 62.0 } else { 36.0 } * u;
+                let pill = Rf::new(right - pw, r.cy() - 26.0 * u, pw, 52.0 * u);
+                if *menu {
+                    p.rrect(pill, pill.h / 2.0, SURFACE2);
+                }
+                super::line_text(p, Rf::new(pill.x + 18.0 * u, pill.y, tw + 2.0 * u, pill.h), Face::Medium, 22.0 * u, role, TEXT2, false);
+                if *menu {
+                    let (ax, ay) = (pill.right() - 24.0 * u, pill.cy());
+                    p.polygon(&[(ax - 7.0 * u, ay - 3.0 * u), (ax + 7.0 * u, ay - 3.0 * u), (ax, ay + 5.0 * u)], TEXT2);
+                }
+                right = pill.x - 12.0 * u;
+            }
+            let x = r.x + side + 18.0 * u;
+            let w = (right - x).max(0.0);
+            if name == email {
+                super::line_text(p, Rf::new(x, r.cy() - 17.0 * u, w, 34.0 * u), Face::Bold, 24.0 * u, name, TEXT1, false);
+            } else {
+                super::line_text(p, Rf::new(x, r.cy() - 32.0 * u, w, 34.0 * u), Face::Bold, 24.0 * u, name, TEXT1, false);
+                super::line_text(p, Rf::new(x, r.cy() + 2.0 * u, w, 30.0 * u), Face::Regular, 20.0 * u, email, TEXT3, false);
+            }
+            true
+        }
         Look::Avatar { text, color } => {
             let side = r.w.min(r.h);
             let (cx, cy) = (r.x + side / 2.0, r.cy());
@@ -1090,14 +1324,32 @@ pub(super) fn menu_rows(app: &App, kind: &MenuKind) -> Option<(f32, Vec<Option<(
     match kind {
         MenuKind::TeamCard(id) => {
             let role = app.team_boards.iter().find(|b| &b.id == id).map_or(Role::Viewer, |b| b.role);
-            let mut rows = vec![row(Some(Ico::Share), "Open", false, Act::OpenTeam(id.clone()))];
+            let mut rows = vec![row(Some(Ico::Page), "Open", false, Act::OpenTeam(id.clone()))];
             if role.can_edit() {
                 rows.push(row(Some(Ico::Rename), "Rename", false, Act::RenameTeam(id.clone())));
             }
+            rows.push(row(Some(Ico::Share), "Share…", false, Act::ShareTeam(id.clone())));
             if role == Role::Owner {
-                rows.push(row(Some(Ico::Trash), "Delete for everyone", true, Act::DeleteTeam(id.clone())));
+                rows.push(None);
+                rows.push(row(Some(Ico::Trash), "Delete", true, Act::DeleteTeam(id.clone())));
             }
             Some((400.0, rows))
+        }
+        MenuKind::Account => {
+            let mut rows = vec![
+                row(Some(Ico::Gear), "Settings", false, Act::Settings),
+                row(Some(Ico::Hand), "Phone pad", false, Act::Remote),
+                row(Some(Ico::Claude), "Claude", false, Act::Claude),
+            ];
+            if let Some((version, _)) = &app.update {
+                rows.push(Some((
+                    Look::Row { icon: Some(Ico::Update), text: "Update".into(), value: format!("{version} ready"), chevron: false, danger: false },
+                    Act::Updates,
+                )));
+            }
+            rows.push(None);
+            rows.push(row(Some(Ico::Exit), "Sign out", false, Act::SignOut));
+            Some((560.0, rows))
         }
         MenuKind::Member(email) => Some((
             360.0,
@@ -1115,24 +1367,24 @@ pub(super) fn menu_rows(app: &App, kind: &MenuKind) -> Option<(f32, Vec<Option<(
 /// What the library shows for a team board.
 pub(super) struct TeamCard<'a> {
     pub board: &'a CloudBoard,
+    /// "Edited 5 min ago", with the owner's name first on boards shared with you.
     pub subtitle: String,
+    pub access: Access,
 }
 
+/// The boards the current filter keeps, most recently changed first.
 pub(super) fn team_cards(app: &App) -> Vec<TeamCard<'_>> {
-    app.team_boards
-        .iter()
+    let mut boards: Vec<&CloudBoard> = app.team_boards.iter().filter(|b| app.tab.keeps(b)).collect();
+    boards.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    boards
+        .into_iter()
         .map(|b| {
-            let who = if b.role == Role::Owner { "You".to_string() } else { b.owner_name.split_whitespace().next().unwrap_or(&b.owner_name).to_string() };
-            let role = match b.role {
-                Role::Owner => "",
-                Role::Editor => "  ·  can edit",
-                Role::Viewer => "  ·  view only",
-            };
-            TeamCard { board: b, subtitle: format!("{who}  ·  {}{role}", ago(b.updated_at)) }
+            let edited = if b.updated_at > 0 { format!("Edited {}", ago(b.updated_at)) } else { "New".to_string() };
+            let subtitle = if b.role == Role::Owner { edited } else { format!("{}  ·  {edited}", person_name(&b.owner_name, &b.owner_email)) };
+            TeamCard { board: b, subtitle, access: app.access_of(b) }
         })
         .collect()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1194,12 +1446,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("inkboard-signin-{}-{}", std::process::id(), random_token(6)));
         let mut app = App::new(Box::new(NoHost), dir.join("boards"), dir.join("settings.json"), "0.9.0".into(), 0, Arc::new(|| {}));
         app.resize(1280, 800, 1.5);
-        assert!(!app.team_tab());
-        app.run(Act::Tab(true));
         let nodes = app.layout();
         assert!(nodes.iter().any(|n| n.act == Some(Act::SignIn)));
         app.panel(PanelKind::Account);
-        app.sign_in = Some(SignIn { cancel: Arc::new(AtomicBool::new(false)), code: Some(("WXYZ-QRST".into(), "https://www.google.com/device".into())), error: None });
+        app.sign_in = Some(SignIn { cancel: Arc::new(AtomicBool::new(false)), code: Some(("WXYZ-QRST".into(), "https://www.google.com/device".into())), error: None, browser: false });
         let nodes = app.layout();
         assert!(nodes.iter().any(|n| matches!(&n.look, Look::Label { text, .. } if text == "WXYZ-QRST")));
         assert!(nodes.iter().any(|n| matches!(&n.look, Look::Qr(url) if url == "https://www.google.com/device")));
@@ -1221,7 +1471,6 @@ mod tests {
         let (mut ben, dir_b) = signed_in(&server, &tb);
         let mut t = 1000;
 
-        ana.run(Act::Tab(true));
         ana.create_team_board("Pairing".into());
         pump(&mut [&mut ana], &mut t, |a| live_ready(a[0]));
         let cloud_id = ana.live.as_ref().unwrap().cloud_id.clone();
@@ -1229,7 +1478,6 @@ mod tests {
         let account = ana.account().unwrap().clone();
         cloud::block_on(cloud::add_member(&account, &cloud_id, &ben.me().unwrap().email, Role::Editor)).unwrap();
 
-        ben.run(Act::Tab(true));
         pump(&mut [&mut ben], &mut t, |a| a[0].team_boards.iter().any(|b| b.id == cloud_id));
         assert!(ben.cards().iter().any(|c| c.title == "Pairing"));
         ben.run(Act::OpenTeam(cloud_id.clone()));
@@ -1292,5 +1540,300 @@ mod tests {
         cloud::block_on(cloud::delete_board(&account, &cloud_id)).unwrap();
         let _ = std::fs::remove_dir_all(dir_a);
         let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    // ------------------------------------------------- library, no server
+
+    use crate::store;
+    use std::sync::Mutex;
+
+    /// A host that remembers what was copied.
+    struct Clip(Arc<Mutex<Vec<String>>>);
+    impl Platform for Clip {
+        fn copy_text(&mut self, text: &str) {
+            self.0.lock().unwrap().push(text.to_string());
+        }
+    }
+
+    fn offline_app(copied: Arc<Mutex<Vec<String>>>) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("inkboard-lib-{}-{}", std::process::id(), random_token(8)));
+        let mut app = App::new(Box::new(Clip(copied)), dir.join("boards"), dir.join("settings.json"), "0.9.0".into(), 0, Arc::new(|| {}));
+        // Nothing listens here, so requests fail at once.
+        app.settings.server = "http://127.0.0.1:1".into();
+        (app, dir)
+    }
+
+    fn sign_in_here(app: &mut App) {
+        let user = cloud::User { id: "u1".into(), email: "shashank@kenpath.com".into(), name: "Shashank Rao".into(), color: 0xff2748e8 };
+        app.settings.account = Some(Account { server: app.settings.server.clone(), token: "t".into(), user });
+    }
+
+    fn board(id: &str, title: &str, role: Role, org: &str, owner: &str, minutes_ago: i64) -> CloudBoard {
+        CloudBoard {
+            id: id.into(),
+            title: title.into(),
+            role,
+            org_access: org.into(),
+            owner_name: owner.into(),
+            owner_email: format!("{}@kenpath.com", owner.to_lowercase().replace(' ', ".")),
+            updated_at: super::super::wall_millis() - minutes_ago * 60_000,
+            members: 0,
+        }
+    }
+
+    fn some_boards() -> Vec<CloudBoard> {
+        vec![
+            board("a", "Sprint planning", Role::Owner, "none", "Shashank Rao", 5),
+            board("b", "Kenpath roadmap", Role::Owner, "view", "Shashank Rao", 90),
+            board("c", "Brand sketches", Role::Editor, "none", "Ana Iyer", 600),
+            board("d", "Onsite map", Role::Viewer, "edit", "Ben Thomas", 3000),
+        ]
+    }
+
+    fn titles(app: &App) -> Vec<String> {
+        app.cards().into_iter().map(|c| c.title).collect()
+    }
+
+    #[test]
+    fn signed_out_the_library_is_a_welcome_screen() {
+        let (mut app, dir) = offline_app(Default::default());
+        app.resize(1920, 1080, 1.5);
+        settle_frames(&mut app);
+        let nodes = app.layout();
+        let sign_in = nodes.iter().find(|n| n.act == Some(Act::SignIn)).expect("a sign-in button");
+        assert!(matches!(&sign_in.look, Look::Button { text, .. } if text == "Sign in with Google"));
+        assert!(nodes.iter().any(|n| matches!(&n.look, Look::Label { text, .. } if text.contains("Kenpath Google Workspace"))));
+        // No boards, tabs or New board button before signing in.
+        assert!(!nodes.iter().any(|n| n.act == Some(Act::NewBoard)));
+        assert!(!nodes.iter().any(|n| matches!(n.act, Some(Act::Filter(_)) | Some(Act::OpenTeam(_)) | Some(Act::Open(_)))));
+        assert!(!nodes.iter().any(|n| matches!(n.look, Look::Thumb { .. })));
+        // Nor the old header pills.
+        assert!(!nodes.iter().any(|n| matches!(n.act, Some(Act::Remote) | Some(Act::Claude) | Some(Act::Account))));
+        // Phones get the same screen.
+        app.resize(720, 1280, 2.0);
+        assert!(app.layout().iter().any(|n| n.act == Some(Act::SignIn)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn settle_frames(app: &mut App) {
+        for i in 0..20 {
+            app.frame(1000 + i);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn signed_in_the_header_is_an_avatar_with_an_account_menu() {
+        let (mut app, dir) = offline_app(Default::default());
+        sign_in_here(&mut app);
+        app.team_boards = some_boards();
+        app.team_listed = true;
+        app.resize(1920, 1080, 1.5);
+        settle_frames(&mut app);
+        let nodes = app.layout();
+        let avatar = nodes.iter().find(|n| n.act == Some(Act::AccountMenu)).expect("the avatar");
+        assert!(matches!(&avatar.look, Look::Avatar { text, .. } if text == "SR"));
+        for gone in [Act::Remote, Act::Claude, Act::Settings, Act::Account, Act::SignIn] {
+            assert!(!nodes.iter().any(|n| n.act == Some(gone.clone())), "{gone:?} is in the menu now");
+        }
+        app.run(Act::AccountMenu);
+        app.frame(2000);
+        let acts: Vec<Act> = app.nodes.iter().filter_map(|n| n.act.clone()).collect();
+        for want in [Act::Settings, Act::Remote, Act::Claude, Act::SignOut] {
+            assert!(acts.contains(&want), "{want:?} missing from the account menu");
+        }
+        assert!(app.nodes.iter().any(|n| matches!(&n.look, Look::Label { text, .. } if text == "shashank@kenpath.com")));
+        // Update stays reachable from the menu when one is ready.
+        app.update = Some(("1.0.0".into(), String::new()));
+        app.frame(2100);
+        assert!(app.nodes.iter().any(|n| n.act == Some(Act::Updates)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn filters_choose_the_right_cards_and_badges() {
+        let (mut app, dir) = offline_app(Default::default());
+        sign_in_here(&mut app);
+        app.team_boards = some_boards();
+        app.team_listed = true;
+        app.resize(1920, 1080, 1.5);
+        // Most recently edited first.
+        assert_eq!(titles(&app), ["Sprint planning", "Kenpath roadmap", "Brand sketches", "Onsite map"]);
+        app.run(Act::Filter(Tab::Yours));
+        assert_eq!(titles(&app), ["Sprint planning", "Kenpath roadmap"]);
+        app.run(Act::Filter(Tab::Shared));
+        assert_eq!(titles(&app), ["Brand sketches", "Onsite map"]);
+        // Shared-with-you cards name the owner; yours say when they changed.
+        let cards = app.cards();
+        assert!(cards[0].subtitle.starts_with("Ana Iyer"), "{}", cards[0].subtitle);
+        assert!(cards[0].subtitle.contains("Edited 10 h ago"), "{}", cards[0].subtitle);
+        app.run(Act::Filter(Tab::All));
+        assert_eq!(app.cards()[0].subtitle, "Edited 5 min ago");
+        // Badges: private, org-wide, shared with me, org-wide.
+        let access: Vec<Access> = app.cards().iter().map(|c| c.access).collect();
+        assert_eq!(access, [Access::Private, Access::Org, Access::Shared, Access::Org]);
+        let badges: Vec<Access> = app.layout().iter().filter_map(|n| if let Look::Badge { access } = n.look { Some(access) } else { None }).collect();
+        assert_eq!(badges, access);
+        // Inviting someone makes a private board shared.
+        app.invited.insert("a".into());
+        assert_eq!(app.cards()[0].access, Access::Shared);
+        // A filter with nothing in it says so instead of showing an empty grid.
+        app.team_boards.retain(|b| b.role == Role::Owner);
+        app.run(Act::Filter(Tab::Shared));
+        assert!(app.cards().is_empty());
+        assert!(app.layout().iter().any(|n| matches!(&n.look, Look::Label { text, .. } if text.starts_with("Nothing shared"))));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_empty_account_invites_a_first_board() {
+        let (mut app, dir) = offline_app(Default::default());
+        sign_in_here(&mut app);
+        app.team_listed = true;
+        app.resize(1920, 1080, 1.5);
+        let nodes = app.layout();
+        assert!(nodes.iter().any(|n| matches!(&n.look, Look::Label { text, .. } if text == "Create your first board")));
+        assert_eq!(nodes.iter().filter(|n| n.act == Some(Act::NewBoard)).count(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn new_board_signed_in_skips_the_name_dialog() {
+        let (mut app, dir) = offline_app(Default::default());
+        sign_in_here(&mut app);
+        app.run(Act::NewBoard);
+        assert!(app.overlay.is_none(), "no dialog while signed in");
+        assert!(app.new_board_at.is_some(), "the board is being made");
+        // A second tap right away does not make another.
+        let first = app.new_board_at;
+        app.run(Act::NewBoard);
+        assert_eq!(app.new_board_at, first);
+        // Signed out, boards on this device are still named first.
+        let (mut local, dir2) = offline_app(Default::default());
+        local.run(Act::NewBoard);
+        assert!(matches!(local.overlay, Some(Overlay::Ask { purpose: AskFor::NewBoard, .. })));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn card_menu_offers_open_rename_share_and_delete() {
+        let (mut app, dir) = offline_app(Default::default());
+        sign_in_here(&mut app);
+        app.team_boards = some_boards();
+        let acts = |app: &App, id: &str| -> Vec<Act> {
+            menu_rows(app, &MenuKind::TeamCard(id.into())).unwrap().1.into_iter().flatten().map(|(_, a)| a).collect()
+        };
+        assert_eq!(
+            acts(&app, "a"),
+            [Act::OpenTeam("a".into()), Act::RenameTeam("a".into()), Act::ShareTeam("a".into()), Act::DeleteTeam("a".into())]
+        );
+        // An editor cannot delete; a viewer cannot rename either.
+        assert_eq!(acts(&app, "c"), [Act::OpenTeam("c".into()), Act::RenameTeam("c".into()), Act::ShareTeam("c".into())]);
+        assert_eq!(acts(&app, "d"), [Act::OpenTeam("d".into()), Act::ShareTeam("d".into())]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn share_copies_the_board_link() {
+        let copied: Arc<Mutex<Vec<String>>> = Default::default();
+        let (mut app, dir) = offline_app(copied.clone());
+        app.settings.server = "https://ink.example/".into();
+        app.run(Act::CopyBoardLink("abc123".into()));
+        assert_eq!(*copied.lock().unwrap(), ["https://ink.example/app/#board=abc123"]);
+        assert_eq!(app.toast.as_ref().unwrap().text, "Link copied");
+        // Signed out, the panel offers sign-in rather than copying to Team boards.
+        let (rows, _) = app.panel_rows(PanelKind::Share, 700.0);
+        assert!(rows.iter().any(|(_, look, act)| *act == Some(Act::SignIn) && matches!(look, Look::Button { text, .. } if text == "Sign in to share")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Writes pictures of the new screens when INKBOARD_SNAPSHOT_DIR is set.
+    #[test]
+    fn library_screenshots() {
+        if std::env::var("INKBOARD_SNAPSHOT_DIR").is_err() {
+            return;
+        }
+        let (mut app, dir) = offline_app(Default::default());
+        let sizes = [("wide", 1920, 1080, 1.5), ("phone", 1080, 2340, 3.0)];
+        for (name, w, h, d) in sizes {
+            app.resize(w, h, d);
+            app.frame(1000);
+            snapshot(&app, &format!("{name}-1-signed-out"));
+        }
+        // Boards with pictures: the cached copy of each team board.
+        sign_in_here(&mut app);
+        app.team_boards = some_boards();
+        app.team_listed = true;
+        for (i, b) in app.team_boards.clone().iter().enumerate() {
+            let id = cache_id(&b.id);
+            let shapes: Vec<Arc<Shape>> = (0..4 + i)
+                .map(|k| Arc::new(Shape::new(&format!("s{k}"), Tool::Rectangle, vec![Pt::new(40.0 + 90.0 * k as f64, 60.0 + 40.0 * (k % 2) as f64), Pt::new(110.0 + 90.0 * k as f64, 130.0 + 40.0 * (k % 2) as f64)])))
+                .collect();
+            let contents = store::encode(&id, &b.title, "2026-11-19T10:00:00.000", &shapes, &Map::new());
+            store::save_atomic(&dir.join("boards"), &id, &contents).unwrap();
+        }
+        app.send(Job::List);
+        for (name, w, h, d) in sizes {
+            app.resize(w, h, d);
+            for i in 0..40 {
+                app.frame(2000 + i * 20);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            snapshot(&app, &format!("{name}-2-boards"));
+            app.run(Act::Filter(Tab::Shared));
+            app.frame(4000);
+            snapshot(&app, &format!("{name}-3-shared-with-you"));
+            app.run(Act::Filter(Tab::All));
+            app.run(Act::AccountMenu);
+            app.frame(4100);
+            app.frame(4400);
+            snapshot(&app, &format!("{name}-4-account-menu"));
+            app.dismiss();
+            app.run(Act::TeamMenu("a".into()));
+            app.frame(4500);
+            app.frame(4800);
+            snapshot(&app, &format!("{name}-5-card-menu"));
+            app.dismiss();
+        }
+        app.update = Some(("1.0.0".into(), String::new()));
+        app.frame(5000);
+        snapshot(&app, "phone-6-update");
+        app.update = None;
+        // The share panel of an open team board.
+        let mut extra = Map::new();
+        extra.insert("cloud".into(), json!({ "id": "a", "role": "owner" }));
+        let contents = store::encode(&cache_id("a"), "Sprint planning", "2026-11-19T10:00:00.000", &[], &extra);
+        store::save_atomic(&dir.join("boards"), &cache_id("a"), &contents).unwrap();
+        app.run(Act::OpenTeam("a".into()));
+        for i in 0..30 {
+            app.frame(6000 + i * 20);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.live.is_some(), "board did not open");
+        let person = |email: &str, name: &str, role| cloud::Member { email: email.into(), name: name.into(), role };
+        app.members = Some((
+            "a".into(),
+            cloud::Members {
+                org_access: "none".into(),
+                owner: Some(person("shashank@kenpath.com", "Shashank Rao", Role::Owner)),
+                members: vec![person("ana.iyer@kenpath.com", "Ana Iyer", Role::Editor), person("ben@kenpath.com", "", Role::Viewer)],
+            },
+        ));
+        for (name, w, h, d) in sizes {
+            app.resize(w, h, d);
+            app.panel(PanelKind::Share);
+            app.frame(7000);
+            app.frame(7300);
+            snapshot(&app, &format!("{name}-7-share"));
+            app.dismiss();
+            app.members.as_mut().unwrap().1.org_access = "view".into();
+            app.panel(PanelKind::Share);
+            app.frame(7400);
+            snapshot(&app, &format!("{name}-8-share-org"));
+            app.dismiss();
+            app.members.as_mut().unwrap().1.org_access = "none".into();
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
